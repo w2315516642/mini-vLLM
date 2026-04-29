@@ -1,16 +1,33 @@
 from typing import List
 
 from .model_runner import ModelRunner
-from .sequence import Sequence
-
+from minivllm.sequence import SequenceGroup, SequenceStatus
+from minivllm.utils.counter import Counter
+from minivllm.worker.worker import Worker
 
 class LLMEngine:
     """ 核心，负责模型初始化、资源分配和推理 """
     def __init__(
         self, 
-        model: str | None = None,
-        max_model_len: int = 128
+        model_config,
+        cache_config,
+        parallel_config,
+        scheduler_config,
+        distributed_init_method: str,
+        stage_devices,
+        log_stats: bool,
     ) -> None:
+
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.parallel_config = parallel_config
+        self.scheduler_config = scheduler_config
+        self.log_stats = log_stats
+
+        self.seq_counter = Counter()
+
+        self.workers: List[Worker] = []
+
         self.max_model_len = max_model_len
 
         # 1. 获取模型配置
@@ -21,7 +38,6 @@ class LLMEngine:
         # 3. 分配 KVCache 空间
 
         # 4. 初始化推理相关的成员
-        self.next_request_id = 0
         self.eos_id_list = [151643]
 
         # 运行池
@@ -62,7 +78,7 @@ class LLMEngine:
 
 
     def generate(self, prompts: str):
-        # 1. 预处理
+        # 1. 预处理转成token-ids
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompts}
@@ -75,7 +91,8 @@ class LLMEngine:
         encoded = self.runner.tokenizer(
             [text], return_tensor='pt'
             ).to(self.runner.device)
-        # 附上request id，整合到一个request里面
+        
+        # 2. 把新输入的token-ids转换成一个请求（要根据请求参数设置seqg）
 
         request = Sequence(
             token_ids=encoded.input_ids[0], 
