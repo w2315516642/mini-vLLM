@@ -1,7 +1,7 @@
 from typing import List
 
 from .model_runner import ModelRunner
-from minivllm.sequence import SequenceGroup, SequenceStatus
+from minivllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from minivllm.utils.counter import Counter
 from minivllm.worker.worker import Worker
 
