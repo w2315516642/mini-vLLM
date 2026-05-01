@@ -59,3 +59,14 @@ def get_tensor_model_parallel_world_size():
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
+
+
+def model_parallel_is_initialized():
+    """Check if model and data parallel groups are initialized."""
+    if (
+        _TENSOR_MODEL_PARALLEL_GROUP is None
+        or _PIPELINE_MODEL_PARALLEL_GROUP is None
+        or _DATA_PARALLEL_GROUP is None
+    ):
+        return False
+    return True

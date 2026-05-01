@@ -2,6 +2,9 @@ import random
 import numpy as np
 import torch
 
+from minivllm.model_executor.parallel_utils.parallel_state import model_parallel_is_initialized
+from minivllm.model_executor.parallel_utils.tensor_parallel import model_parallel_cuda_manual_seed
+
 
 def set_random_seed(seed: int) -> None:
     random.seed(seed)
@@ -10,4 +13,5 @@ def set_random_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-    # TODO: Parallelism seed
+    if model_parallel_is_initialized():
+        model_parallel_cuda_manual_seed(seed)
