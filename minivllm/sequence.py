@@ -9,14 +9,14 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     SWAPPED = auto()
-    FINISHED_STOP = auto()
+    FINISHED_STOPPED = auto()
     FINISHED_LENGTH_CAPPED = auto()
     FINISHED_ABORTED = auto()
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
         return status in [
-            SequenceStatus.FINISHED_STOP,
+            SequenceStatus.FINISHED_STOPPED,
             SequenceStatus.FINISHED_LENGTH_CAPPED,
             SequenceStatus.FINISHED_ABORTED,
         ]

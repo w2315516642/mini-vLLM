@@ -1,5 +1,5 @@
-from typing import Any, List
-
+from typing import Any, List, Optional
+import time
 
 from loguru import logger
 
@@ -8,7 +8,7 @@ from .model_runner import ModelRunner
 from minivllm.configs import (
     ModelConfig, ParallelConfig, CacheConfig, SchedulerConfig
 )
-
+from minivllm.kv_cache.scheduler import Scheduler
 from minivllm.engine.arg_utils import EngineArgs
 from minivllm.engine.ray_utils import DeviceID, ray
 from minivllm.outputs import RequestOutput
@@ -147,6 +147,63 @@ class LLMEngine:
             request_outputs.append(request_output)
         return request_outputs
 
+    def add_request(
+        self,
+        request_id: str,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+        prompt_token_ids: Optional[List[int]] = None,
+        arrival_time: Optional[float] = None 
+    ) -> None:
+        """Add a request to the engine's request pool.
+
+        The request is added to the request pool and will be processed by the
+        scheduler as `engine.step()` is called. The exact scheduling policy is
+        determined by the scheduler.
+
+        Args:
+            request_id: The unique ID of the request.
+            prompt: The prompt string. Can be None if prompt_token_ids is
+                provided.
+            sampling_params: The sampling parameters for text generation.
+            prompt_token_ids: The token IDs of the prompt. If None, we
+                use the tokenizer to convert the prompts to token IDs.
+            arrival_time: The arrival time of the request. If None, we use
+                the current time.
+        """
+        if arrival_time is None:
+            arrival_time = time.time()
+        if prompt_token_ids is None:
+            assert prompt is not None
+            prompt_token_ids = self.tokenizer.encode(prompt)
+        
+        # Create the sequences.
+        block_size = self.cache_config.block_size
+        seqs: List[Sequence] = []
+        for _ in range(sampling_params.best_of):
+            seq_id = next(self.seq_counter)
+            seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
+            seqs.append(seq)
+        
+        # Create the sequence group.
+        seq_group = SequenceGroup(
+            request_id, seqs, sampling_params, arrival_time)
+
+        # Add the sequence group to the scheduler.
+        self.scheduler.add_seq_group(seq_group)
+
+    def abort_request(self, request_id: str) -> None:
+        """Aborts a request with the given ID."""
+        self.scheduler.abort_seq_group(request_id)
+
+    def get_num_unfinished_requests(self) -> int:
+        """Gets the number of unfinished requests."""
+        return self.scheduler.get_num_unfinished_seq_groups()
+
+    def has_unfinished_requests(self) -> bool:
+        """Returns True if there are unfinished requests."""
+        return self.scheduler.has_unfinished_seqs()
+
     def _run_workers(
         self,
         method: str,
@@ -177,85 +234,89 @@ class LLMEngine:
         return output
 
 
-    def step(self):
-        # 1. 找到需要处理的请求（应该是schedular负责的，先放这）
-        request = None
-        for req in self.running:
-            if not req.is_finished:
-                request = req
-                break
-        
-        if request is None:
+    def step(self) -> List[RequestOutput]:
+        """Performs one decoding iteration and returns newly generated results.
+
+        This function performs one decoding iteration of the engine. It first
+        schedules the sequences to be executed in the next iteration and the
+        token blocks to be swapped in/out/copy. Then, it executes the model
+        and updates the scheduler with the model outputs. Finally, it decodes
+        the sequences and returns the newly generated results.
+        """
+        seq_group_metadata_list, scheduler_outputs = self.scheduler.scheduler()
+        if (not seq_group_metadata_list) and scheduler_outputs.is_empty():
             return []
         
-        # 2. 进行一次推理
-        next_token_ids, past_kv = self.runner.forward(
-            input_ids=request.next_token,
-            is_prefill=request.is_prefill,
-            past_kv=request.kv_cache,
-            attention_mask=request.attention_mask,
+        # Execute the model.
+        output = self._run_workers(
+            "execute_model",
+            seq_group_metadata_list=seq_group_metadata_list,
+            blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+            blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
+            blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
-        request.append_token(next_token_ids[-1])
+        # Update the scheduler with the model outputs.
+        seq_groups = self.scheduler.update(output)
 
-        # 3. 更新请求状态
-        if request.is_prefill:
-            request.decoding()
-        if (
-            next_token_ids[-1] in self.eos_id_list 
-            or len(request) >= self.max_model_len
-        ):
-            request.finished()
-            return [(self.next_request_id, request.output_token_ids)]
-        else:
-            request.kv_cache = past_kv
-            return []
-
-
-    def generate(self, prompts: str):
-        # 1. 预处理转成token-ids
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompts}
-        ]
-        text = self.runner.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        ) + "</think>\n"
-        print(f"prompts:\n {text}")
-        # 对prompts进行tokenize
-        encoded = self.runner.tokenizer(
-            [text], return_tensor='pt'
-            ).to(self.runner.device)
+        # Decode the sequences.
+        self._decode_sequences(seq_groups)
+        # Stop the sequences that meet the stopping criteria.
+        self._stop_sequences(seq_groups)
+        # Free the finished sequence groups.
+        self.scheduler.free_finished_seq_groups()
         
-        # 2. 把新输入的token-ids转换成一个请求（要根据请求参数设置seqg）
+        # Create the outputs.
+        request_outputs: List[RequestOutput] = []
+        for seq_group in seq_groups:
+            request_output = RequestOutput.from_seq_group(seq_group)
+            request_outputs.append(request_output)
+        return request_outputs
 
-        request = Sequence(
-            token_ids=encoded.input_ids[0], 
-            attention_mask=encoded.attention_mask
-        )
-        self.next_request_id += 1
+    def _decode_sequences(self, seq_groups: List[SequenceGroup]) -> None:
+        """Decodes the sequence outputs."""
+        for seq_group in seq_groups:
+            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                new_token, new_output_text = detokenize_incrementally(
+                    self.tokenizer,
+                    seq.output_tokens,
+                    seq.get_last_token_id(),
+                    skip_specical_tokens=True,
+                )
+                seq.output_tokens.append(new_token)
+                seq.output_text += new_output_text
 
-        # 2. 添加请求
-        self.running.append(request)
-
-        outputs = {}
-        while not self.is_finished():
-            output = self.step()
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-
-        # 解码并整成列表输出
-        outputs = [{
-            "request_id": seq_id, 
-            "text": self.runner.tokenizer.decode(outputs[seq_id])} 
-            for seq_id in sorted(outputs.keys())]
-
-        return outputs
-
-    def is_finished(self):
-        for request in self.running:
-            if not request.is_finished:
-                return False
-        return True 
+    def _stop_sequences(self, seq_groups: List[SequenceGroup]) -> None:
+        """Stop the finished sequences."""
+        for seq_group in seq_groups:
+            sampling_params = seq_group.sampling_params
+            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                # Check if the sequence has generated a stop string.
+                stopped = False
+                for stop_str in sampling_params.stop:
+                    if seq.output_text.endswith(stop_str):
+                        # Truncate the output text so that the stop string is
+                        # not included in the output.
+                        seq.output_text = seq.output_text[:-len(stop_str)]
+                        self.scheduler.free_seq(
+                            seq, SequenceStatus.FINISHED_STOPPED)
+                        stopped = True
+                        break
+                if stopped:
+                    continue
+                    
+                # Check if the sequence has reached max_tokens.
+                if seq.get_output_len() == sampling_params.max_tokens:
+                    self.scheduler.free_seq(
+                        seq, SequenceStatus.FINISHED_LENGTH_CAPPED
+                    )
+                    continue
+                # Check if the sequence has generated the EOS token.
+                if not sampling_params.ignore_eos:
+                    if seq.get_last_token_id() == self.tokenizer.eos_token_id:
+                        self.scheduler.free_seq(
+                            seq, SequenceStatus.FINISHED_STOPPED
+                        )
+                        continue
 
 
 if __name__ == "__main__":
