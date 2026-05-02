@@ -1,3 +1,4 @@
+import copy
 from enum import Enum, auto
 from typing import Optional, List, Dict
 
@@ -7,14 +8,17 @@ from minivllm.sampling_params import SamplingParams
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    SWAPPED = auto()
     FINISHED_STOP = auto()
     FINISHED_LENGTH_CAPPED = auto()
+    FINISHED_ABORTED = auto()
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
         return status in [
             SequenceStatus.FINISHED_STOP,
-            SequenceStatus.FINISHED_LENGTH_CAPPED
+            SequenceStatus.FINISHED_LENGTH_CAPPED,
+            SequenceStatus.FINISHED_ABORTED,
         ]
 
 
@@ -127,6 +131,13 @@ class Sequence:
 
     def is_finished(self) -> bool:
         return SequenceStatus.is_finished(self.status)
+
+    def fork(self, child_seq: 'Sequence') -> None:
+        # TODO: Optimized by prefix caching.
+        child_seq.logical_token_blocks = copy.deepcopy(self.logical_token_blocks)
+        child_seq.output_logprobs = copy.deepcopy(self.output_logprobs)
+        child_seq.data = copy.deepcopy(self.data)
+        return None
 
     def __repr__(self) -> str:
         return (f'Sequence(seq_id={self.seq_id}, '
