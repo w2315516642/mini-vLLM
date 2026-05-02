@@ -3,8 +3,6 @@ import time
 
 from loguru import logger
 
-from .model_runner import ModelRunner
-
 from minivllm.configs import (
     ModelConfig, ParallelConfig, CacheConfig, SchedulerConfig
 )

@@ -8,7 +8,7 @@ from minivllm.configs.config import (
     SchedulerConfig
 )
 
-from minivllm.model_executor import InputMetadata, set_random_seed
+from minivllm.model_executor import InputMetadata, set_random_seed, get_model
 
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata
