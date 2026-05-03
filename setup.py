@@ -77,7 +77,7 @@ ext_modules = []
 
 # Cache operations.
 cache_extension = CUDAExtension(
-    name="vllm.cache_ops",
+    name="minivllm.cache_ops",
     sources=["csrc/cache.cpp", "csrc/cache_kernels.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS}
 )
@@ -89,11 +89,11 @@ attention_extension = CUDAExtension(
     sources=["csrc/attention.cpp", "csrc/attention/attention_kernels.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS}
 )
-ext_modules.append(attention_extenstion)
+ext_modules.append(attention_extension)
 
 # Positional encoding kernels.
 positional_encoding_extension = CUDAExtension(
-    name="vllm.pos_encoding_ops",
+    name="minivllm.pos_encoding_ops",
     sources=["csrc/pos_encoding.cpp", "csrc/pos_encoding_kernels.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
@@ -101,7 +101,7 @@ ext_modules.append(positional_encoding_extension)
 
 # Layer normalization kernels.
 layernorm_extension = CUDAExtension(
-    name="vllm.layernorm_ops",
+    name="minivllm.layernorm_ops",
     sources=["csrc/layernorm.cpp", "csrc/layernorm_kernels.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
@@ -109,7 +109,7 @@ ext_modules.append(layernorm_extension)
 
 # Activation kernels.
 activation_extension = CUDAExtension(
-    name="vllm.activation_ops",
+    name="minivllm.activation_ops",
     sources=["csrc/activation.cpp", "csrc/activation_kernels.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
@@ -163,7 +163,7 @@ setuptools.setup(
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    pachages=setuptools.find_packages(
+    packages=setuptools.find_packages(
         exclude=("asserts", "benchmarks", "csrc", "docs", "examples", "tests")),
     python_requires=">=3.8",
     install_requires=get_requirements(),

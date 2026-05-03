@@ -86,7 +86,7 @@ def load_tensor_parallel_weights(
             shard_size = param.shape[0]
             loaded_weight = loaded_weight[
                 shard_size * tensor_model_parallel_rank:
-                shard_size * (tensor_model_para + 1)
+                shard_size * (tensor_model_parallel_rank + 1)
             ]
             break
     for p in row_parallel_weight_name:
