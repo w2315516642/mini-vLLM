@@ -240,6 +240,52 @@ class Worker:
         )
         return tokens_tensor, positions_tensor, input_metadata
 
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> Dict[int, SequenceOutputs]:
+        # Issue cache operations.
+        issued_cache_op = False
+        if blocks_to_swap_in:
+            self.cache_engine.swap_in(blocks_to_swap_in)
+            issued_cache_op = True
+        if blocks_to_swap_out:
+            self.cache_engine.swap_out(blocks_to_swap_out)
+            issued_cache_op = True
+        if blocks_to_copy:
+            self.cache_engine.copy(blocks_to_copy)
+            issued_cache_op = True
+        
+        if issued_cache_op:
+            cache_events = self.cache_events
+        else:
+            cache_events = None
+        
+        # If there is no input, we don't need to execute the model.
+        if not seq_group_metadata_list:
+            if cache_events is not None:
+                for event in cache_events:
+                    event.wait()
+            return {}
+        
+        # Prepare input tensors.
+        input_tokens, input_positions, input_metadata = self._prepare_inputs(
+            seq_group_metadata_list=seq_group_metadata_list)
+        
+        # Execute the model.
+        output = self.model(
+            input_ids=input_tokens,
+            positions=input_positions,
+            kv_caches=self.gpu_cache,
+            input_metadata=input_metadata,
+            cache_events=cache_events,
+        )
+        return output
+
 
 def _init_distributed_environment(
     parallel_config: ParallelConfig,
