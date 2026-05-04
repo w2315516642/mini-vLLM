@@ -1,6 +1,6 @@
 import copy
 from enum import Enum, auto
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 
 from minivllm.kv_cache.block import LogicalTokenBlock
 from minivllm.sampling_params import SamplingParams
@@ -20,6 +20,18 @@ class SequenceStatus(Enum):
             SequenceStatus.FINISHED_LENGTH_CAPPED,
             SequenceStatus.FINISHED_ABORTED,
         ]
+
+    @staticmethod
+    def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
+        if status == SequenceStatus.FINISHED_STOPPED:
+            finished_reason = "stop"
+        elif status == SequenceStatus.FINISHED_LENGTH_CAPPED:
+            finished_reason = "length"
+        elif status == SequenceStatus.FINISHED_ABORTED:
+            finished_reason = "abort"
+        else:
+            finished_reason = None
+        return finished_reason
 
 
 class SequenceData:

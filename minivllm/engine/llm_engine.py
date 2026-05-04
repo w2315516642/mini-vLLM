@@ -42,11 +42,13 @@ class LLMEngine:
         assert len(stage_devices) == 1, "Only support one stage for now."
         for rank, node_resource, _ in stage_devices[0]:
             worker_cls = Worker
+            runtime_env = {"env_vars": {"NCCL_IB_DISABLE": "1", "NCCL_IP_OVER_IB": "0"}}
             if self.parallel_config.worker_use_ray:
                 worker_cls = ray.remote(
                     num_cpus=0,
                     num_gpus=1,
-                    resources={node_resource: 1e-5}
+                    resources={node_resource: 1e-4},
+                    runtime_env=runtime_env
                 )(worker_cls).remote
             
             worker = worker_cls(
@@ -224,7 +226,6 @@ class LLMEngine:
         
         if get_all_outputs:
             return all_outputs
-        print(all_outputs)
         # Make sure all workers have the same results.
         output = all_outputs[0]
         for other_output in all_outputs[1:]:
@@ -278,7 +279,7 @@ class LLMEngine:
                     self.tokenizer,
                     seq.output_tokens,
                     seq.get_last_token_id(),
-                    skip_specical_tokens=True,
+                    skip_special_tokens=True,
                 )
                 seq.output_tokens.append(new_token)
                 seq.output_text += new_output_text

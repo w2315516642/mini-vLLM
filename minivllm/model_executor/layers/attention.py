@@ -207,6 +207,7 @@ class PagedAttentionWithRoPE(PagedAttention):
     ) -> torch.Tensor:
         # Apply rotary embedding to the query and key before passing them
         # to the attention op.
+        query
         pos_encoding_ops.rotary_embedding_neox(
             positions,
             query,

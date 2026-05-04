@@ -34,7 +34,7 @@ def main(args: argparse.Namespace):
 
     def run_to_completion(profile: bool = False):
         if profile:
-            torch.cuda.cudart().cudaProfileStart()
+            torch.cuda.cudart().cudaProfilerStart()
         start_time = time.time()
         llm.generate(
             prompt_token_ids=dummy_prompt_token_ids,
@@ -44,7 +44,7 @@ def main(args: argparse.Namespace):
         end_time = time.time()
         latency = end_time - start_time
         if profile:
-            torch.cuda.cudart().cudaProfileStop()
+            torch.cuda.cudart().cudaProfilerStop()
         return latency
 
     print("Warming up...")
@@ -55,6 +55,9 @@ def main(args: argparse.Namespace):
     for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
         latencies.append(run_to_completion(profile=True))
     print(f"Avg latency: {np.mean(latencies)} seconds.")
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

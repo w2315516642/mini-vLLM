@@ -179,7 +179,7 @@ class GraphAllReduce:
 
         self.group = get_tensor_model_parallel_group()
         self.buffer = torch.empty(
-            size=(max_num_tokens, hidden_size),
+            size=(max_num_tokens + 1, hidden_size),
             dtype=dtype,
             device="cuda",
         )

@@ -15,7 +15,7 @@ from minivllm.model_executor import InputMetadata, set_random_seed, get_model
 from minivllm.model_executor.parallel_utils.parallel_state import (
     initialize_all_reduce_launcher, initialize_model_parallel)
 from minivllm.sampling_params import SamplingParams
-from minivllm.sequence import SequenceData, SequenceGroupMetadata
+from minivllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from minivllm.worker.cache_engine import CacheEngine
 from minivllm.utils.device import get_gpu_memory
 
@@ -183,7 +183,7 @@ class Worker:
             if seq_group_metadata.is_prompt:
                 continue
             
-            seq_ids = List(seq_group_metadata.seq_data.keys())
+            seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
             seq_groups.append((seq_ids, sampling_params))
 
