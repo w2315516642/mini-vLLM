@@ -6,3 +6,12 @@ __pycache__/
 docs/
 
 *.so
+
+
+build/
+
+dist/
+
+*.egg-info/
+
+.ipynb_checkpoints/
