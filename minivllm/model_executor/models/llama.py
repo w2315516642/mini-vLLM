@@ -67,7 +67,7 @@ class LlamaAttention(nn.Module):
 
         self.qkv_proj = ColumnParallelLinear(
             hidden_size,
-            3 * self.num_heads * self.head_dim,
+            3 * self.total_num_heads * self.head_dim,
             bias=False,
             gather_output=False,
             perform_initialization=False,
@@ -91,14 +91,14 @@ class LlamaAttention(nn.Module):
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
-        print(hidden_states.shape)
         qkv, _ = self.qkv_proj(hidden_states)
-        print(qkv.shape)
-        # q, k ,v = qkv.chunk(chunks=3, dim=-1)
-        qkv = qkv.reshape(-1, 3, self.num_heads, self.head_dim)
-        print(qkv.shape)
-        q, k, v = qkv.unbind(dim=1)
-        print(q.shape)
+        q, k ,v = qkv.chunk(chunks=3, dim=-1)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        # qkv = qkv.reshape(-1, 3, self.num_heads, self.head_dim)
+        # print(qkv.shape)
+        # q, k, v = qkv.unbind(dim=1)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(
             positions, q, k, v, k_cache, v_cache, input_metadata, cache_event
@@ -134,7 +134,6 @@ class LlamaDecoderLayer(nn.Module):
         # Attn
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -187,7 +186,6 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 cache_event,
             )
-            print(f"layer {i}: ", hidden_states.is_contiguous())
         hidden_states = self.norm(hidden_states)
         return hidden_states
 

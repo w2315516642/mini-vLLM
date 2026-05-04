@@ -190,6 +190,9 @@ class ColumnParallelLinear(nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
+        # print(f"col output_size_per_partition: {self.output_size_per_partition}, "
+        #       f"total output size: {output_size}, "
+        #       f"world_size: {world_size}")
         self.skip_bias_add = skip_bias_add
 
         if params_dtype is None:
