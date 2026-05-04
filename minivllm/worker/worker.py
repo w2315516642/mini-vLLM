@@ -1,6 +1,8 @@
 import torch
 from typing import Tuple, List, Dict
 
+from torch.nn import parallel
+
 from minivllm.configs.config import (
     ModelConfig,
     CacheConfig,
@@ -10,6 +12,8 @@ from minivllm.configs.config import (
 
 from minivllm.model_executor import InputMetadata, set_random_seed, get_model
 
+from minivllm.model_executor.parallel_utils.parallel_state import (
+    initialize_all_reduce_launcher, initialize_model_parallel)
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata
 from minivllm.worker.cache_engine import CacheEngine
@@ -40,10 +44,13 @@ class Worker:
         _init_distributed_environment(parallel_config, rank, 
                                       distributed_init_method)
 
-        # TODO: initializing methods
         set_random_seed(self.model_config.seed)
         self.model = get_model(model_config)
-
+        initialize_all_reduce_launcher(
+            self.scheduler_config.max_num_batched_tokens,
+            self.model_config.get_hidden_size(),
+            self.model_config.dtype
+        )
 
         # 各类 cache 配置，在后续 self.init_cache_engine() 函数中设置
         self.cache_config = None
@@ -239,16 +246,17 @@ def _init_distributed_environment(
     rank: int,
     distributed_init_method: str
 ) -> None:
+    """Initialize the distributed environment."""
     torch.distributed.init_process_group(
         backend="nccl",
         world_size=parallel_config.world_size,
         rank=rank,
         init_method=distributed_init_method
     )
-
-    # warm up
+    # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
-    # TODO: initialize_model_parallel()
+    initialize_model_parallel(parallel_config.tensor_parallel_size,
+                              parallel_config.pipeline_parallel_size)
 
 
 def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:

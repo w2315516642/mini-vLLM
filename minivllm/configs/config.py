@@ -66,7 +66,7 @@ class ModelConfig:
 
 class CacheConfig:
     " 对 KVCache 的配置 "
-    def __inint__(
+    def __init__(
         self,
         block_size: int, 
         gpu_memory_utilization: float,
