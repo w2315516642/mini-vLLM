@@ -81,7 +81,12 @@ __global__ void single_query_cached_kv_attention_kernel(
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_blocks_per_seq,
   const int q_stride) {
+  // block-size是一个block里面的token数量
+  // THREAD_GROUP_SIZE 表示多少个线程处理block中的一个token的特征
+  // 例如这里可以是32/16=2个线程处理一个token的特征
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
+  // NUM_TOKENS_PER_THREAD_GROUP 避免block size大于warp size时，一个线程组处理不了一个token
+  // 例如当block size=64时，这个参数等于2，一个线程需要处理两个token的特征
   constexpr int NUM_TOKENS_PER_THREAD_GROUP = (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int thread_idx = threadIdx.x;

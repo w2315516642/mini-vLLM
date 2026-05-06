@@ -142,6 +142,8 @@ class PagedAttention(nn.Module):
         if (num_valid_tokens > 0 and key_cache is not None
             and value_cache is not None):
             # The stride is 3 because the key and value are sliced from qkv.
+            # NOTE: 这里把对应层的kv cache整个（指针）传进去了
+            # 然后根据slot_mapping把算好的key和value通过这个函数放置到kv cache的对应位置
             cache_ops.reshape_and_cache(
                 key[:num_valid_tokens],
                 value[:num_valid_tokens],
@@ -207,7 +209,6 @@ class PagedAttentionWithRoPE(PagedAttention):
     ) -> torch.Tensor:
         # Apply rotary embedding to the query and key before passing them
         # to the attention op.
-        query
         pos_encoding_ops.rotary_embedding_neox(
             positions,
             query,

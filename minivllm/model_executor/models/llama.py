@@ -96,9 +96,7 @@ class LlamaAttention(nn.Module):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        # qkv = qkv.reshape(-1, 3, self.num_heads, self.head_dim)
-        # print(qkv.shape)
-        # q, k, v = qkv.unbind(dim=1)
+        
         k_cache, v_cache = kv_cache
         attn_output = self.attn(
             positions, q, k, v, k_cache, v_cache, input_metadata, cache_event
