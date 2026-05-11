@@ -1,5 +1,7 @@
 /*
  * Adapted from https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention/decoder_masked_multihead_attention_template.hpp
+ * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention/decoder_masked_multihead_attention_template.hpp
+ * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention/decoder_masked_multihead_attention_template.hpp
  * Copyright (c) 2023, The vLLM team.
  * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -15,8 +17,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
@@ -30,8 +32,8 @@
 namespace vllm {
 
 // Utility function for attention softmax.
-template<int NUM_WARPS>
-inline __device__ float block_sum(float* red_smem, float sum) {
+template <int NUM_WARPS>
+inline __device__ float block_sum(float *red_smem, float sum) {
   // Decompose the thread index into warp / lane.
   int warp = threadIdx.x / WARP_SIZE;
   int lane = threadIdx.x % WARP_SIZE;
@@ -65,29 +67,29 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   return __shfl_sync(uint32_t(-1), sum, 0);
 }
 
-// Grid: (num_heads, num_seqs).
-template<
-  typename scalar_t,
-  int HEAD_SIZE,
-  int BLOCK_SIZE,
-  int NUM_THREADS>
+// Grid: (num_heads, num_seqs)
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS>
 __global__ void single_query_cached_kv_attention_kernel(
-  scalar_t* __restrict__ out,             // [num_seqs, num_heads, head_size]
-  const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
-  const scalar_t* __restrict__ k_cache,   // [num_blocks, num_heads, head_size/x, block_size, x]
-  const scalar_t* __restrict__ v_cache,   // [num_blocks, num_heads, head_size, block_size]
-  const float scale,
-  const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
-  const int* __restrict__ context_lens,   // [num_seqs]
-  const int max_num_blocks_per_seq,
-  const int q_stride) {
+    scalar_t *__restrict__ out,           // [num_seqs, num_heads, head_size]
+    const scalar_t *__restrict__ q,       // [num_seqs, num_heads, head_size]
+    const scalar_t *__restrict__ k_cache, // [num_blocks, num_heads,
+                                          // head_size/x, block_size, x]
+    const scalar_t
+        *__restrict__ v_cache, // [num_blocks, num_heads, head_size, block_size]
+    const float scale,
+    const int *__restrict__ block_tables, // [num_seqs, max_num_blocks_per_seq]
+    const int *__restrict__ context_lens, // [num_seqs]
+    const int max_num_blocks_per_seq, const int q_stride) {
   // block-size是一个block里面的token数量
   // THREAD_GROUP_SIZE 表示多少个线程处理block中的一个token的特征
   // 例如这里可以是32/16=2个线程处理一个token的特征
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
-  // NUM_TOKENS_PER_THREAD_GROUP 避免block size大于warp size时，一个线程组处理不了一个token
-  // 例如当block size=64时，这个参数等于2，一个线程需要处理两个token的特征
-  constexpr int NUM_TOKENS_PER_THREAD_GROUP = (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  // NUM_TOKENS_PER_THREAD_GROUP 避免block size大于warp
+  // size时，一个线程组处理不了一个token 例如当block
+  // size=64时，这个参数等于2，一个线程需要处理两个token的特征
+  constexpr int NUM_TOKENS_PER_THREAD_GROUP =
+      (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
@@ -98,10 +100,10 @@ __global__ void single_query_cached_kv_attention_kernel(
   const int seq_idx = blockIdx.y;
 
   // A vector type to store a part of a key or a query.
-  // The vector size is configured in such a way that the threads in a thread group
-  // fetch or compute 16 bytes at a time.
-  // For example, if the size of a thread group is 4 and the data type is half,
-  // then the vector size is 16 / (4 * sizeof(half)) == 2.
+  // The vector size is configured in such a way that the threads in a thread
+  // group fetch or compute 16 bytes at a time. For example, if the size of a
+  // thread group is 4 and the data type is half, then the vector size is 16 /
+  // (4 * sizeof(half)) == 2.
   constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
   using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
   using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
@@ -114,22 +116,22 @@ __global__ void single_query_cached_kv_attention_kernel(
 
   // Load the query to registers.
   // Each thread in a thread group has a different part of the query.
-  // For example, if the the thread group size is 4, then the first thread in the group
-  // has 0, 4, 8, ... th vectors of the query, and the second thread has 1, 5, 9, ...
-  // th vectors of the query, and so on.
-  // NOTE(woosuk): Because q is split from a qkv tensor, it may not be contiguous.
-  const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
+  // For example, if the the thread group size is 4, then the first thread in
+  // the group has 0, 4, 8, ... th vectors of the query, and the second thread
+  // has 1, 5, 9, ... th vectors of the query, and so on. NOTE(woosuk): Because
+  // q is split from a qkv tensor, it may not be contiguous.
+  const scalar_t *q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
   Q_vec q_vecs[NUM_VECS_PER_THREAD];
 #pragma unroll
   for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
     const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
-    q_vecs[i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
+    q_vecs[i] = *reinterpret_cast<const Q_vec *>(q_ptr + vec_idx * VEC_SIZE);
   }
 
   // Memory planning.
   extern __shared__ char shared_mem[];
   // NOTE(woosuk): We use FP32 for the softmax logits for better accuracy.
-  float* logits = reinterpret_cast<float*>(shared_mem);
+  float *logits = reinterpret_cast<float *>(shared_mem);
   // Workspace for reduction.
   __shared__ float red_smem[2 * NUM_WARPS];
 
@@ -138,7 +140,7 @@ __global__ void single_query_cached_kv_attention_kernel(
   constexpr int x = 16 / sizeof(scalar_t);
   float qk_max = -FLT_MAX;
 
-  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   const int context_len = context_lens[seq_idx];
   const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -146,35 +148,40 @@ __global__ void single_query_cached_kv_attention_kernel(
   // Each warp fetches a block of keys for each iteration.
   // Each thread group in a warp fetches a key from the block, and computes
   // dot product with the query.
-  for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
+  for (int block_idx = warp_idx; block_idx < num_blocks;
+       block_idx += NUM_WARPS) {
     const int physical_block_number = block_table[block_idx];
 
     // Load a key to registers.
     // Each thread in a thread group has a different part of the key.
-    // For example, if the the thread group size is 4, then the first thread in the group
-    // has 0, 4, 8, ... th vectors of the key, and the second thread has 1, 5, 9, ... th
-    // vectors of the key, and so on.
+    // For example, if the the thread group size is 4, then the first thread in
+    // the group has 0, 4, 8, ... th vectors of the key, and the second thread
+    // has 1, 5, 9, ... th vectors of the key, and so on.
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-      const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
+      const int physical_block_offset =
+          (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
       K_vec k_vecs[NUM_VECS_PER_THREAD];
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const scalar_t* k_ptr = k_cache + physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE
-                                        + head_idx * HEAD_SIZE * BLOCK_SIZE
-                                        + physical_block_offset * x;
+        const scalar_t *k_ptr =
+            k_cache +
+            physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
-        k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        k_vecs[j] = *reinterpret_cast<const K_vec *>(
+            k_ptr + offset1 * BLOCK_SIZE * x + offset2);
       }
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
-      const float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
+      const float qk =
+          scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
       const bool mask = token_idx >= context_len;
-    
+
       if (thread_group_offset == 0) {
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
@@ -231,7 +238,8 @@ __global__ void single_query_cached_kv_attention_kernel(
 
   constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
   constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW;
-  constexpr int NUM_ROWS_PER_THREAD = (HEAD_SIZE + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER;
+  constexpr int NUM_ROWS_PER_THREAD =
+      (HEAD_SIZE + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER;
 
   // NOTE(woosuk): We use FP32 for the accumulator for better accuracy.
   float accs[NUM_ROWS_PER_THREAD];
@@ -240,21 +248,24 @@ __global__ void single_query_cached_kv_attention_kernel(
     accs[i] = 0.f;
   }
 
-  for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
+  for (int block_idx = warp_idx; block_idx < num_blocks;
+       block_idx += NUM_WARPS) {
     const int physical_block_number = block_table[block_idx];
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
-    from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx));
+    from_float(logits_vec,
+               *reinterpret_cast<Float_L_vec *>(logits + token_idx));
 
-    const scalar_t* v_ptr = v_cache + physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE
-                                    + head_idx * HEAD_SIZE * BLOCK_SIZE;
+    const scalar_t *v_ptr =
+        v_cache + physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE +
+        head_idx * HEAD_SIZE * BLOCK_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE) {
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
-        V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset);
+        V_vec v_vec = *reinterpret_cast<const V_vec *>(v_ptr + offset);
         accs[i] += dot(logits_vec, v_vec);
       }
     }
@@ -271,18 +282,18 @@ __global__ void single_query_cached_kv_attention_kernel(
     accs[i] = acc;
   }
 
-  // NOTE(woosuk): A barrier is required because the shared memory space for logits
-  // is reused for the output.
+  // NOTE(woosuk): A barrier is required because the shared memory space for
+  // logits is reused for the output.
   __syncthreads();
 
   // Perform reduction across warps.
-  float* out_smem = reinterpret_cast<float*>(shared_mem);
+  float *out_smem = reinterpret_cast<float *>(shared_mem);
 #pragma unroll
   for (int i = NUM_WARPS; i > 1; i /= 2) {
     int mid = i / 2;
     // Upper warps write to shared memory.
     if (warp_idx >= mid && warp_idx < i) {
-      float* dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
+      float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
 #pragma unroll
       for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
         const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
@@ -295,7 +306,7 @@ __global__ void single_query_cached_kv_attention_kernel(
 
     // Lower warps update the output.
     if (warp_idx < mid) {
-      const float* src = &out_smem[warp_idx * HEAD_SIZE];
+      const float *src = &out_smem[warp_idx * HEAD_SIZE];
 #pragma unroll
       for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
         const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
@@ -309,7 +320,8 @@ __global__ void single_query_cached_kv_attention_kernel(
 
   // Write the final output.
   if (warp_idx == 0) {
-    scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+    scalar_t *out_ptr =
+        out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
@@ -320,35 +332,379 @@ __global__ void single_query_cached_kv_attention_kernel(
   }
 }
 
+// Grid: (num_blocks_per_seq, num_heads, num_seqs)
+// NUM_THREADS = 128
+// TM是一个warp一次处理的query行数
+// Qi需要用掉 TM * (head_size * data type) / 32 个寄存器，需要注意
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
+          int NUM_THREADS, const int TM = 2>
+__global__ void varlen_query_cached_kv_attention_kernel(
+    scalar_t *__restrict__ out,           // [num_tokens, num_heads, head_size]
+    const scalar_t *__restrict__ q,       // [max_seqlen_q * num_seqs,
+                                          // num_heads, head_size]
+    const scalar_t *__restrict__ k_cache, // [num_blocks, num_heads,
+                                          // head_size/x, block_size, x]
+    const scalar_t *__restrict__ v_cache, // [num_blocks, num_heads, head_size, block_size]
+    const int *__restrict__ cu_seqlens_q, // [num_seqs + 1]
+    const int max_seqlen_q, const float scale,
+    const int *__restrict__ block_tables, // [num_seqs, max_num_blocks_per_seq]
+    const int *__restrict__ context_lens, // [num_seqs]
+    const int max_num_blocks_per_seq, const int q_stride) {
+  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
+  constexpr int NUM_TOKENS_PER_THREAD_GROUP =
+      (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+
+  const int thread_idx = threadIdx.x;
+  const int warp_idx = thread_idx / WARP_SIZE;
+  const int lane_idx = thread_idx % WARP_SIZE;
+  
+  const int head_idx = blockIdx.y;
+  const int seq_idx = blockIdx.z;
+
+  const int num_blocks_per_seq = gridDim.x;
+  const int num_heads = gridDim.y;
+  const int num_seqs = gridDim.z;
+
+  const int num_tokens_per_block =
+      (max_seqlen_q + num_blocks_per_seq - 1) / num_blocks_per_seq;
+  
+  // 当前seq在q中第一维（tokens）的起始位置
+  const int q_offset = seq_idx * max_seqlen_q;
+  // 这个是当前block处理的seq的token offset，不是在整个q内的idx
+  const int m_block_offset = blockIdx.x * num_tokens_per_block;
+  // 计算当前block.y对应的seq的真实长度
+  const int seqlen_q = cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx];
+  // 计算当前block处理的Query的token范围
+  const int num_q_tokens =
+      MIN(num_tokens_per_block, seqlen_q - m_block_offset);
+  // 目前是填充到max_seqlen_q, 有些seq填充的tokens数可能大于num_tokens_per_block
+  if (num_q_tokens <= 0) return;
+
+  // A vector type to store a part of a key or a query.
+  // The vector size is configured in such a way that the threads in a thread
+  // group fetch or compute 16 bytes at a time. For example, if the size of a
+  // thread group is 4 and the data type is half, then the vector size is 16 /
+  // (4 * sizeof(half)) == 2.
+  // 一个vec里面包含多少个scalar_t类型数据，当block-size=16、数据类型为half时
+  // VEC_SIZE=2，即一个vec里面包含2个half类型数据
+  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
+  using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
+  using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
+      
+  // 每个线程处理head-size维度元素（scalar_t）的数量
+  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
+  // 每个线程要处理的vec的数量
+  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
+
+  const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;    // 当前thread对应token组
+  const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE; // 当前thread的token组内idx
+  
+  // 一个线程一次处理TM*(NUM_VECS * VEC_SIZE)大小的Query tile
+  Q_vec Qi[TM * NUM_VECS_PER_THREAD];
+  
+  const scalar_t *q_ptr = q + (q_offset + m_block_offset) * q_stride
+                            + head_idx * HEAD_SIZE;
+
+  // const int num_tiles_m = (num_q_tokens + TM - 1) / TM;
+  // Q矩阵外循环
+  for (int loop = warp_idx * TM; loop < num_q_tokens; loop += NUM_WARPS * TM) {
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      // 填充当前Qi子块
+      // q里面对应的token-idx起始下标
+      const int token_idx = loop + row_offset;
+      if (token_idx < num_q_tokens) {
+#pragma unroll
+        for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
+          const int ele_idx = token_idx * q_stride + VEC_SIZE *
+                              (thread_group_offset + i * THREAD_GROUP_SIZE);
+          Qi[row_offset * NUM_VECS_PER_THREAD + i] = 
+              *reinterpret_cast<const Q_vec*>(q_ptr + ele_idx);
+        }
+      }
+    } // 搬运Qi完毕
+    
+    // 写完后记得放到Qi循环外面
+    // NOTE(woosuk): We use FP32 for the softmax logits for better accuracy.
+    extern __shared__ char shared_mem[];
+    // float *KiVi = shared_mem;
+    // Si = Qi * Ki^T, Pi = exp(Si - mi)
+    // 先用来存Si，然后原地计算exp用来存Pi, [TM * TN]
+    constexpr int TN = NUM_WARPS * BLOCK_SIZE;
+    float *logits = reinterpret_cast<float*>(shared_mem);;
+    // // 中间求和值，当前最大值，先前最大值
+    // float *li = &shared_mem[TM * TN];
+    // float *qk_max = &shared_mem[TM * TN + TM];
+    // float *qk_max2 = &shared_mem[TM * TN + 2 * TM];
+    // 先读取Ki跟Qi进行计算，然后重利用给Vi用来计算, [TN * HEAD_SIZE/x * x]
+    // __shared__ K_vec KiVi[TN * HEAD_SIZE];
+
+    __shared__ float red_smem[2 * TM * NUM_WARPS];
+
+    // 准备填充Ki子块
+    // x == THREAD_GROUP_SIZE * VEC_SIZE
+    // Each thread group fetches x elements from the key at a time.
+    constexpr int x = 16 / sizeof(scalar_t);
+    float &qk_max_tg[TM];
+    for (int i = 0; i < TM; i++) {
+      qk_max_tg[i] = -FLT_MAX;
+    }
+
+    const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+    const int context_len = context_lens[seq_idx];
+    // 当前seq要找的kv cache block的数量
+    const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    K_vec zero_K_vec;
+    memset(&zero_K_vec, 0.0f, sizeof(K_vec));
+    // 一个warp一轮处理一个kvblock
+    for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
+      // 当前warp处理的物理block-id
+      const int physical_block_id = block_table[block_idx];
+      // 把kcache数据搬运到KiVi内
+      for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
+        // 当前线程group处理的block内的物理token-idx
+        const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
+        // K的context-len内的逻辑token-idx
+        const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+
+        K_vec k_vecs[NUM_VECS_PER_THREAD];
+
+        // const bool mask = token_idx >= context_len;
+        // 从kvcache中获取当前Ki子块
+        const scalar_t *k_ptr = k_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE
+                                        + head_idx * HEAD_SIZE * BLOCK_SIZE
+                                        + physical_block_offset * x;
+#pragma unroll
+        for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+          const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+          const int offset1 = (vec_idx * VEC_SIZE) / x;
+          const int offset2 = (vec_idx * VEC_SIZE) % x;
+          // KiVi[token_idx * HEAD_SIZE + j] = mask ? zero_K_vec : 
+          //     *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        }
+
+        // Compute dot product.
+        // This includes a reduction across the threads in the same thread group.
+        for (int row_offset = 0; row_offset < TM; row_offset++) {
+          // q里面对应的token-idx起始下标
+          const int q_token_idx = loop + row_offset;
+          if (q_token_idx < num_q_tokens) {
+            Q_vec *q_vecs = &Qi[row_offset * NUM_VECS_PER_THREAD];
+            const float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
+            const bool mask = token_idx >= context_len;
+            
+            // 线程组内第0个线程负责赋值dot结果和qk最大值
+            if (thread_group_offset == 0) {
+              const int s_idx = row_offset * TN + (token_idx % TN); 
+              logits[s_idx] = mask ? 0.0f : qk;
+              // 每个线程维护自己组负责的token qk值的最大值
+              // 由于一个tg (thread group) 可能负责多个token，因此需要多次比较
+              qk_max_tg[row_offset] = mask ? qk_max_tg[row_offset] : 
+                                             fmaxf(qk_max_tg[row_offset], qk);
+            }
+          }
+        }
+      }
+    }
+
+    // 在warp内进行规约
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      const int q_token_idx = loop + row_offset;
+      if (q_token_idx < num_q_tokens) {
+        for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
+          qk_max_tg[row_offset] = fmaxf(qk_max_tg[row_offset], 
+              __shfl_xor_sync(uint32_t(-1), qk_max_tg[row_offset], mask));
+        }
+        if (lane_idx == 0) {
+          red_smem[row_offset * NUM_WARPS * 2 + warp_idx] = qk_max_tg[row_offset];
+        }
+      }
+    }
+    __syncthreads();
+
+    // 进行block内最大值规约
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      const int q_token_idx = loop + row_offset;
+      if (q_token_idx < num_q_tokens) {
+        qk_max_tg[row_offset] = lane_idx < NUM_WARPS ? 
+            red_smem[row_offset * NUM_WARPS * 2 + lane_idx] : -FLT_MAX;
+#pragma unroll
+        for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+          // 最大值归约到每个warp的前NUM_WARPS个线程里面
+          qk_max_tg[row_offset] = fmaxf(qk_max_tg[row_offset], 
+              __shfl_xor_sync(uint32_t(-1), qk_max_tg[row_offset], mask));
+        }
+        // 把最大值广播到每个warp内的所有线程上
+        qk_max_tg[row_offset] = __shfl_sync(uint32_t(-1), qk_max_tg[row_offset], 0);
+
+        // Get the sum of the exp values.
+        float exp_sum = 0.0f;
+        for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+          const int s_idx = row_offset * TN + i;
+          float val = __expf(logits[s_idx] - qk_max_tg[row_offset]);
+          logits[s_idx] = val;
+          exp_sum += val;
+        }
+        exp_sum = block_sum<NUM_WARPS>(
+          &red_smem[row_offset * NUM_WARPS * 2 + NUM_WARPS], exp_sum);
+        
+        // 计算softmax
+        const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
+        for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+          const int s_idx = row_offset * TN + i; 
+          logits[s_idx] *= inv_sum;
+        }
+      }
+    }
+
+    __syncthreads();
+    // 从kvcache中获取当前Vi子块
+    // 写完记得搬到query外循环外面
+    // Each thread will fetch 16 bytes from the value cache at a time.
+    constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
+    using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
+    using L_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
+    using Float_L_vec = typename FloatVec<L_vec>::Type;
+
+    // v cache: [num_blocks, num_heads, head_size, block_size]
+    // 每行取多少个V_vec，一个thread取一个，等价于每行要多少个thread处理
+    constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
+    // 每个warp一轮处理多少行
+    constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW; 
+    // 每个thread要处理的总行数，即循环次数
+    constexpr int NUM_ROWS_PER_THREAD = (HEAD_SIZE + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER;
+
+    float accs[TM * NUM_ROWS_PER_THREAD];
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+#pragma unroll
+      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+        accs[row_offset * NUM_ROWS_PER_THREAD + i] = 0.f;
+      }
+    }
+
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      const int q_token_idx = loop + row_offset;
+      if (q_token_idx < num_q_tokens) {
+        for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
+          const int physical_block_id = block_table[block_idx];
+          // 当前thread处理的是某一行的哪个v-vec
+          const int physical_block_offset = (lane_idx % NUM_V_VECS_PER_ROW) * V_VEC_SIZE; 
+          const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+          L_vec logits_vec;
+          from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(
+                                  &logits[row_offset * TN] + token_idx));
+          // 当前warp处理的v-cache数据起始指针位置
+          const scalar_t *v_ptr = v_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE
+                                          + head_idx * HEAD_SIZE * BLOCK_SIZE;
+          // 取出v-cache里面的数据并作乘法
+#pragma unroll
+          for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+            const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+            if (row_idx < HEAD_SIZE) {
+              const int offset_r = row_idx * BLOCK_SIZE + physical_block_offset;
+              V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset_r);
+              accs[row_offset * NUM_ROWS_PER_THREAD + i] += dot(logits_vec, v_vec);
+            }
+          }
+        }
+        // 一个token维度可能由多个thread处理
+        // 因此需要对这几个thread进行规约
+#pragma unroll
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          float acc = accs[row_offset * NUM_ROWS_PER_THREAD + i];
+#pragma unroll
+          for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
+            acc += __shfl_xor_sync(uint32_t(-1), acc, mask);
+          }
+          accs[row_offset * NUM_ROWS_PER_THREAD + i] = acc;
+        }
+      }
+    }
+    __syncthreads();
+
+    // 在warp间进行求和，即处理不同kv block的token数据
+    // out_smem: [TM * NUM_WARPS / 2 * HEAD_SIZE]
+    float* out_smem = reinterpret_cast<float*>(shared_mem);
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      const int q_token_idx = loop + row_offset;
+      if (q_token_idx < num_q_tokens) {
+#pragma unroll
+        for (int i = NUM_WARPS; i > 1; i /= 2) {
+          // 手动进行树状规约
+          // 高半部分warp把结果写到里面，然后低半部分的warp再加上去
+          int mid = i / 2;
+          if (warp_idx >= mid && warp_idx < i) {
+            int out_idx = row_offset * NUM_WARPS / 2 * HEAD_SIZE 
+                          + (warp_idx - mid) * HEAD_SIZE;
+            float *dst = &out_smem[out_idx];
+#pragma unroll
+            for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+              const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+              if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
+                dst[row_idx] = accs[row_offset * NUM_ROWS_PER_THREAD + i];
+              }
+            }
+          }
+          // 等高半warp把数据都搬到dst内
+          __syncthreads();
+
+          // 低半warp对数据进行累加
+          if (warp_idx < mid) {
+            int out_idx = row_offset * NUM_WARPS / 2 * HEAD_SIZE 
+                          + warp_idx * HEAD_SIZE;
+            const float *src = &out_smem[out_idx];
+#pragma unroll
+            for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+              const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+              if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
+                accs[row_offset * NUM_ROWS_PER_THREAD + i] += src[row_idx];
+              }
+            }
+          }
+          __syncthreads();
+        }
+      }
+    } // 规约后求和结果放在了第一个warp内
+
+    // 更新输出子块Oi
+    if (warp_idx == 0) {
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+        const int q_token_idx = loop + row_offset;
+        if (q_token_idx < num_q_tokens) { 
+          // 要看绝对指针了
+          const int token_idx = q_offset + m_block_offset + q_token_idx;
+          scalar_t* out_ptr = out + token_idx * num_heads * HEAD_SIZE
+                                  + head_idx * HEAD_SIZE;
+          for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+            const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+            if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
+              from_float(*(out_ptr + row_idx), accs[row_offset * NUM_ROWS_PER_THREAD + i]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 } // namespace vllm
 
-#define LAUNCH_ATTENTION_KERNEL(T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS)                        \
-  vllm::single_query_cached_kv_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>        \
-  <<<grid, block, shared_mem_size, stream>>>(                                                 \
-    out_ptr,                                                                                  \
-    query_ptr,                                                                                \
-    key_cache_ptr,                                                                            \
-    value_cache_ptr,                                                                          \
-    scale,                                                                                    \
-    block_tables_ptr,                                                                         \
-    context_lens_ptr,                                                                         \
-    max_num_blocks_per_seq,                                                                   \
-    query_stride);
+#define LAUNCH_ATTENTION_KERNEL(T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS)         \
+  vllm::single_query_cached_kv_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE,      \
+                                                NUM_THREADS>                   \
+      <<<grid, block, shared_mem_size, stream>>>(                              \
+          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,           \
+          block_tables_ptr, context_lens_ptr, max_num_blocks_per_seq,          \
+          query_stride);
 
 // TODO(woosuk): Tune NUM_THREADS.
-template<
-  typename T,
-  int BLOCK_SIZE,
-  int NUM_THREADS = 128>
+template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128>
 void single_query_cached_kv_attention_launcher(
-  torch::Tensor& out,
-  torch::Tensor& query,
-  torch::Tensor& key_cache,
-  torch::Tensor& value_cache,
-  float scale,
-  torch::Tensor& block_tables,
-  torch::Tensor& context_lens,
-  int max_context_len) {
+    torch::Tensor &out, torch::Tensor &query, torch::Tensor &key_cache,
+    torch::Tensor &value_cache, float scale, torch::Tensor &block_tables,
+    torch::Tensor &context_lens, int max_context_len) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -358,15 +714,16 @@ void single_query_cached_kv_attention_launcher(
   int thread_group_size = MAX(WARP_SIZE / BLOCK_SIZE, 1);
   assert(head_size % thread_group_size == 0);
 
-  T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
-  T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
-  T* key_cache_ptr = reinterpret_cast<T*>(key_cache.data_ptr());
-  T* value_cache_ptr = reinterpret_cast<T*>(value_cache.data_ptr());
-  int* block_tables_ptr = block_tables.data_ptr<int>();
-  int* context_lens_ptr = context_lens.data_ptr<int>();
+  T *out_ptr = reinterpret_cast<T *>(out.data_ptr());
+  T *query_ptr = reinterpret_cast<T *>(query.data_ptr());
+  T *key_cache_ptr = reinterpret_cast<T *>(key_cache.data_ptr());
+  T *value_cache_ptr = reinterpret_cast<T *>(value_cache.data_ptr());
+  int *block_tables_ptr = block_tables.data_ptr<int>();
+  int *context_lens_ptr = context_lens.data_ptr<int>();
 
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-  int padded_max_context_len = ((max_context_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+  int padded_max_context_len =
+      ((max_context_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
   int logits_size = padded_max_context_len * sizeof(float);
   int outputs_size = (NUM_WARPS / 2) * head_size * sizeof(float);
   int shared_mem_size = std::max(logits_size, outputs_size);
@@ -375,95 +732,90 @@ void single_query_cached_kv_attention_launcher(
   dim3 block(NUM_THREADS);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   switch (head_size) {
-    // NOTE(woosuk): To reduce the compilation time, we omitted head sizes
-    // 32, 160, 192, 256.
-    // case 32:
-    //   LAUNCH_ATTENTION_KERNEL(T, 32, BLOCK_SIZE, NUM_THREADS);
-    //   break;
-    case 64:
-      LAUNCH_ATTENTION_KERNEL(T, 64, BLOCK_SIZE, NUM_THREADS);
-      break;
-    case 80:
-      LAUNCH_ATTENTION_KERNEL(T, 80, BLOCK_SIZE, NUM_THREADS);
-      break;
-    case 96:
-      LAUNCH_ATTENTION_KERNEL(T, 96, BLOCK_SIZE, NUM_THREADS);
-      break;
-    case 128:
-      LAUNCH_ATTENTION_KERNEL(T, 128, BLOCK_SIZE, NUM_THREADS);
-      break;
-    // case 160:
-    //   LAUNCH_ATTENTION_KERNEL(T, 160, BLOCK_SIZE, NUM_THREADS);
-    //   break;
-    // case 192:
-    //   LAUNCH_ATTENTION_KERNEL(T, 192, BLOCK_SIZE, NUM_THREADS);
-    //   break;
-    // case 256:
-    //   LAUNCH_ATTENTION_KERNEL(T, 256, BLOCK_SIZE, NUM_THREADS);
-    //   break;
-    default:
-      TORCH_CHECK(false, "Unsupported head size: ", head_size);
-      break;
+  // NOTE(woosuk): To reduce the compilation time, we omitted head sizes
+  // 32, 160, 192, 256.
+  // case 32:
+  //   LAUNCH_ATTENTION_KERNEL(T, 32, BLOCK_SIZE, NUM_THREADS);
+  //   break;
+  case 64:
+    LAUNCH_ATTENTION_KERNEL(T, 64, BLOCK_SIZE, NUM_THREADS);
+    break;
+  case 80:
+    LAUNCH_ATTENTION_KERNEL(T, 80, BLOCK_SIZE, NUM_THREADS);
+    break;
+  case 96:
+    LAUNCH_ATTENTION_KERNEL(T, 96, BLOCK_SIZE, NUM_THREADS);
+    break;
+  case 128:
+    LAUNCH_ATTENTION_KERNEL(T, 128, BLOCK_SIZE, NUM_THREADS);
+    break;
+  // case 160:
+  //   LAUNCH_ATTENTION_KERNEL(T, 160, BLOCK_SIZE, NUM_THREADS);
+  //   break;
+  // case 192:
+  //   LAUNCH_ATTENTION_KERNEL(T, 192, BLOCK_SIZE, NUM_THREADS);
+  //   break;
+  // case 256:
+  //   LAUNCH_ATTENTION_KERNEL(T, 256, BLOCK_SIZE, NUM_THREADS);
+  //   break;
+  default:
+    TORCH_CHECK(false, "Unsupported head size: ", head_size);
+    break;
   }
 }
 
-#define CALL_KERNEL_LAUNCHER(T, BLOCK_SIZE)                         \
-  single_query_cached_kv_attention_launcher<T, BLOCK_SIZE>(         \
-    out,                                                            \
-    query,                                                          \
-    key_cache,                                                      \
-    value_cache,                                                    \
-    scale,                                                          \
-    block_tables,                                                   \
-    context_lens,                                                   \
-    max_context_len);
+#define CALL_KERNEL_LAUNCHER(T, BLOCK_SIZE)                                    \
+  single_query_cached_kv_attention_launcher<T, BLOCK_SIZE>(                    \
+      out, query, key_cache, value_cache, scale, block_tables, context_lens,   \
+      max_context_len);
 
 // NOTE(woosuk): To reduce the compilation time, we omitted block sizes
 // 1, 2, 4, 64, 128, 256.
-#define CALL_KERNEL_LAUNCHER_BLOCK_SIZE(T)                          \
-  switch (block_size) {                                             \
-    /* case 1:                         */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 1);   */                           \
-    /*   break;                        */                           \
-    /* case 2:                         */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 2);   */                           \
-    /*   break;                        */                           \
-    /* case 4:                         */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 4);   */                           \
-    /*   break;                        */                           \
-    case 8:                                                         \
-      CALL_KERNEL_LAUNCHER(T, 8);                                   \
-      break;                                                        \
-    case 16:                                                        \
-      CALL_KERNEL_LAUNCHER(T, 16);                                  \
-      break;                                                        \
-    case 32:                                                        \
-      CALL_KERNEL_LAUNCHER(T, 32);                                  \
-      break;                                                        \
-    /* case 64:                        */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 64);  */                           \
-    /*   break;                        */                           \
-    /* case 128:                       */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 128); */                           \
-    /*   break;                        */                           \
-    /* case 256:                       */                           \
-    /*   CALL_KERNEL_LAUNCHER(T, 256); */                           \
-    /*   break;                        */                           \
-    default:                                                        \
-      TORCH_CHECK(false, "Unsupported block size: ", block_size);   \
-      break;                                                        \
+#define CALL_KERNEL_LAUNCHER_BLOCK_SIZE(T)                                     \
+  switch (block_size) {                                                        \
+  /* case 1:                         */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 1);   */                                        \
+  /*   break;                        */                                        \
+  /* case 2:                         */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 2);   */                                        \
+  /*   break;                        */                                        \
+  /* case 4:                         */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 4);   */                                        \
+  /*   break;                        */                                        \
+  case 8:                                                                      \
+    CALL_KERNEL_LAUNCHER(T, 8);                                                \
+    break;                                                                     \
+  case 16:                                                                     \
+    CALL_KERNEL_LAUNCHER(T, 16);                                               \
+    break;                                                                     \
+  case 32:                                                                     \
+    CALL_KERNEL_LAUNCHER(T, 32);                                               \
+    break;                                                                     \
+  /* case 64:                        */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 64);  */                                        \
+  /*   break;                        */                                        \
+  /* case 128:                       */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 128); */                                        \
+  /*   break;                        */                                        \
+  /* case 256:                       */                                        \
+  /*   CALL_KERNEL_LAUNCHER(T, 256); */                                        \
+  /*   break;                        */                                        \
+  default:                                                                     \
+    TORCH_CHECK(false, "Unsupported block size: ", block_size);                \
+    break;                                                                     \
   }
 
 void single_query_cached_kv_attention(
-  torch::Tensor& out,             // [num_seqs, num_heads, head_size]
-  torch::Tensor& query,           // [num_seqs, num_heads, head_size]
-  torch::Tensor& key_cache,       // [num_blocks, num_heads, head_size/x, block_size, x]
-  torch::Tensor& value_cache,     // [num_blocks, num_heads, head_size, block_size]
-  float scale,
-  torch::Tensor& block_tables,    // [num_seqs, max_num_blocks_per_seq]
-  torch::Tensor& context_lens,    // [num_seqs]
-  int block_size,
-  int max_context_len) {
+    torch::Tensor &out,   // [num_seqs, num_heads, head_size]
+    torch::Tensor &query, // [num_seqs, num_heads, head_size]
+    torch::Tensor
+        &key_cache, // [num_blocks, num_heads, head_size/x, block_size, x]
+    torch::Tensor
+        &value_cache, // [num_blocks, num_heads, head_size, block_size]
+    float scale,
+    torch::Tensor &block_tables, // [num_seqs, max_num_blocks_per_seq]
+    torch::Tensor &context_lens, // [num_seqs]
+    int block_size, int max_context_len) {
   if (query.dtype() == at::ScalarType::Float) {
     CALL_KERNEL_LAUNCHER_BLOCK_SIZE(float);
   } else if (query.dtype() == at::ScalarType::Half) {

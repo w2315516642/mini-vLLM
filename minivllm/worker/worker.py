@@ -140,7 +140,7 @@ class Worker:
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
                 continue
-
+            # TODO: 处理有前缀缓存的prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
             sampling_params = seq_group_metadata.sampling_params
             seq_groups.append((seq_ids, sampling_params))
@@ -277,6 +277,7 @@ class Worker:
             seq_group_metadata_list=seq_group_metadata_list)
         
         # Execute the model.
+        # output: List[int (seq_id), SequenceOutputs]
         output = self.model(
             input_ids=input_tokens,
             positions=input_positions,

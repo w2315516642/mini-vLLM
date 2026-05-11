@@ -1,4 +1,5 @@
 .VSCodeCounter/
+.vscode/
 
 __pycache__/
 

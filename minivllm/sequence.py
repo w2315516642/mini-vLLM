@@ -4,6 +4,8 @@ from typing import Optional, List, Dict, Union
 
 from minivllm.kv_cache.block import LogicalTokenBlock
 from minivllm.sampling_params import SamplingParams
+from minivllm.utils import BlockHash, BlockHasher
+
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -77,20 +79,35 @@ class Sequence:
         prompt: str,
         prompt_token_ids: List[int],
         block_size: int,
+        block_hasher: Optional[BlockHasher] = None
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
         self.block_size = block_size
+        self.block_hasher = block_hasher
 
         self.data = SequenceData(prompt_token_ids)
         self.output_logprobs: List[Dict[int, float]] = []
         self.output_tokens: List[str] = []
         self.output_text = ""
 
+        # Number of tokens which have been computed.
+        self.num_computed_tokens: int = 0
+        self.num_cached_blocks: int = 0
+
+        self.block_hashes: List[BlockHash] = []
         self.logical_token_blocks: List[LogicalTokenBlock] = []
         # Initialize the logical token blocks with the prompt token ids.
         self._append_tokens_to_blocks(prompt_token_ids)
         self.status = SequenceStatus.WAITING
+
+        self.update_block_hashes()
+
+    def update_block_hashes(self) -> None:
+        if self.block_hasher is None:
+            return
+        new_block_hashes = self.block_hasher(self)
+        self.block_hashes.extend(new_block_hashes)
 
     def _append_logical_block(self) -> None:
         block = LogicalTokenBlock(
@@ -122,9 +139,14 @@ class Sequence:
         self._append_tokens_to_blocks([token_id])
         self.output_logprobs.append(logprobs)
         self.data.append_token_id(token_id, logprobs[token_id])
+        
+        self.update_block_hashes()
 
     def get_len(self) -> int:
         return self.data.get_len()
+
+    def get_prompt_len(self) -> int:
+        return self.get_len() - self.get_output_len()
 
     def get_output_len(self) -> int:
         return self.data.get_output_len()
@@ -163,12 +185,13 @@ class SequenceGroup:
         request_id: str,
         seqs: List[Sequence],
         sampling_params: SamplingParams,
-        arrival_time: float
+        arrival_time: float,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
+
 
     def get_seqs(
         self,
@@ -193,6 +216,7 @@ class SequenceGroup:
 
     def is_finished(self) -> bool:
         return all(seq.is_finished() for seq in self.seqs)
+
 
 class SequenceGroupMetadata:
     def __init__(

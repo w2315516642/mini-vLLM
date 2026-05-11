@@ -1,6 +1,7 @@
 from typing import Any, List, Optional
 import time
 
+
 from loguru import logger
 
 from minivllm.configs import (
@@ -12,7 +13,13 @@ from minivllm.engine.tokenizer_utils import detokenize_incrementally, get_tokeni
 from minivllm.outputs import RequestOutput
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from minivllm.utils import Counter
+from minivllm.utils import (
+    get_hash_fn_by_name, 
+    init_none_hash, 
+    get_seq_block_hasher, 
+    Counter, 
+    BlockHasher
+)
 from minivllm.worker.worker import Worker
 
 class LLMEngine:
@@ -62,9 +69,14 @@ class LLMEngine:
         
         self._init_cache()
 
-        # TODO: Create scheduler
         self.scheduler = Scheduler(scheduler_config, cache_config, log_stats)
-    
+
+        # TODO: Get hash function.
+        caching_hash_fn = get_hash_fn_by_name(
+            self.cache_config.prefix_caching_hash_fn)
+        init_none_hash(caching_hash_fn)
+        self.seq_block_hasher = get_seq_block_hasher(caching_hash_fn)
+        
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -182,7 +194,14 @@ class LLMEngine:
         seqs: List[Sequence] = []
         for _ in range(sampling_params.best_of):
             seq_id = next(self.seq_counter)
-            seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
+            # 在这里把哈希函数传进去，让Sequence初始化的时候计算哈希
+            seq = Sequence(
+                seq_id=seq_id, 
+                prompt=prompt, 
+                prompt_token_ids=prompt_token_ids, 
+                block_size=block_size, 
+                block_hasher=self.seq_block_hasher,
+            )
             seqs.append(seq)
         
         # Create the sequence group.

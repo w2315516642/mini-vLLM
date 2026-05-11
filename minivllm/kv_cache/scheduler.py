@@ -254,6 +254,7 @@ class Scheduler:
         for seq_group in self.running:
             # Process beam search results before processing the new tokens.
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                # 这里默认seq_outputs一定有running队列里面所有序列的结果
                 output = seq_outputs[seq.seq_id]
                 if seq.seq_id != output.parent_seq_id:
                     # The sequence is a fork of the parent sequence (beam search).
@@ -268,6 +269,7 @@ class Scheduler:
                 # Append a new token to the sequence.
                 output = seq_outputs[seq.seq_id]
                 seq.append_token_id(output.output_token, output.logprobs)
+                self.block_manager.cache_blocks(seq)
         # Return a shallow copy of the running queue to prevent the queue
         # from being modified by the caller.
         return self.running.copy()

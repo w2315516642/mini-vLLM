@@ -1,0 +1,9 @@
+CompileFlags:
+  Add: [
+    "-xcuda",                      
+    "--cuda-gpu-arch=sm_89",          
+    "-I/usr/local/cuda/include",
+    "-I/home/yue/anaconda3/envs/mini-vllm/lib/python3.10/site-packages/torch/include",
+    "-I/home/yue/anaconda3/envs/mini-vllm/lib/python3.10/site-packages/torch/include/torch/csrc/api/include",
+  ]
+  Compiler: clang++

@@ -1,8 +1,9 @@
 from typing import Optional, List, Dict, Tuple, Set
+from collections import OrderedDict
 
 from minivllm.kv_cache.block import PhysicalTokenBlock
 from minivllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from minivllm.utils import Device
+from minivllm.utils import Device, BlockHash
 
 class BlockAllocator:
     """Manages free physical token blocks for a device.
@@ -47,6 +48,60 @@ class BlockAllocator:
         return len(self.free_blocks)
 
 
+class BlockHashManager:
+    def __init__(self) -> None:
+        self.hash_to_block: OrderedDict[BlockHash, LogicalTokenBlock] = {}
+
+    def add_blocks(
+        self,
+        block_hashes: List[BlockHash],
+        blocks: List[PhysicalTokenBlock],
+    ) -> None:
+        assert len(block_hashes) == len(blocks), (
+            f"Length of block_hashes should be equal to blocks, "
+            f"but got {len(block_hashes)} and {len(blocks)}"
+        )
+
+        for block_hash, block in zip(block_hashes, blocks):
+            if block_hash in self.hash_to_block:
+                self.hash_to_block.move_to_end(block)
+                continue
+            self.hash_to_block[block_hash] = block
+
+    def get_block(
+        self, 
+        block_hash: BlockHash
+    ) -> PhysicalTokenBlock | None:
+        if block_hash not in self.hash_to_block:
+            return None
+        
+        self.hash_to_block.move_to_end(block_hash)
+        return self.hash_to_block[block_hash]
+
+    def find_longest_cache_hit(
+        self,
+        block_hashes: List[BlockHash],
+        max_num_tokens: int,
+    ) -> List[PhysicalTokenBlock]:
+        hit_blocks: List[PhysicalTokenBlock] = []
+        curr_num_tokens = 0
+        for block_hash in block_hashes:
+            block = self.get_block(block_hash)
+            if block is None:
+                break
+            
+            curr_num_tokens += block.block_size
+            if curr_num_tokens > max_num_tokens:
+                break
+
+            hit_blocks.append(block)
+        return hit_blocks
+
+    def evict(self, block_hash: BlockHash) -> PhysicalTokenBlock | None:
+        evicted_block = self.hash_to_block.pop(block_hash, None)
+        return evicted_block
+
+
 BlockTable = List[PhysicalTokenBlock]
 
 class BlockSpaceManager:
@@ -70,10 +125,24 @@ class BlockSpaceManager:
             Device.GPU, block_size, num_gpu_blocks)
         self.cpu_allocator = BlockAllocator(
             Device.CPU, block_size, num_cpu_blocks)
+        self.hash_manager = BlockHashManager()
 
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
+    def cache_blocks(self, seq: Sequence) -> None:
+        block_table = self.block_tables[seq.seq_id]
+        uncached_hashes = seq.block_hashes[seq.num_cached_blocks:]
+        uncached_blocks = block_table[seq.num_cached_blocks:]
+        # Drop the unfull block.
+        last_block = seq.logical_token_blocks[-1]
+        if not last_block.is_full():
+            uncached_blocks = uncached_blocks[:-1]
+        # Cache blocks.
+        self.hash_manager.add_blocks(
+            uncached_hashes, uncached_blocks)
+        seq.num_cached_blocks += len(uncached_blocks)
+    
     def can_allocate(self, seq_group: SequenceGroup) -> bool:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
@@ -83,20 +152,36 @@ class BlockSpaceManager:
         # Use watermark to avoid frequent cache eviction.
         return num_free_gpu_blocks - num_required_blocks > self.watermark_blocks
 
+    def find_longest_cache_hit(self, seq: Sequence) -> BlockTable:
+        # Allocate new physical token blocks that will store the prompt tokens.
+        # 这里找prompt命中的缓存块，找不到的再从gpu_allocator要
+        max_num_tokens = seq.get_prompt_len() - 1
+        hit_blocks = self.find_longest_cache_hit(
+            seq.block_hashes, max_num_tokens)
+        return BlockTable(hit_blocks)
+
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same prompt.
         seq = seq_group.get_seqs()[0]
+        block_table = self.find_longest_cache_hit(seq)
 
-        # Allocate new physical token blocks that will store the prompt tokens.
-        block_table: BlockTable = []
-        for _ in range(len(seq.logical_token_blocks)):
+        num_computed_tokens = len(block_table) * self.block_size
+        num_need_blocks = len(seq.logical_token_blocks) - len(block_table)
+        assert num_need_blocks >= 0, (
+            f"Number of logical_token_blocks {len(seq.logical_token_blocks)} "
+            f"should be greater than or equal to hit_blocks {len(block_table)}."
+        )
+        for _ in range(num_need_blocks):
             block = self.gpu_allocator.allocate()
-            # Set the reference counts of the token blocks.
-            block.ref_count = seq_group.num_seqs()
             block_table.append(block)
+        # Add ref_count
+        for block in block_table:
+            block.ref_count += seq_group.num_seqs()
         
         # Assign the block table for each sequence.
+        # 一个seq group里面所有seq共享相同的初始block table（因为prompt相同）
         for seq in seq_group.get_seqs():
+            seq.num_computed_tokens = num_computed_tokens
             self.block_tables[seq.seq_id] = block_table.copy()
     
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:

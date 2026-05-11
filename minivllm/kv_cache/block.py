@@ -1,6 +1,6 @@
 from typing import List
 
-from minivllm.utils.device import Device
+from minivllm.utils import Device
 
 class LogicalTokenBlock:
     "虚拟内存块，不代表真实内存情况"
