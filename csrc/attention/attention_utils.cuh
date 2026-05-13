@@ -52,31 +52,4 @@ struct Qk_dot {
   }
 };
 
-template<typename Vec, const int NUM_THREADS, const int NUM_VECS_PER_THREAD, 
-         int THREAD_GROUP_SIZE, const int TMN = 4>
-inline __device__ float QiKi_matmul_(
-  const Vec *A,
-  const Vec *B,
-  Vec *C,
-  int M, int N, int K,
-) {
-  using A_vec = typename FloatVec<Vec>::Type;
-
-  int tid = threadIdx.x;
-  constexpr int WARP_SIZE = 32;
-  int warp_idx = tid / WARP_SIZE;
-  int lane_idx = tid % WARP_SIZE;
-  int num_warps = NUM_THREADS / WAPR_SIZE;
-
-  // 每个warp处理TMN行
-  for (int sr = TMN * warp_idx; sr < M; sr += num_warps * TMN) {
-    // 当前warp处理的行数量
-    int BA = min(TMN, M - sr);
-    // 每个lane处理TMN列
-    for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
-
-    }
-  }
-}
-
 } // namespace vllm
