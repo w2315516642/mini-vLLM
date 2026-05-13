@@ -19,7 +19,7 @@
  */
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
-#include <cuda_pipeline.h>
+// #include <cuda_pipeline.h>
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
@@ -887,15 +887,15 @@ void varlen_query_cached_kv_attention_launcher(
     switch (block_size) {                                               \
     case 8:                                                             \
       CALL_VARLEN_KERNEL_LAUNCHER(T, 8);                                \
-      break;                                                            \        
-    case 16:                                                            \    
-      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \        
-      break;                                                            \      
-    case 32:                                                            \  
-      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \            
-      break;                                                            \                                  
-    default:                                                            \                    
-      TORCH_CHECK(false, "Unsupported block size: ", block_size);       \         
+      break;                                                            \
+    case 16:                                                            \
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \
+      break;                                                            \
+    case 32:                                                            \
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \
+      break;                                                            \
+    default:                                                            \
+      TORCH_CHECK(false, "Unsupported block size: ", block_size);       \
       break;                                                            \
     }
 
