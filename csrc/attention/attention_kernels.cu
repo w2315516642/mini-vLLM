@@ -812,7 +812,7 @@ void single_query_cached_kv_attention(
   vllm::varlen_query_cached_kv_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE,           \
                                                 NUM_THREADS, TM>                    \
       <<<grid, block, shared_mem_size, stream>>>(                                   \
-          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q          \
+          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q,         \
           max_seqlen_q, scale, block_tables_ptr, context_lens_ptr,                  \
           max_num_blocks_per_seq, query_stride)
 
@@ -841,22 +841,22 @@ void varlen_query_cached_kv_attention_launcher(
   T *out_ptr = reinterpret_cast<T *>(out.data_ptr());
   T *query_ptr = reinterpret_cast<T *>(query.data_ptr());
   T *key_cache_ptr = reinterpret_cast<T *>(key_cache.data_ptr());
-  T *value_cache_ptr = reinterpret_cast<T *(value_cache.data_ptr());
+  T *value_cache_ptr = reinterpret_cast<T *>(value_cache.data_ptr());
   int *block_tables_ptr = block_tables.data_ptr<int>();
   int *context_lens_ptr = context_lens.data_ptr<int>();
   int *cu_seqlens_q_ptr = cu_seqlens_q.data_ptr<int>();
 
-  constexpr int NUM_WAPRS = NUM_THREADS / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   int padded_max_context_len = 
       ((max_context_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
       // Default output data type is float.
   int shared_mem_size = NUM_WARPS * TM * BLOCK_SIZE * sizeof(float);
   
   // 一个block内一次循环处理NUM_WARPS * TM行，默认处理四次
-  constexpr TOKENS_PER_BLOCK = NUM_WARPS * TM * 4;
+  constexpr int TOKENS_PER_BLOCK = NUM_WARPS * TM * 4;
   int max_blocks_per_seq = 
       (max_seqlen_q + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
-  dim3 grid(num_blocks_per_seq, num_heads, num_seqs);
+  dim3 grid(max_blocks_per_seq, num_heads, num_seqs);
   dim3 block(NUM_THREADS);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   switch(head_size) {
