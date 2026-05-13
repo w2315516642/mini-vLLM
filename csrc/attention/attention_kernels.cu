@@ -19,6 +19,7 @@
  */
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#include <cuda_pipeline.h>
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
@@ -298,7 +299,7 @@ __global__ void single_query_cached_kv_attention_kernel(
       for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
         const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
         if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-          dst[row_idx] = accs[i];
+          dst[row_idx] = accs[i];   // 总共放了head-size个float元素进去
         }
       }
     }
@@ -354,6 +355,7 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   constexpr int NUM_TOKENS_PER_THREAD_GROUP =
       (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  constexpr int NUM_THREAD_GROUPS_PER_WARP = WARP_SIZE / THREAD_GROUP_SIZE;
 
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
@@ -397,8 +399,9 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   // 每个线程要处理的vec的数量
   constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
 
-  const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;    // 当前thread对应token组
-  const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE; // 当前thread的token组内idx
+  // Warp-local thread-group index.
+  const int thread_group_idx = lane_idx / THREAD_GROUP_SIZE;
+  const int thread_group_offset = lane_idx % THREAD_GROUP_SIZE;
   
   // 一个线程一次处理TM*(NUM_VECS * VEC_SIZE)大小的Query tile
   Q_vec Qi[TM * NUM_VECS_PER_THREAD];
@@ -406,8 +409,32 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   const scalar_t *q_ptr = q + (q_offset + m_block_offset) * q_stride
                             + head_idx * HEAD_SIZE;
 
+  constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
+  using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
+  using L_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
+  using Float_L_vec = typename FloatVec<L_vec>::Type;
+
+  // v cache: [num_blocks, num_heads, head_size, block_size]
+  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
+  constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW;
+  constexpr int NUM_ROWS_PER_THREAD =
+      (HEAD_SIZE + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER;
+
+  // x == THREAD_GROUP_SIZE * VEC_SIZE
+  constexpr int x = 16 / sizeof(scalar_t);
+
+  // Workspace:
+  // - block_logits: [NUM_WARPS, TM, BLOCK_SIZE]
+  // Used to keep one KV block's logits per warp and per query row.
+  extern __shared__ char shared_mem[];
+  float* block_logits_smem = reinterpret_cast<float*>(shared_mem);
+
+  const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  const int context_len = context_lens[seq_idx];
+  const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
   // const int num_tiles_m = (num_q_tokens + TM - 1) / TM;
-  // Q矩阵外循环
+  // Q矩阵外循环，不同warp处理不同行，每个warp处理一个完整的kv行，就不用全局规约了
   for (int loop = warp_idx * TM; loop < num_q_tokens; loop += NUM_WARPS * TM) {
     for (int row_offset = 0; row_offset < TM; row_offset++) {
       // 填充当前Qi子块
@@ -423,265 +450,218 @@ __global__ void varlen_query_cached_kv_attention_kernel(
         }
       }
     } // 搬运Qi完毕
-    
-    // 写完后记得放到Qi循环外面
-    // NOTE(woosuk): We use FP32 for the softmax logits for better accuracy.
-    extern __shared__ char shared_mem[];
-    // float *KiVi = shared_mem;
-    // Si = Qi * Ki^T, Pi = exp(Si - mi)
-    // 先用来存Si，然后原地计算exp用来存Pi, [TM * TN]
-    constexpr int TN = NUM_WARPS * BLOCK_SIZE;
-    float *logits = reinterpret_cast<float*>(shared_mem);;
-    // // 中间求和值，当前最大值，先前最大值
-    // float *li = &shared_mem[TM * TN];
-    // float *qk_max = &shared_mem[TM * TN + TM];
-    // float *qk_max2 = &shared_mem[TM * TN + 2 * TM];
-    // 先读取Ki跟Qi进行计算，然后重利用给Vi用来计算, [TN * HEAD_SIZE/x * x]
-    // __shared__ K_vec KiVi[TN * HEAD_SIZE];
 
-    __shared__ float red_smem[2 * TM * NUM_WARPS];
-
-    // 准备填充Ki子块
-    // x == THREAD_GROUP_SIZE * VEC_SIZE
-    // Each thread group fetches x elements from the key at a time.
-    constexpr int x = 16 / sizeof(scalar_t);
-    float &qk_max_tg[TM];
-    for (int i = 0; i < TM; i++) {
-      qk_max_tg[i] = -FLT_MAX;
-    }
-
-    const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
-    const int context_len = context_lens[seq_idx];
-    // 当前seq要找的kv cache block的数量
-    const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    K_vec zero_K_vec;
-    memset(&zero_K_vec, 0.0f, sizeof(K_vec));
-    // 一个warp一轮处理一个kvblock
-    for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
-      // 当前warp处理的物理block-id
-      const int physical_block_id = block_table[block_idx];
-      // 把kcache数据搬运到KiVi内
-      for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-        // 当前线程group处理的block内的物理token-idx
-        const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
-        // K的context-len内的逻辑token-idx
-        const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-
-        K_vec k_vecs[NUM_VECS_PER_THREAD];
-
-        // const bool mask = token_idx >= context_len;
-        // 从kvcache中获取当前Ki子块
-        const scalar_t *k_ptr = k_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE
-                                        + head_idx * HEAD_SIZE * BLOCK_SIZE
-                                        + physical_block_offset * x;
-#pragma unroll
-        for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-          const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-          const int offset1 = (vec_idx * VEC_SIZE) / x;
-          const int offset2 = (vec_idx * VEC_SIZE) % x;
-          // KiVi[token_idx * HEAD_SIZE + j] = mask ? zero_K_vec : 
-          //     *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-        }
-
-        // Compute dot product.
-        // This includes a reduction across the threads in the same thread group.
-        for (int row_offset = 0; row_offset < TM; row_offset++) {
-          // q里面对应的token-idx起始下标
-          const int q_token_idx = loop + row_offset;
-          if (q_token_idx < num_q_tokens) {
-            Q_vec *q_vecs = &Qi[row_offset * NUM_VECS_PER_THREAD];
-            const float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
-            const bool mask = token_idx >= context_len;
-            
-            // 线程组内第0个线程负责赋值dot结果和qk最大值
-            if (thread_group_offset == 0) {
-              const int s_idx = row_offset * TN + (token_idx % TN); 
-              logits[s_idx] = mask ? 0.0f : qk;
-              // 每个线程维护自己组负责的token qk值的最大值
-              // 由于一个tg (thread group) 可能负责多个token，因此需要多次比较
-              qk_max_tg[row_offset] = mask ? qk_max_tg[row_offset] : 
-                                             fmaxf(qk_max_tg[row_offset], qk);
-            }
-          }
-        }
-      }
-    }
-
-    // 在warp内进行规约
-    for (int row_offset = 0; row_offset < TM; row_offset++) {
-      const int q_token_idx = loop + row_offset;
-      if (q_token_idx < num_q_tokens) {
-        for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
-          qk_max_tg[row_offset] = fmaxf(qk_max_tg[row_offset], 
-              __shfl_xor_sync(uint32_t(-1), qk_max_tg[row_offset], mask));
-        }
-        if (lane_idx == 0) {
-          red_smem[row_offset * NUM_WARPS * 2 + warp_idx] = qk_max_tg[row_offset];
-        }
-      }
-    }
-    __syncthreads();
-
-    // 进行block内最大值规约
-    for (int row_offset = 0; row_offset < TM; row_offset++) {
-      const int q_token_idx = loop + row_offset;
-      if (q_token_idx < num_q_tokens) {
-        qk_max_tg[row_offset] = lane_idx < NUM_WARPS ? 
-            red_smem[row_offset * NUM_WARPS * 2 + lane_idx] : -FLT_MAX;
-#pragma unroll
-        for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-          // 最大值归约到每个warp的前NUM_WARPS个线程里面
-          qk_max_tg[row_offset] = fmaxf(qk_max_tg[row_offset], 
-              __shfl_xor_sync(uint32_t(-1), qk_max_tg[row_offset], mask));
-        }
-        // 把最大值广播到每个warp内的所有线程上
-        qk_max_tg[row_offset] = __shfl_sync(uint32_t(-1), qk_max_tg[row_offset], 0);
-
-        // Get the sum of the exp values.
-        float exp_sum = 0.0f;
-        for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
-          const int s_idx = row_offset * TN + i;
-          float val = __expf(logits[s_idx] - qk_max_tg[row_offset]);
-          logits[s_idx] = val;
-          exp_sum += val;
-        }
-        exp_sum = block_sum<NUM_WARPS>(
-          &red_smem[row_offset * NUM_WARPS * 2 + NUM_WARPS], exp_sum);
-        
-        // 计算softmax
-        const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
-        for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
-          const int s_idx = row_offset * TN + i; 
-          logits[s_idx] *= inv_sum;
-        }
-      }
-    }
-
-    __syncthreads();
-    // 从kvcache中获取当前Vi子块
-    // 写完记得搬到query外循环外面
-    // Each thread will fetch 16 bytes from the value cache at a time.
-    constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
-    using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
-    using L_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
-    using Float_L_vec = typename FloatVec<L_vec>::Type;
-
-    // v cache: [num_blocks, num_heads, head_size, block_size]
-    // 每行取多少个V_vec，一个thread取一个，等价于每行要多少个thread处理
-    constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
-    // 每个warp一轮处理多少行
-    constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW; 
-    // 每个thread要处理的总行数，即循环次数
-    constexpr int NUM_ROWS_PER_THREAD = (HEAD_SIZE + NUM_ROWS_PER_ITER - 1) / NUM_ROWS_PER_ITER;
-
+    float running_max[TM];
+    float running_l[TM];
     float accs[TM * NUM_ROWS_PER_THREAD];
-      for (int row_offset = 0; row_offset < TM; row_offset++) {
+
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      running_max[row_offset] = -FLT_MAX;
+      running_l[row_offset] = 0.f;
 #pragma unroll
       for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
         accs[row_offset * NUM_ROWS_PER_THREAD + i] = 0.f;
       }
     }
 
-    for (int row_offset = 0; row_offset < TM; row_offset++) {
-      const int q_token_idx = loop + row_offset;
-      if (q_token_idx < num_q_tokens) {
-        for (int block_idx = warp_idx; block_idx < num_blocks; block_idx += NUM_WARPS) {
-          const int physical_block_id = block_table[block_idx];
-          // 当前thread处理的是某一行的哪个v-vec
-          const int physical_block_offset = (lane_idx % NUM_V_VECS_PER_ROW) * V_VEC_SIZE; 
-          const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-          L_vec logits_vec;
-          from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(
-                                  &logits[row_offset * TN] + token_idx));
-          // 当前warp处理的v-cache数据起始指针位置
-          const scalar_t *v_ptr = v_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE
-                                          + head_idx * HEAD_SIZE * BLOCK_SIZE;
-          // 取出v-cache里面的数据并作乘法
+    // Online softmax over KV blocks.
+    for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+      const int physical_block_id = block_table[block_idx];
+      float block_max_tg[TM];
+      float block_max[TM];
+
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+        block_max_tg[row_offset] = -FLT_MAX;
+      }
+
+      // Compute block logits and block max.
+      for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
+        const int physical_block_offset =
+            thread_group_idx + i * NUM_THREAD_GROUPS_PER_WARP;
+        // tg/warp * tokens/tg = tokens/warp
+        // 在一个warp负责一个block的前提下，下面的这个就是不可能事件
+        // if (physical_block_offset >= BLOCK_SIZE) {  
+        //   continue;
+        // }
+        const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+
+        K_vec k_vecs[NUM_VECS_PER_THREAD];
+        const scalar_t* k_ptr =
+            k_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
 #pragma unroll
-          for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-            const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-            if (row_idx < HEAD_SIZE) {
-              const int offset_r = row_idx * BLOCK_SIZE + physical_block_offset;
-              V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset_r);
-              accs[row_offset * NUM_ROWS_PER_THREAD + i] += dot(logits_vec, v_vec);
+        for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+          const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+          const int offset1 = (vec_idx * VEC_SIZE) / x;   // head size/x维度下标
+          const int offset2 = (vec_idx * VEC_SIZE) % x;   // x维度下标
+          k_vecs[j] = *reinterpret_cast<const K_vec*>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        }
+
+        for (int row_offset = 0; row_offset < TM; row_offset++) {
+          const int q_token_idx = loop + row_offset;
+          // if (q_token_idx >= num_q_tokens) { // 这样会多执行一个指令
+          //   continue;
+          // }
+          if (q_token_idx < num_q_tokens) {
+            const Q_vec (&q_vecs)[NUM_VECS_PER_THREAD] =
+              *reinterpret_cast<const Q_vec (*)[NUM_VECS_PER_THREAD]>(
+                  &Qi[row_offset * NUM_VECS_PER_THREAD]);
+            const float qk =
+                scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
+            if (thread_group_offset == 0) {
+              float* row_logits = block_logits_smem +
+                                  (warp_idx * TM + row_offset) * BLOCK_SIZE;
+              const bool mask = token_idx < context_len;
+              row_logits[physical_block_offset] = mask ? -FLT_MAX : qk;
+              block_max_tg[row_offset] = mask ? block_max_tg[row_offset] : 
+                                                fmaxf(block_max_tg[row_offset], qk);
+              // 避免warp divergence
+              // if (token_idx < context_len) { 
+              //   row_logits[physical_block_offset] = qk;
+              //   block_max_tg[row_offset] =
+              //       fmaxf(block_max_tg[row_offset], qk);
+              // } else {
+              //   row_logits[physical_block_offset] = -FLT_MAX;
+              // }
             }
           }
         }
-        // 一个token维度可能由多个thread处理
-        // 因此需要对这几个thread进行规约
+      }
+      // Reduce block max inside each warp.
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+        const int q_token_idx = loop + row_offset;
+        float m = block_max_tg[row_offset];
+        if (q_token_idx < num_q_tokens) {
+#pragma unroll
+          for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE;
+               mask /= 2) {
+            m = fmaxf(m, __shfl_xor_sync(uint32_t(-1), m, mask));
+          }
+          // 广播到warp内所有线程
+          m = __shfl_sync(uint32_t(-1), m, 0);
+        }
+        block_max[row_offset] = m;
+      }
+      __syncwarp();
+
+      // Convert block logits to exp(logit - block_max), and reduce block sum.
+      float block_l[TM];
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+        const int q_token_idx = loop + row_offset;
+        float sum = 0.f;
+        if (q_token_idx < num_q_tokens) {
+          float* row_logits = block_logits_smem +
+                              (warp_idx * TM + row_offset) * BLOCK_SIZE;
+          for (int i = lane_idx; i < BLOCK_SIZE; i += WARP_SIZE) {
+            const int token_idx = block_idx * BLOCK_SIZE + i;
+            const bool mask = token_idx < context_len;
+            float p = mask ? 0.f : __expf(row_logits[i] - block_max[row_offset]);
+            // if (token_idx < context_len) {
+            //   p = __expf(row_logits[i] - block_max[row_offset]);
+            // }
+            row_logits[i] = p;
+            sum += p;
+          }
+#pragma unroll
+          for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+            sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+          }
+          sum = __shfl_sync(uint32_t(-1), sum, 0);
+        }
+        block_l[row_offset] = sum;
+      }
+      __syncwarp();
+
+      // Compute unnormalized block output and merge using online softmax.
+      for (int row_offset = 0; row_offset < TM; row_offset++) {
+        const int q_token_idx = loop + row_offset;
+        if (q_token_idx >= num_q_tokens) {
+          continue;
+        }
+
+        float block_acc[NUM_ROWS_PER_THREAD];
 #pragma unroll
         for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-          float acc = accs[row_offset * NUM_ROWS_PER_THREAD + i];
+          block_acc[i] = 0.f;
+        }
+
+        const int physical_block_offset =
+            (lane_idx % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
+        L_vec probs_vec;
+        float* row_logits = block_logits_smem +
+                            (warp_idx * TM + row_offset) * BLOCK_SIZE;
+        from_float(probs_vec, *reinterpret_cast<Float_L_vec*>(
+                                  row_logits + physical_block_offset));
+
+        const scalar_t* v_ptr =
+            v_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx * HEAD_SIZE * BLOCK_SIZE;
+#pragma unroll
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          const int row_idx =
+              lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+          if (row_idx < HEAD_SIZE) {
+            const int offset_r = row_idx * BLOCK_SIZE + physical_block_offset;
+            V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset_r);
+            block_acc[i] += dot(probs_vec, v_vec);
+          }
+        }
+
+        // Reduce duplicated work among lanes that process the same row.
+#pragma unroll
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          float acc = block_acc[i];
 #pragma unroll
           for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
             acc += __shfl_xor_sync(uint32_t(-1), acc, mask);
           }
-          accs[row_offset * NUM_ROWS_PER_THREAD + i] = acc;
+          block_acc[i] = acc;
+        }
+        // 状态更新
+        const float prev_m = running_max[row_offset];
+        const float prev_l = running_l[row_offset];
+        const float cur_m = block_max[row_offset];
+        const float new_m = fmaxf(prev_m, cur_m);
+        const float alpha = prev_m == -FLT_MAX ? 0.f : __expf(prev_m - new_m);
+        const float beta = __expf(cur_m - new_m);
+
+        running_max[row_offset] = new_m;
+        running_l[row_offset] = prev_l * alpha + block_l[row_offset] * beta;
+#pragma unroll
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          accs[row_offset * NUM_ROWS_PER_THREAD + i] =
+              accs[row_offset * NUM_ROWS_PER_THREAD + i] * alpha +
+              block_acc[i] * beta;
         }
       }
     }
-    __syncthreads();
 
-    // 在warp间进行求和，即处理不同kv block的token数据
-    // out_smem: [TM * NUM_WARPS / 2 * HEAD_SIZE]
-    float* out_smem = reinterpret_cast<float*>(shared_mem);
+    // Normalize by final denominator.
     for (int row_offset = 0; row_offset < TM; row_offset++) {
       const int q_token_idx = loop + row_offset;
       if (q_token_idx < num_q_tokens) {
+        const float inv_sum = __fdividef(1.f, running_l[row_offset] + 1e-6f);
 #pragma unroll
-        for (int i = NUM_WARPS; i > 1; i /= 2) {
-          // 手动进行树状规约
-          // 高半部分warp把结果写到里面，然后低半部分的warp再加上去
-          int mid = i / 2;
-          if (warp_idx >= mid && warp_idx < i) {
-            int out_idx = row_offset * NUM_WARPS / 2 * HEAD_SIZE 
-                          + (warp_idx - mid) * HEAD_SIZE;
-            float *dst = &out_smem[out_idx];
-#pragma unroll
-            for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-              const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-              if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
-                dst[row_idx] = accs[row_offset * NUM_ROWS_PER_THREAD + i];
-              }
-            }
-          }
-          // 等高半warp把数据都搬到dst内
-          __syncthreads();
-
-          // 低半warp对数据进行累加
-          if (warp_idx < mid) {
-            int out_idx = row_offset * NUM_WARPS / 2 * HEAD_SIZE 
-                          + warp_idx * HEAD_SIZE;
-            const float *src = &out_smem[out_idx];
-#pragma unroll
-            for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-              const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-              if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
-                accs[row_offset * NUM_ROWS_PER_THREAD + i] += src[row_idx];
-              }
-            }
-          }
-          __syncthreads();
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          accs[row_offset * NUM_ROWS_PER_THREAD + i] *= inv_sum;
         }
       }
-    } // 规约后求和结果放在了第一个warp内
+    }
 
     // 更新输出子块Oi
-    if (warp_idx == 0) {
-      for (int row_offset = 0; row_offset < TM; row_offset++) {
-        const int q_token_idx = loop + row_offset;
-        if (q_token_idx < num_q_tokens) { 
-          // 要看绝对指针了
-          const int token_idx = q_offset + m_block_offset + q_token_idx;
-          scalar_t* out_ptr = out + token_idx * num_heads * HEAD_SIZE
-                                  + head_idx * HEAD_SIZE;
-          for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-            const int row_idx = lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-            if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
-              from_float(*(out_ptr + row_idx), accs[row_offset * NUM_ROWS_PER_THREAD + i]);
-            }
+    for (int row_offset = 0; row_offset < TM; row_offset++) {
+      const int q_token_idx = loop + row_offset;
+      if (q_token_idx < num_q_tokens) {
+        const int token_idx = q_offset + m_block_offset + q_token_idx;
+        scalar_t* out_ptr =
+            out + token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+        for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+          const int row_idx =
+              lane_idx / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+          if (row_idx < HEAD_SIZE && lane_idx % NUM_V_VECS_PER_ROW == 0) {
+            from_float(*(out_ptr + row_idx),
+                       accs[row_offset * NUM_ROWS_PER_THREAD + i]);
           }
         }
       }
@@ -822,6 +802,120 @@ void single_query_cached_kv_attention(
     CALL_KERNEL_LAUNCHER_BLOCK_SIZE(uint16_t);
   } else if (query.dtype() == at::ScalarType::BFloat16) {
     CALL_KERNEL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+  }
+}
+
+
+#define LAUNCH_VARLEN_ATTENTION_KERNEL(T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, TM)   \
+  vllm::varlen_query_cached_kv_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE,           \
+                                                NUM_THREADS, TM>                    \
+      <<<grid, block, shared_mem_size, stream>>>(                                   \
+          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q          \
+          max_seqlen_q, scale, block_tables_ptr, context_lens_ptr,                  \
+          max_num_blocks_per_seq, query_stride)
+
+template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128, int TM = 4>
+void varlen_query_cached_kv_attention_launcher(
+    torch::Tensor &out,               // [num_tokens, num_heads, head_size]            
+    torch::Tensor &query,             // [max_seqlen_q * num_seqs, 
+                                      //  num_heads, head_size]
+    torch::Tensor &key_cache,         // [num_blocks, num_heads,
+                                      //  head_size/x, block_size, x]
+    torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]   
+    torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]      
+    int max_seqlen_q, float scale,            
+    torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]
+    torch::Tensor &context_lens,      // [num_seqs]      
+    int max_context_len) {
+  int num_seqs = cu_seqlens_q.size(0) - 1;
+  int num_heads = query.size(1);
+  int head_size = query.size(2);
+  int max_num_blocks_per_seq = block_tables.size(1);
+  int query_stride = query.stride(0);
+
+  int thread_group_size = MAX(WARP_SIZE / BLOCK_SIZE, 1);
+  assert(head_size % thread_group_size == 0);
+
+  T *out_ptr = reinterpret_cast<T *>(out.data_ptr());
+  T *query_ptr = reinterpret_cast<T *>(query.data_ptr());
+  T *key_cache_ptr = reinterpret_cast<T *>(key_cache.data_ptr());
+  T *value_cache_ptr = reinterpret_cast<T *(value_cache.data_ptr());
+  int *block_tables_ptr = block_tables.data_ptr<int>();
+  int *context_lens_ptr = context_lens.data_ptr<int>();
+  int *cu_seqlens_q_ptr = cu_seqlens_q.data_ptr<int>();
+
+  constexpr int NUM_WAPRS = NUM_THREADS / WARP_SIZE;
+  int padded_max_context_len = 
+      ((max_context_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+      // Default output data type is float.
+  int shared_mem_size = NUM_WARPS * TM * BLOCK_SIZE * sizeof(float);
+  
+  // 一个block内一次循环处理NUM_WARPS * TM行，默认处理四次
+  constexpr TOKENS_PER_BLOCK = NUM_WARPS * TM * 4;
+  int max_blocks_per_seq = 
+      (max_seqlen_q + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK;
+  dim3 grid(num_blocks_per_seq, num_heads, num_seqs);
+  dim3 block(NUM_THREADS);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  switch(head_size) {
+  case 64:
+    LAUNCH_VARLEN_ATTENTION_KERNEL(T, 64, BLOCK_SIZE, NUM_THREADS, TM);
+    break;
+  case 80:
+    LAUNCH_VARLEN_ATTENTION_KERNEL(T, 80, BLOCK_SIZE, NUM_THREADS, TM);
+    break;
+  case 96:
+    LAUNCH_VARLEN_ATTENTION_KERNEL(T, 96, BLOCK_SIZE, NUM_THREADS, TM);
+    break;
+  case 128:
+    LAUNCH_VARLEN_ATTENTION_KERNEL(T, 128, BLOCK_SIZE, NUM_THREADS, TM);
+    break;
+  default:
+    TORCH_CHECK(false, "Unsupported head size: ", head_size);
+    break;
+  }
+}
+
+#define CALL_VARLEN_KERNEL_LAUNCHER(T, BLOCK_SIZE)                      \
+  varlen_query_cached_kv_attention_launcher<T, BLOCK_SIZE>(             \
+    out, query, key_cache, value_cache, cu_seqlens_q,                   \
+    max_seqlen_q, scale, block_tables, context_lens, max_context_len);
+
+#define CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(T)                       \
+    switch (block_size) {                                               \
+    case 8:                                                             \
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 8);                                \
+      break;                                                            \        
+    case 16:                                                            \    
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \        
+      break;                                                            \      
+    case 32:                                                            \  
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \            
+      break;                                                            \                                  
+    default:                                                            \                    
+      TORCH_CHECK(false, "Unsupported block size: ", block_size);       \         
+      break;                                                            \
+    }
+
+
+void varlen_query_cached_kv_attention(
+    torch::Tensor &out,               // [num_tokens, num_heads, head_size]     
+    torch::Tensor &query,             // [max_seqlen_q * num_seqs, num_heads, heda_size]  
+    torch::Tensor &key_cache,         // [num_blocks, num_heads, head_size/x, block_size, x]      
+    torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]        
+    torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]
+    int max_seqlen_q, float scale,
+    torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]          
+    torch::Tensor &context_lens,      // [num_seqs]
+    int block_size, int max_context_len) {
+  if (query.dtype() == at::ScalarType::Float) {
+    CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(float);
+  } else if (query.dtype() == at::ScalarType::Half) {
+    CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(uint16_t);
+  } else if (query.dtype() == at::ScalarType::BFloat16) {
+    CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(__nv_bfloat16);
   } else {
     TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
   }
