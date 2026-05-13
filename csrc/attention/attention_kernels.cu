@@ -812,7 +812,7 @@ void single_query_cached_kv_attention(
   vllm::varlen_query_cached_kv_attention_kernel<T, HEAD_SIZE, BLOCK_SIZE,           \
                                                 NUM_THREADS, TM>                    \
       <<<grid, block, shared_mem_size, stream>>>(                                   \
-          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q,         \
+          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q_ptr,     \
           max_seqlen_q, scale, block_tables_ptr, context_lens_ptr,                  \
           max_num_blocks_per_seq, query_stride)
 
