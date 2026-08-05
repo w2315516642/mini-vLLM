@@ -71,6 +71,7 @@ class CacheConfig:
         block_size: int, 
         gpu_memory_utilization: float,
         swap_space: int,
+        enable_prefix_caching: bool = False,
         prefix_caching_hash_fn: str = "sha256",
     ) -> None:
         self.block_size = block_size
@@ -81,6 +82,7 @@ class CacheConfig:
         self.num_gpu_blocks = None
         self.num_cpu_blocks = None
 
+        self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_hash_fn = prefix_caching_hash_fn
 
     def _verify_args(self) -> None:

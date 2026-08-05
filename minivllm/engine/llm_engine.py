@@ -71,11 +71,12 @@ class LLMEngine:
 
         self.scheduler = Scheduler(scheduler_config, cache_config, log_stats)
 
-        # TODO: Get hash function.
-        caching_hash_fn = get_hash_fn_by_name(
-            self.cache_config.prefix_caching_hash_fn)
-        init_none_hash(caching_hash_fn)
-        self.seq_block_hasher = get_seq_block_hasher(caching_hash_fn)
+        self.seq_block_hasher: Optional[BlockHasher] = None
+        if self.cache_config.enable_prefix_caching:
+            caching_hash_fn = get_hash_fn_by_name(
+                self.cache_config.prefix_caching_hash_fn)
+            init_none_hash(caching_hash_fn)
+            self.seq_block_hasher = get_seq_block_hasher(caching_hash_fn)
         
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -143,7 +144,7 @@ class LLMEngine:
             blocks_to_copy=scheduler_outputs.blocks_to_copy
         )
         # Update the scheduler with the model outputs.
-        seq_groups = self.scheduler.update(output)
+        seq_groups = self.scheduler.update(output, scheduler_outputs)
 
         # Decode the sequences.
         self._decode_sequences(seq_groups)
@@ -274,7 +275,7 @@ class LLMEngine:
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
         # Update the scheduler with the model outputs.
-        seq_groups = self.scheduler.update(output)
+        seq_groups = self.scheduler.update(output, scheduler_outputs)
 
         # Decode the sequences.
         self._decode_sequences(seq_groups)

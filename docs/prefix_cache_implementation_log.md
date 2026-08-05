@@ -40,7 +40,23 @@
 
 ## 阶段二：命中感知调度
 
-状态：待开始
+状态：已完成
+
+完成内容：
+
+- 新增 `enable_prefix_caching` 配置和 CLI 参数，默认关闭。
+- 关闭缓存时不创建 block hash，也不登记缓存引用，保持原执行路径。
+- `SchedulerOutputs` 记录每条 Sequence 本轮实际执行的 token 数量。
+- prompt 的 batch token 预算只计算前缀命中后的剩余 token。
+- `SequenceGroupMetadata` 携带执行前进度和本轮调度量，供 Worker 切分输入。
+- 模型执行完成后先推进 `num_computed_tokens`，再追加采样 token。
+- recompute preemption 正确重置进度，并把 `SequenceGroup` 放回 waiting 队列。
+
+验证结果：
+
+- `python -m unittest discover -s tests -v`：新增调度测试后共 8 项测试通过。
+- 覆盖缓存关闭、命中后预算、执行进度更新和 recompute 状态重置。
+- 本阶段 Python 文件通过 `py_compile` 和 `git diff --check`。
 
 ## 阶段三：缓存前缀后的后缀 Prefill
 

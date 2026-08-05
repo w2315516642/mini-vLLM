@@ -145,11 +145,13 @@ class BlockSpaceManager:
         num_gpu_blocks: int,
         num_cpu_blocks: int,
         watermark: float = 0.01,
+        enable_prefix_caching: bool = True,
     ) -> None:
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
         self.num_cpu_blocks = num_cpu_blocks
         self.watermark = watermark
+        self.enable_prefix_caching = enable_prefix_caching
         assert watermark >= 0.0
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
@@ -177,6 +179,8 @@ class BlockSpaceManager:
         return self.gpu_allocator.allocate()
 
     def cache_blocks(self, seq: Sequence) -> None:
+        if not self.enable_prefix_caching:
+            return
         block_table = self.block_tables[seq.seq_id]
         # Logical blocks exist before model execution. Only the blocks covered
         # by num_computed_tokens are guaranteed to contain valid KV data.
@@ -206,7 +210,14 @@ class BlockSpaceManager:
         return (num_available_blocks - num_required_blocks
                 >= self.watermark_blocks)
 
+    def get_num_cached_tokens(self, seq_group: SequenceGroup) -> int:
+        """Return the reusable prefix length without allocating block tables."""
+        seq = seq_group.get_seqs()[0]
+        return len(self.find_longest_cache_hit(seq)) * self.block_size
+
     def find_longest_cache_hit(self, seq: Sequence) -> BlockTable:
+        if not self.enable_prefix_caching:
+            return []
         # Allocate new physical token blocks that will store the prompt tokens.
         # 这里找prompt命中的缓存块，找不到的再从gpu_allocator要
         # Keep the final known token for logits. With full-block reuse, an

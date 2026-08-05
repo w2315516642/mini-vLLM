@@ -34,17 +34,20 @@ class SchedulerOutputs:
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
+        num_scheduled_tokens: Dict[int, int],
     ) -> None:
         self.blocks_to_swap_in = blocks_to_swap_in
         self.blocks_to_swap_out = blocks_to_swap_out
         self.blocks_to_copy = blocks_to_copy
+        self.num_scheduled_tokens = num_scheduled_tokens
         # Swap in and swap out should never happen at the same time.
         assert not (blocks_to_swap_in and blocks_to_swap_out)
 
     def is_empty(self) -> bool:
         return (not self.blocks_to_swap_in
                 and not self.blocks_to_swap_out
-                and not self.blocks_to_copy)
+                and not self.blocks_to_copy
+                and not self.num_scheduled_tokens)
 
 
 class Scheduler:
@@ -64,7 +67,8 @@ class Scheduler:
         self.block_manager = BlockSpaceManager(
             block_size=self.cache_config.block_size,
             num_gpu_blocks=self.cache_config.num_gpu_blocks,
-            num_cpu_blocks=self.cache_config.num_cpu_blocks
+            num_cpu_blocks=self.cache_config.num_cpu_blocks,
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
         )
 
         # Sequence groups in the WAITING state.
@@ -105,6 +109,7 @@ class Scheduler:
         blocks_to_swap_in: Dict[int, int] = {}
         blocks_to_swap_out: Dict[int, int] = {}
         blocks_to_copy: Dict[int, List[int]] = {}
+        num_scheduled_tokens: Dict[int, int] = {}
         
         # Fix the current time.
         now = time.time()
@@ -137,6 +142,8 @@ class Scheduler:
             else:
                 # Append new slots to the sequence group.
                 self._append_slot(seq_group, blocks_to_copy)
+                for seq in seq_group.get_seqs(SequenceStatus.RUNNING):
+                    num_scheduled_tokens[seq.seq_id] = 1
                 running.append(seq_group)
         self.running = running
 
@@ -161,12 +168,11 @@ class Scheduler:
             seq_group = self.swapped.pop(0)
             self._swap_in(seq_group, blocks_to_swap_in)
             self._append_slot(seq_group, blocks_to_copy)
+            for seq in seq_group.get_seqs(SequenceStatus.RUNNING):
+                num_scheduled_tokens[seq.seq_id] = 1
             self.running.append(seq_group)
 
-        num_batched_tokens = sum(
-            seq_group.num_seqs(status=SequenceStatus.RUNNING)
-            for seq_group in self.running
-        )
+        num_batched_tokens = sum(num_scheduled_tokens.values())
 
         # Join waiting sequences if possible.
         prompt_group_ids: List[str] = []
@@ -188,7 +194,10 @@ class Scheduler:
                     break
                     
                 # If the number of batched tokens exceeds the limit, stop.
-                num_prompt_tokens = seq_group.get_seqs()[0].get_len()
+                seq = seq_group.get_seqs()[0]
+                num_cached_tokens = self.block_manager.get_num_cached_tokens(
+                    seq_group)
+                num_prompt_tokens = seq.get_len() - num_cached_tokens
                 if (num_batched_tokens + num_prompt_tokens 
                     > self.scheduler_config.max_num_batched_tokens):
                     break
@@ -205,11 +214,14 @@ class Scheduler:
                 self.running.append(seq_group)
                 num_batched_tokens += num_prompt_tokens
                 prompt_group_ids.append(seq_group.request_id)
+                for seq in seq_group.get_seqs(SequenceStatus.RUNNING):
+                    num_scheduled_tokens[seq.seq_id] = num_prompt_tokens
 
         scheduler_outputs = SchedulerOutputs(
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
+            num_scheduled_tokens=num_scheduled_tokens,
         )
         if not self.log_stats:
             return scheduler_outputs, prompt_group_ids
@@ -229,19 +241,26 @@ class Scheduler:
         for seq_group in self.running:
             is_prompt = seq_group.request_id in prompt_group_ids
 
-            seq_data: Dict[int, List[SequenceData]] = {}
+            seq_data: Dict[int, SequenceData] = {}
             block_tables: Dict[int, List[int]] = {}
+            num_computed_tokens: Dict[int, int] = {}
+            num_scheduled_tokens: Dict[int, int] = {}
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                num_computed_tokens[seq_id] = seq.num_computed_tokens
+                num_scheduled_tokens[seq_id] = (
+                    scheduler_outputs.num_scheduled_tokens[seq_id])
             
             seq_group_metadata = SequenceGroupMetadata(
                 request_id=seq_group.request_id,
                 is_prompt=is_prompt,
                 seq_data=seq_data,
                 sampling_params=seq_group.sampling_params,
-                block_tables=block_tables
+                block_tables=block_tables,
+                num_computed_tokens=num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs
@@ -249,9 +268,22 @@ class Scheduler:
     def update(
         self,
         seq_outputs: Dict[int, SequenceOutputs],    # [seq_id, output]
+        scheduler_outputs: SchedulerOutputs,
     ) -> List[SequenceGroup]:
         # Update the running sequences and free blocks.
         for seq_group in self.running:
+            # The model has consumed these known tokens. Advance the KV
+            # progress before beam forking or appending newly sampled tokens.
+            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                num_scheduled_tokens = (
+                    scheduler_outputs.num_scheduled_tokens[seq.seq_id])
+                seq.num_computed_tokens += num_scheduled_tokens
+                assert seq.num_computed_tokens == seq.get_len(), (
+                    f"Sequence {seq.seq_id} computed "
+                    f"{seq.num_computed_tokens} tokens, but has "
+                    f"{seq.get_len()} known tokens."
+                )
+
             # Process beam search results before processing the new tokens.
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 # 这里默认seq_outputs一定有running队列里面所有序列的结果
@@ -343,9 +375,13 @@ class Scheduler:
         for seq in seqs:
             seq.status = SequenceStatus.WAITING
             self.block_manager.free(seq)
+            # Recompute starts from a fresh block table. Prefix allocation may
+            # immediately restore part of this progress from the LRU cache.
+            seq.num_computed_tokens = 0
+            seq.num_cached_blocks = 0
         # NOTE: For FCFS, we insert the preempted sequence group to the front
         # of the waiting queue.
-        self.waiting.insert(0, seq)
+        self.waiting.insert(0, seq_group)
 
     def _preempt_by_swap(
         self,

@@ -21,6 +21,7 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     block_size: int = 16
+    enable_prefix_caching: bool = False
     swap_space: int = 4   # GiB
     gpu_memory_utilization: float = 0.9
     max_num_batched_tokens: int = 2560
@@ -71,6 +72,9 @@ class EngineArgs:
                             default=EngineArgs.block_size,
                             choices=[8, 16, 32],
                             help='token block size')
+        parser.add_argument('--enable-prefix-caching', action='store_true',
+                            help='reuse computed KV cache blocks for prompts '
+                                 'with a shared token prefix')
         # TODO(woosuk): Support fine-grained seeds (e.g., seed per request).
         parser.add_argument('--seed', type=int, default=EngineArgs.seed,
                             help='random seed')
@@ -109,7 +113,10 @@ class EngineArgs:
             self.use_dummy_weights, self.dtype, self.seed
         )
         cache_config = CacheConfig(
-            self.block_size, self.gpu_memory_utilization, self.swap_space
+            self.block_size,
+            self.gpu_memory_utilization,
+            self.swap_space,
+            self.enable_prefix_caching,
         )
         parallel_config = ParallelConfig(self.pipeline_parallel_size, 
             self.tensor_parallel_size, self.worker_use_ray

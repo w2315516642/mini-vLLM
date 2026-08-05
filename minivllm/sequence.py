@@ -230,12 +230,22 @@ class SequenceGroupMetadata:
         seq_data: Dict[int, SequenceData],
         sampling_params: SamplingParams,
         block_tables: Dict[int, List[int]],
+        num_computed_tokens: Optional[Dict[int, int]] = None,
+        num_scheduled_tokens: Optional[Dict[int, int]] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
         self.seq_data = seq_data
         self.sampling_params = sampling_params
         self.block_tables = block_tables
+        # These dictionaries describe the state before this model execution.
+        # Defaults keep profiling callers independent from the scheduler.
+        self.num_computed_tokens = num_computed_tokens or {
+            seq_id: 0 for seq_id in seq_data
+        }
+        self.num_scheduled_tokens = num_scheduled_tokens or {
+            seq_id: seq.get_len() for seq_id, seq in seq_data.items()
+        }
         
 
 class SequenceOutputs:
