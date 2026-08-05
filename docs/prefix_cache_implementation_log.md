@@ -60,7 +60,24 @@
 
 ## 阶段三：缓存前缀后的后缀 Prefill
 
-状态：待开始
+状态：已完成
+
+完成内容：
+
+- Worker 将输入稳定排列为“无命中 prompt、命中后的 prompt 后缀、decode token”，并只为命中请求提交未计算后缀。
+- prompt 后缀沿用原序列的绝对 position 和物理 block slot，不重复计算已缓存 token。
+- 无命中 prompt 保留 xFormers 路径；命中后缀通过 varlen paged attention 读取已有 KV。
+- 在执行后缀注意力前先写入本轮 K/V，使每个 query token 能看到缓存前缀和它之前的后缀 token。
+- 修复 varlen CUDA kernel 的 packed query 偏移、因果掩码和 block size 32 模板分发。
+- 修复 decode block table 最大宽度读取错误。
+- 补充 Worker 输入规划测试，覆盖 token、position、slot mapping、block table 和采样分组顺序。
+
+验证结果：
+
+- 所有 Python 命令均通过 `conda run -n mini-vllm` 执行。
+- `python -m unittest discover -s tests -v`：共 9 项测试通过。
+- 本阶段 Python 文件通过 `py_compile`，代码通过 `git diff --check`。
+- CUDA 扩展数值验证未完成：Windows 下首次编译 attention 扩展耗时较长，按要求中止编译并继续后续收尾；本阶段不把输入规划测试等同于 CUDA kernel 数值验证。
 
 ## 阶段四：集成验证与文档收尾
 

@@ -371,8 +371,8 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   const int num_tokens_per_block =
       (max_seqlen_q + num_blocks_per_seq - 1) / num_blocks_per_seq;
   
-  // 当前seq在q中第一维（tokens）的起始位置
-  const int q_offset = seq_idx * max_seqlen_q;
+  // Queries are packed by sequence; cu_seqlens_q stores each sequence offset.
+  const int q_offset = cu_seqlens_q[seq_idx];
   // 这个是当前block处理的seq的token offset，不是在整个q内的idx
   const int m_block_offset = blockIdx.x * num_tokens_per_block;
   // 计算当前block.y对应的seq的真实长度
@@ -431,6 +431,8 @@ __global__ void varlen_query_cached_kv_attention_kernel(
 
   const int *block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   const int context_len = context_lens[seq_idx];
+  // context_len includes both the cached prefix and the current query suffix.
+  const int query_start = context_len - seqlen_q;
   const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
   // const int num_tiles_m = (num_q_tokens + TM - 1) / TM;
@@ -512,7 +514,9 @@ __global__ void varlen_query_cached_kv_attention_kernel(
             if (thread_group_offset == 0) {
               float* row_logits = block_logits_smem +
                                   (warp_idx * TM + row_offset) * BLOCK_SIZE;
-              const bool mask = token_idx < context_len;
+              const int query_position =
+                  query_start + m_block_offset + q_token_idx;
+              const bool mask = token_idx > query_position;
               row_logits[physical_block_offset] = mask ? -FLT_MAX : qk;
               block_max_tg[row_offset] = mask ? block_max_tg[row_offset] : 
                                                 fmaxf(block_max_tg[row_offset], qk);
@@ -553,9 +557,11 @@ __global__ void varlen_query_cached_kv_attention_kernel(
         if (q_token_idx < num_q_tokens) {
           float* row_logits = block_logits_smem +
                               (warp_idx * TM + row_offset) * BLOCK_SIZE;
+          const int query_position =
+              query_start + m_block_offset + q_token_idx;
           for (int i = lane_idx; i < BLOCK_SIZE; i += WARP_SIZE) {
             const int token_idx = block_idx * BLOCK_SIZE + i;
-            const bool mask = token_idx < context_len;
+            const bool mask = token_idx > query_position;
             float p = mask ? 0.f : __expf(row_logits[i] - block_max[row_offset]);
             // if (token_idx < context_len) {
             //   p = __expf(row_logits[i] - block_max[row_offset]);
@@ -892,7 +898,7 @@ void varlen_query_cached_kv_attention_launcher(
       CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \
       break;                                                            \
     case 32:                                                            \
-      CALL_VARLEN_KERNEL_LAUNCHER(T, 16);                               \
+      CALL_VARLEN_KERNEL_LAUNCHER(T, 32);                               \
       break;                                                            \
     default:                                                            \
       TORCH_CHECK(false, "Unsupported block size: ", block_size);       \

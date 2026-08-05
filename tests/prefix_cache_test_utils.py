@@ -97,3 +97,59 @@ def make_scheduler(max_tokens=32, max_seqs=8, num_gpu_blocks=16):
         enable_prefix_caching=True,
     )
     return scheduler.Scheduler(scheduler_config, cache_config, log_stats=False)
+
+
+def load_worker_module():
+    """Load Worker with small stubs for dependencies unrelated to input prep."""
+    configs_config = types.ModuleType("minivllm.configs.config")
+    for name in ("ModelConfig", "CacheConfig", "ParallelConfig", "SchedulerConfig"):
+        setattr(configs_config, name, object)
+    sys.modules["minivllm.configs.config"] = configs_config
+
+    xformers = types.ModuleType("xformers")
+    xformers_ops = types.ModuleType("xformers.ops")
+    xformers_fmha = types.ModuleType("xformers.ops.fmha")
+    xformers_bias = types.ModuleType("xformers.ops.fmha.attn_bias")
+
+    class BlockDiagonalCausalMask:
+        @classmethod
+        def from_seqlens(cls, seqlens):
+            return tuple(seqlens)
+
+    xformers_bias.BlockDiagonalCausalMask = BlockDiagonalCausalMask
+    sys.modules["xformers"] = xformers
+    sys.modules["xformers.ops"] = xformers_ops
+    sys.modules["xformers.ops.fmha"] = xformers_fmha
+    sys.modules["xformers.ops.fmha.attn_bias"] = xformers_bias
+
+    input_metadata = _load_module(
+        "minivllm.model_executor.input_metadata",
+        "minivllm/model_executor/input_metadata.py",
+    )
+    model_executor = types.ModuleType("minivllm.model_executor")
+    model_executor.__path__ = [str(ROOT / "minivllm" / "model_executor")]
+    model_executor.InputMetadata = input_metadata.InputMetadata
+    model_executor.set_random_seed = lambda *args, **kwargs: None
+    model_executor.get_model = lambda *args, **kwargs: None
+    sys.modules["minivllm.model_executor"] = model_executor
+
+    parallel_state = types.ModuleType(
+        "minivllm.model_executor.parallel_utils.parallel_state")
+    parallel_state.initialize_all_reduce_launcher = lambda *args, **kwargs: None
+    parallel_state.initialize_model_parallel = lambda *args, **kwargs: None
+    sys.modules[
+        "minivllm.model_executor.parallel_utils.parallel_state"
+    ] = parallel_state
+
+    worker_package = types.ModuleType("minivllm.worker")
+    worker_package.__path__ = [str(ROOT / "minivllm" / "worker")]
+    sys.modules["minivllm.worker"] = worker_package
+    cache_engine = types.ModuleType("minivllm.worker.cache_engine")
+    cache_engine.CacheEngine = object
+    sys.modules["minivllm.worker.cache_engine"] = cache_engine
+
+    device = types.ModuleType("minivllm.utils.device")
+    device.get_gpu_memory = lambda *args, **kwargs: 0
+    sys.modules["minivllm.utils.device"] = device
+
+    return _load_module("minivllm.worker.worker", "minivllm/worker/worker.py")

@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import torch
 
@@ -8,15 +8,29 @@ from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData
 
 class InputMetadata:
+    """Describes the packed token layout consumed by every model layer.
+
+    Prompt tokens are placed before decode tokens. Within the prompt region,
+    prompts without a cache hit come first and cached prompt suffixes follow.
+    This lets fresh prompts keep using xFormers while cached suffixes attend to
+    their paged KV prefix with the varlen CUDA kernel.
+    """
+
     def __init__(
         self,
         seq_groups: List[Tuple[List[int], SamplingParams]],     # List of (seq_ids, sampling_params).
         seq_data: Dict[int, SequenceData],                      # Seq id -> seq_data
-        prompt_lens: List[int],             
+        prompt_lens: List[int],             # Scheduled query length per prompt.
         slot_mapping: torch.Tensor,         # (num_valid_tokens,)
         context_lens: torch.Tensor,         # (num_generation_seqs,)
-        max_context_len: int,               # (num_generation_seqs, max_num_blocks_per_seq)
-        block_tables: torch.Tensor,
+        max_context_len: int,
+        block_tables: torch.Tensor,         # Decode block tables.
+        fresh_prompt_lens: Optional[List[int]] = None,
+        cached_prompt_query_lens: Optional[List[int]] = None,
+        cached_prompt_cu_seqlens: Optional[torch.Tensor] = None,
+        cached_prompt_context_lens: Optional[torch.Tensor] = None,
+        cached_prompt_block_tables: Optional[torch.Tensor] = None,
+        max_cached_prompt_context_len: int = 0,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -26,30 +40,58 @@ class InputMetadata:
         self.max_context_len = max_context_len
         self.block_tables = block_tables
 
-        self.attn_bias = BlockDiagonalCausalMask.from_seqlens(prompt_lens)
+        self.fresh_prompt_lens = (
+            prompt_lens if fresh_prompt_lens is None else fresh_prompt_lens)
+        self.cached_prompt_query_lens = cached_prompt_query_lens or []
+        self.cached_prompt_cu_seqlens = cached_prompt_cu_seqlens
+        self.cached_prompt_context_lens = cached_prompt_context_lens
+        self.cached_prompt_block_tables = cached_prompt_block_tables
+        self.max_cached_prompt_context_len = max_cached_prompt_context_len
+
+        # xFormers only sees prompts whose query contains the whole context.
+        # Cached suffixes need the separate paged-attention metadata below.
+        self.attn_bias = None
+        if self.fresh_prompt_lens:
+            self.attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                self.fresh_prompt_lens)
         self.num_prompts = len(prompt_lens)
         self.num_prompt_tokens = sum(prompt_lens)
+        self.num_fresh_prompt_tokens = sum(self.fresh_prompt_lens)
+        self.num_cached_prompt_tokens = sum(self.cached_prompt_query_lens)
+        assert (self.num_fresh_prompt_tokens
+                + self.num_cached_prompt_tokens == self.num_prompt_tokens)
         self.num_generation_tokens = context_lens.shape[0]
         self.num_valid_tokens = slot_mapping.shape[0]
         if block_tables.numel() > 0:
-            # NOTE: Each seq have the same lenght of block table
-            self.max_num_blocks_per_seq = block_tables.shape[0]
+            # Every row is padded to the same block-table length.
+            self.max_num_blocks_per_seq = block_tables.shape[1]
         else:
             self.max_num_blocks_per_seq = 0
         # Check number of decode seq
         assert block_tables.shape[0] == self.num_generation_tokens
         assert context_lens.shape[0] == self.num_generation_tokens
+
+        num_cached_prompts = len(self.cached_prompt_query_lens)
+        if num_cached_prompts:
+            assert self.cached_prompt_cu_seqlens is not None
+            assert self.cached_prompt_context_lens is not None
+            assert self.cached_prompt_block_tables is not None
+            assert self.cached_prompt_cu_seqlens.shape[0] == num_cached_prompts + 1
+            assert self.cached_prompt_context_lens.shape[0] == num_cached_prompts
+            assert self.cached_prompt_block_tables.shape[0] == num_cached_prompts
     
     def __repr__(self) -> str:
         # Print only useful metadata.
         return (f'InputMetadata('
                 f'num_valid_tokens={self.num_valid_tokens}, '
                 f'num_prompt_tokens={self.num_prompt_tokens}, '
+                f'num_fresh_prompt_tokens={self.num_fresh_prompt_tokens}, '
+                f'num_cached_prompt_tokens={self.num_cached_prompt_tokens}, '
                 f'num_prompts={self.num_prompts}, '
                 f'prompt_lens={self.prompt_lens}, '
                 f'num_generation_tokens={self.num_generation_tokens}, '
                 f'context_lens={self.context_lens}, '
-                f'max_context_len={self.max_context_len}), '
+                f'max_context_len={self.max_context_len}, '
                 f'max_num_blocks_per_seq={self.max_num_blocks_per_seq}, '
-                f'block_tables={self.block_tables}), '
-                f'slot_mapping={self.slot_mapping}')
+                f'block_tables={self.block_tables}, '
+                f'slot_mapping={self.slot_mapping})')

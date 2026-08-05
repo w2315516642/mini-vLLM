@@ -134,81 +134,89 @@ class Worker:
         input_token_ids: List[int] = []
         input_positions: List[int] = []
         slot_mapping: List[int] = []
-
-        # 添加prompt tokens
         prompt_lens: List[int] = []
-        for seq_group_metadata in seq_group_metadata_list:
-            if not seq_group_metadata.is_prompt:
-                continue
-            # TODO: 处理有前缀缓存的prompt
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            sampling_params = seq_group_metadata.sampling_params
-            seq_groups.append((seq_ids, sampling_params))
+        fresh_prompt_lens: List[int] = []
+        cached_prompt_query_lens: List[int] = []
+        cached_prompt_context_lens: List[int] = []
+        cached_prompt_block_tables: List[List[int]] = []
 
+        prompt_metadata = [
+            metadata for metadata in seq_group_metadata_list
+            if metadata.is_prompt
+        ]
+        # Keep each attention input kind contiguous. Fresh prompts retain the
+        # existing xFormers path; only prompts with a cached prefix use varlen.
+        fresh_prompts: List[SequenceGroupMetadata] = []
+        cached_prompts: List[SequenceGroupMetadata] = []
+        for metadata in prompt_metadata:
+            seq_id = next(iter(metadata.seq_data))
+            if metadata.num_computed_tokens[seq_id] == 0:
+                fresh_prompts.append(metadata)
+            else:
+                cached_prompts.append(metadata)
+
+        def append_prompt(
+            metadata: SequenceGroupMetadata,
+            has_cached_prefix: bool,
+        ) -> None:
+            seq_ids = list(metadata.seq_data.keys())
             seq_id = seq_ids[0]
+            seq_data = metadata.seq_data[seq_id]
+            start = metadata.num_computed_tokens[seq_id]
+            query_len = metadata.num_scheduled_tokens[seq_id]
+            end = start + query_len
+            assert end == seq_data.get_len()
 
-            # NOTE: 这里是把所有的prompt token ids都一起取出来了，不涉及到 chunked prefill
-            # TODO: 这里的逻辑需要修改，以添加 chunked prefill 功能
-            seq_data = seq_group_metadata.seq_data[seq_id]
-            prompt_token_ids = seq_data.get_token_ids()
-            prompt_len = len(prompt_token_ids)
-            prompt_lens.append(prompt_len)
+            seq_groups.append((seq_ids, metadata.sampling_params))
+            prompt_lens.append(query_len)
+            input_token_ids.extend(seq_data.get_token_ids()[start:end])
+            input_positions.extend(range(start, end))
 
-            # 拼接tokens
-            input_token_ids.extend(prompt_token_ids)
-            # NOTE: Here we assume that the first token in prompts 
-            # is always the first token in the sequence. 
-            input_positions.extend(range(len(prompt_token_ids)))
+            if metadata.block_tables is None:
+                # Cache profiling does not allocate physical blocks.
+                slot_mapping.extend([0] * query_len)
+                return
 
-            if seq_group_metadata.block_tables is None:
-                # 在内存测试的时候还没有分配blocks，因此用不到这个映射
-                slot_mapping.extend([0] * prompt_len)
-                continue
-            
-            # Mapping token to slot id
-            block_table = seq_group_metadata.block_tables[seq_id]
-            for i in range(prompt_len):
-                block_number = block_table[i // self.block_size]
-                block_offset = i % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
-        
-        # Add generation token
-        max_context_len = 0
-        max_num_blocks_per_seq = 0
+            block_table = metadata.block_tables[seq_id]
+            for position in range(start, end):
+                slot_mapping.append(
+                    _get_slot_id(block_table, position, self.block_size))
+
+            if has_cached_prefix:
+                cached_prompt_query_lens.append(query_len)
+                cached_prompt_context_lens.append(end)
+                cached_prompt_block_tables.append(block_table)
+
+        for metadata in fresh_prompts:
+            seq_id = next(iter(metadata.seq_data))
+            fresh_prompt_lens.append(metadata.num_scheduled_tokens[seq_id])
+            append_prompt(metadata, has_cached_prefix=False)
+        for metadata in cached_prompts:
+            append_prompt(metadata, has_cached_prefix=True)
+
+        # Decode inputs always contain one token per running sequence.
         context_lens: List[int] = []
-        # TODO: 这里chunked prefill要改，prompt的处理也需要block_tables
         generation_block_tables: List[List[int]] = []
-        for seq_group_metadata in seq_group_metadata_list:
-            if seq_group_metadata.is_prompt:
+        for metadata in seq_group_metadata_list:
+            if metadata.is_prompt:
                 continue
-            
-            seq_ids = list(seq_group_metadata.seq_data.keys())
-            sampling_params = seq_group_metadata.sampling_params
-            seq_groups.append((seq_ids, sampling_params))
+
+            seq_ids = list(metadata.seq_data.keys())
+            seq_groups.append((seq_ids, metadata.sampling_params))
 
             for seq_id in seq_ids:
-                seq_data = seq_group_metadata.seq_data[seq_id]
-                generation_token = seq_data.get_last_token_id()
-                input_token_ids.append(generation_token)
-
-                context_len = seq_data.get_len()
-                position = context_len - 1
+                seq_data = metadata.seq_data[seq_id]
+                position = metadata.num_computed_tokens[seq_id]
+                query_len = metadata.num_scheduled_tokens[seq_id]
+                assert query_len == 1 and position + 1 == seq_data.get_len()
+                input_token_ids.append(seq_data.get_token_ids()[position])
                 input_positions.append(position)
 
-                block_table = seq_group_metadata.block_tables[seq_id]
+                block_table = metadata.block_tables[seq_id]
                 generation_block_tables.append(block_table)
-
-                max_context_len = max(max_context_len, context_len)
-                max_num_blocks_per_seq = max(
-                    max_num_blocks_per_seq, len(block_table)
-                )
-                context_lens.append(context_len)
-
-                block_number = block_table[position // self.block_size]
-                block_offset = position % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
+                context_lens.append(position + 1)
+                slot_mapping.append(
+                    _get_slot_id(block_table, position, self.block_size))
         
         # Padding to multiple of 8, used for Tensor Cores
         input_token_ids = _pad_to_alignment(input_token_ids, multiple_of=8)
@@ -219,11 +227,18 @@ class Worker:
         positions_tensor = torch.as_tensor(input_positions, dtype=torch.long, device="cuda")
         slot_mapping_tensor = torch.as_tensor(slot_mapping, dtype=torch.int, device="cuda")
         context_lens_tensor = torch.as_tensor(context_lens, dtype=torch.int, device="cuda")
-        padded_block_tables = [
-            _pad_to_max(block_table, max_num_blocks_per_seq)
-            for block_table in generation_block_tables
-        ]    
-        block_tables_tensor = torch.as_tensor(padded_block_tables, dtype=torch.int, device="cuda")
+        block_tables_tensor = _make_block_table_tensor(generation_block_tables)
+
+        cached_prompt_cu_seqlens = [0]
+        for query_len in cached_prompt_query_lens:
+            cached_prompt_cu_seqlens.append(
+                cached_prompt_cu_seqlens[-1] + query_len)
+        cached_prompt_cu_seqlens_tensor = torch.as_tensor(
+            cached_prompt_cu_seqlens, dtype=torch.int, device="cuda")
+        cached_prompt_context_lens_tensor = torch.as_tensor(
+            cached_prompt_context_lens, dtype=torch.int, device="cuda")
+        cached_prompt_block_tables_tensor = _make_block_table_tensor(
+            cached_prompt_block_tables)
 
         seq_data: Dict[int, SequenceData] = {}
         for seq_group_metadata in seq_group_metadata_list:
@@ -235,8 +250,15 @@ class Worker:
             prompt_lens=prompt_lens,
             slot_mapping=slot_mapping_tensor,
             context_lens=context_lens_tensor,
-            max_context_len=max_context_len,
-            block_tables=block_tables_tensor
+            max_context_len=max(context_lens, default=0),
+            block_tables=block_tables_tensor,
+            fresh_prompt_lens=fresh_prompt_lens,
+            cached_prompt_query_lens=cached_prompt_query_lens,
+            cached_prompt_cu_seqlens=cached_prompt_cu_seqlens_tensor,
+            cached_prompt_context_lens=cached_prompt_context_lens_tensor,
+            cached_prompt_block_tables=cached_prompt_block_tables_tensor,
+            max_cached_prompt_context_len=max(
+                cached_prompt_context_lens, default=0),
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -311,3 +333,27 @@ def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:
     return x + [0] * (max_len - len(x))
+
+
+def _get_slot_id(
+    block_table: List[int],
+    position: int,
+    block_size: int,
+) -> int:
+    block_number = block_table[position // block_size]
+    block_offset = position % block_size
+    return block_number * block_size + block_offset
+
+
+def _make_block_table_tensor(
+    block_tables: List[List[int]],
+) -> torch.Tensor:
+    if not block_tables:
+        return torch.empty((0, 0), dtype=torch.int, device="cuda")
+    max_num_blocks = max(len(block_table) for block_table in block_tables)
+    padded_block_tables = [
+        _pad_to_max(block_table, max_num_blocks)
+        for block_table in block_tables
+    ]
+    return torch.as_tensor(
+        padded_block_tables, dtype=torch.int, device="cuda")

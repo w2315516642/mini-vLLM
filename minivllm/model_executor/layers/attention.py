@@ -15,28 +15,31 @@ class PagedAttention(nn.Module):
     """(by original author) GPT-style multi-head PagedAttention.
 
     This class takes flattened 1D query, key, and value tensors as input. The
-    input 1D tensors can be split into three parts: the prompt tokens, the
-    generation tokens, and the paddings.
+    input 1D tensors can be split into four parts: fresh prompt tokens, cached
+    prompt suffixes, generation tokens, and paddings.
 
     |<------------------------------------- num_valid_tokens ------------------------------------->|
-    |<--------------- num_prompt_tokens -------------->|<------- num_generation_tokens (M) ------->|
-    |<--prompt_0-->|<--prompt_1-->|...|<--prompt_N-1-->|<--generation_0-->|...|<--generation_M-1-->|<--padding-->|
+    |<--------------- num_prompt_tokens -------------->|<------- generation tokens ------->|
+    |<--fresh prompts-->|<--cached prompt suffixes-->|<--generation_0-->|...|<--generation_M-1-->|<--padding-->|
 
     The prompts might have different lengths, while the generation tokens always
     have length 1. The paddings are appended to make the input length a multiple
     of 8, which is desirable for Tensor Cores.
 
     The class does the following:
-    1. Perform multi_query_kv_attention for the prompts. This operation does
-        not use the KV cache.
+    1. Perform multi_query_kv_attention for fresh prompts. This operation does
+        not read the KV cache.
     2. Wait for the cache operations (e.g., swap, copy) to finish. The cache
         operations are issued by the cache engine before executing the forward
         pass of the model, and they are executed asynchronously.
     3. Reshape and store the input key and value tensors in the KV cache.
-    4. Perform single_query_cached_kv_attention for the generation tokens.
+    4. Perform varlen_query_cached_kv_attention for cached prompt suffixes.
+        This operation reads their cached prefixes and the suffix K/V written
+        in step 3.
+    5. Perform single_query_cached_kv_attention for the generation tokens.
         This operation reads the previous key and value tensors from the KV
         cache.
-    5. Output a flattened 1D tensor.
+    6. Output a flattened 1D tensor.
     """
 
     def __init__(
@@ -99,6 +102,33 @@ class PagedAttention(nn.Module):
             input_metadata.max_context_len
         )
 
+    def varlen_query_cached_kv_attention(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> None:
+        """Attend prompt suffix queries to a cached paged KV prefix."""
+        assert input_metadata.cached_prompt_cu_seqlens is not None
+        assert input_metadata.cached_prompt_block_tables is not None
+        assert input_metadata.cached_prompt_context_lens is not None
+        block_size = value_cache.shape[3]
+        attention_ops.varlen_query_cached_kv_attention(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            input_metadata.cached_prompt_cu_seqlens,
+            max(input_metadata.cached_prompt_query_lens),
+            self.scale,
+            input_metadata.cached_prompt_block_tables,
+            input_metadata.cached_prompt_context_lens,
+            block_size,
+            input_metadata.max_cached_prompt_context_len,
+        )
+
     def forward(
         self,
         query: torch.Tensor,                    # [num_tokens, num_heads * head_size]
@@ -119,15 +149,15 @@ class PagedAttention(nn.Module):
 
         output = torch.empty_like(query)
 
-        # TODO: Change this for chunked prefill.
-        # Compute the attention op for prompts
-        num_prompt_tokens = input_metadata.num_prompt_tokens
-        if num_prompt_tokens > 0:
+        # Prompts without a cache hit keep the original xFormers fast path.
+        num_fresh_prompt_tokens = input_metadata.num_fresh_prompt_tokens
+        if num_fresh_prompt_tokens > 0:
+            assert input_metadata.attn_bias is not None
             self.multi_query_kv_attention(
-                output[:num_prompt_tokens],
-                query[:num_prompt_tokens],
-                key[:num_prompt_tokens],
-                value[:num_prompt_tokens],
+                output[:num_fresh_prompt_tokens],
+                query[:num_fresh_prompt_tokens],
+                key[:num_fresh_prompt_tokens],
+                value[:num_fresh_prompt_tokens],
                 input_metadata.attn_bias
             )
         
@@ -151,6 +181,22 @@ class PagedAttention(nn.Module):
                 value_cache,
                 input_metadata.slot_mapping
             )
+
+        # Cached prompt suffixes need both the reused prefix and the K/V just
+        # written for the current suffix. The CUDA kernel applies causality per
+        # query token while reading the paged block table.
+        num_cached_prompt_tokens = input_metadata.num_cached_prompt_tokens
+        if num_cached_prompt_tokens > 0:
+            assert key_cache is not None and value_cache is not None
+            cached_start = num_fresh_prompt_tokens
+            cached_end = cached_start + num_cached_prompt_tokens
+            self.varlen_query_cached_kv_attention(
+                output[cached_start:cached_end],
+                query[cached_start:cached_end],
+                key_cache,
+                value_cache,
+                input_metadata,
+            )
         
         if input_metadata.num_generation_tokens > 0:
             assert key_cache is not None and value_cache is not None, (
@@ -158,8 +204,8 @@ class PagedAttention(nn.Module):
                 "generating tokens."
             )
             self.single_query_cached_kv_attention(
-                output[num_prompt_tokens:num_valid_tokens],
-                query[num_prompt_tokens:num_valid_tokens],
+                output[input_metadata.num_prompt_tokens:num_valid_tokens],
+                query[input_metadata.num_prompt_tokens:num_valid_tokens],
                 key_cache,
                 value_cache,
                 input_metadata
