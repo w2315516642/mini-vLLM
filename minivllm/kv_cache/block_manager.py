@@ -164,9 +164,22 @@ class BlockSpaceManager:
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
-    def _get_num_available_gpu_blocks(self) -> int:
-        return (self.gpu_allocator.get_num_free_blocks()
-                + self.hash_manager.get_num_evictable_blocks())
+    def _get_num_available_gpu_blocks(
+        self,
+        protected_blocks: Optional[BlockTable] = None,
+    ) -> int:
+        """Count free and evictable blocks, excluding blocks about to be used."""
+        num_available_blocks = (
+            self.gpu_allocator.get_num_free_blocks()
+            + self.hash_manager.get_num_evictable_blocks()
+        )
+        if protected_blocks:
+            # Cache-only hits are normally evictable, but allocation will add
+            # sequence references to them. They cannot fund new block slots.
+            num_available_blocks -= sum(
+                block.ref_count == 1 for block in protected_blocks
+            )
+        return num_available_blocks
 
     def _allocate_gpu_block(self) -> PhysicalTokenBlock:
         """Allocate a block, evicting one cache-only LRU block if needed."""
@@ -203,9 +216,10 @@ class BlockSpaceManager:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs()[0]
-        num_hit_blocks = len(self.find_longest_cache_hit(seq))
+        hit_blocks = self.find_longest_cache_hit(seq)
+        num_hit_blocks = len(hit_blocks)
         num_required_blocks = len(seq.logical_token_blocks) - num_hit_blocks
-        num_available_blocks = self._get_num_available_gpu_blocks()
+        num_available_blocks = self._get_num_available_gpu_blocks(hit_blocks)
         # Use watermark to avoid frequent cache eviction.
         return (num_available_blocks - num_required_blocks
                 >= self.watermark_blocks)
@@ -239,17 +253,27 @@ class BlockSpaceManager:
             f"should be greater than or equal to hit_blocks {len(block_table)}."
         )
         hit_blocks = block_table.copy()
+        num_seqs = seq_group.num_seqs()
+
+        if num_need_blocks > self._get_num_available_gpu_blocks(hit_blocks):
+            raise ValueError(
+                "Out of memory! Prefix hits leave too few blocks for the "
+                "uncached suffix."
+            )
+
+        # Pin hits before allocating suffix blocks. Otherwise an empty free
+        # list could evict and immediately reuse a block selected for this
+        # sequence's prefix.
+        for block in hit_blocks:
+            block.ref_count += num_seqs
+
         new_blocks: BlockTable = []
         for _ in range(num_need_blocks):
             block = self._allocate_gpu_block()
             block_table.append(block)
             new_blocks.append(block)
 
-        num_seqs = seq_group.num_seqs()
-        # Cached blocks already have a cache-owned reference. New blocks get
-        # their first sequence reference from BlockAllocator.allocate().
-        for block in hit_blocks:
-            block.ref_count += num_seqs
+        # New blocks get their first sequence reference from allocate().
         for block in new_blocks:
             block.ref_count += num_seqs - 1
         

@@ -39,39 +39,45 @@ class PrefixCacheWorkerTest(unittest.TestCase):
             "fresh", 0, list(range(8)), [10, 11], True, 0, 8)
         cached = make_metadata(
             "cached", 1, list(range(8)), [20, 21], True, 4, 4)
+        cached_short = make_metadata(
+            "cached-short", 3, list(range(6)), [40, 41], True, 4, 2)
         decode = make_metadata(
             "decode", 2, list(range(4)), [30, 31], False, 4, 1)
 
         worker = object.__new__(worker_module.Worker)
         worker.block_size = 4
         tokens, positions, metadata = worker._prepare_inputs(
-            [cached, decode, fresh])
+            [cached, decode, fresh, cached_short])
 
         self.assertEqual(
-            tokens[:13].cpu().tolist(),
-            list(range(8)) + list(range(4, 8)) + [99],
+            tokens[:15].cpu().tolist(),
+            list(range(8)) + list(range(4, 8)) + [4, 5, 99],
         )
         self.assertEqual(
-            positions[:13].cpu().tolist(),
-            list(range(8)) + list(range(4, 8)) + [4],
+            positions[:15].cpu().tolist(),
+            list(range(8)) + list(range(4, 8)) + [4, 5, 4],
         )
         self.assertEqual(
             metadata.slot_mapping.cpu().tolist(),
-            list(range(40, 48)) + list(range(84, 88)) + [124],
+            list(range(40, 48)) + list(range(84, 88)) + [164, 165, 124],
         )
 
-        self.assertEqual(metadata.prompt_lens, [8, 4])
+        self.assertEqual(metadata.prompt_lens, [8, 4, 2])
         self.assertEqual(metadata.num_fresh_prompt_tokens, 8)
-        self.assertEqual(metadata.num_cached_prompt_tokens, 4)
+        self.assertEqual(metadata.num_cached_prompt_tokens, 6)
         self.assertEqual(
-            metadata.cached_prompt_cu_seqlens.cpu().tolist(), [0, 4])
+            metadata.cached_prompt_cu_seqlens.cpu().tolist(), [0, 4, 6])
         self.assertEqual(
-            metadata.cached_prompt_context_lens.cpu().tolist(), [8])
+            metadata.cached_prompt_context_lens.cpu().tolist(), [8, 6])
         self.assertEqual(
-            metadata.cached_prompt_block_tables.cpu().tolist(), [[20, 21]])
+            metadata.cached_prompt_block_tables.cpu().tolist(),
+            [[20, 21], [40, 41]],
+        )
         self.assertEqual(metadata.block_tables.cpu().tolist(), [[30, 31]])
         self.assertEqual(
-            [seq_ids for seq_ids, _ in metadata.seq_groups], [[0], [1], [2]])
+            [seq_ids for seq_ids, _ in metadata.seq_groups],
+            [[0], [1], [3], [2]],
+        )
 
 
 if __name__ == "__main__":

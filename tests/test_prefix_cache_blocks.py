@@ -82,6 +82,35 @@ class PrefixCacheBlockTest(unittest.TestCase):
         manager.reset()
         self.assertEqual(manager.get_num_free_gpu_blocks(), 2)
 
+    def test_prefix_hits_are_not_counted_as_evictable_capacity(self):
+        manager = block_manager.BlockSpaceManager(4, 3, 1, watermark=0)
+        cached_seq = make_seq(0, list(range(12)))
+        manager.allocate(make_group("cached", [cached_seq]))
+        cached_seq.num_computed_tokens = cached_seq.get_len()
+        manager.cache_blocks(cached_seq)
+        cached_blocks = manager.block_tables[cached_seq.seq_id].copy()
+        manager.free(cached_seq)
+
+        # Four logical blocks need two new blocks after the first two hits,
+        # but only the third cached block can actually be evicted.
+        oversized_seq = make_seq(1, list(range(8)) + list(range(100, 105)))
+        self.assertFalse(
+            manager.can_allocate(make_group("oversized", [oversized_seq])))
+
+        # With one suffix block the request fits. The two prefix hits must stay
+        # pinned while the unrelated third cache block is reused.
+        fitting_seq = make_seq(2, list(range(8)) + [100])
+        fitting_group = make_group("fitting", [fitting_seq])
+        self.assertTrue(manager.can_allocate(fitting_group))
+        manager.allocate(fitting_group)
+
+        block_table = manager.block_tables[fitting_seq.seq_id]
+        self.assertIs(block_table[0], cached_blocks[0])
+        self.assertIs(block_table[1], cached_blocks[1])
+        self.assertNotIn(block_table[2], cached_blocks[:2])
+        self.assertEqual(cached_blocks[0].ref_count, 2)
+        self.assertEqual(cached_blocks[1].ref_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -341,8 +341,8 @@ template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, const int TM = 2>
 __global__ void varlen_query_cached_kv_attention_kernel(
     scalar_t *__restrict__ out,           // [num_tokens, num_heads, head_size]
-    const scalar_t *__restrict__ q,       // [max_seqlen_q * num_seqs,
-                                          // num_heads, head_size]
+    const scalar_t *__restrict__ q,       // [num_tokens, num_heads, head_size],
+                                          // packed by sequence
     const scalar_t *__restrict__ k_cache, // [num_blocks, num_heads,
                                           // head_size/x, block_size, x]
     const scalar_t *__restrict__ v_cache, // [num_blocks, num_heads, head_size, block_size]
@@ -380,7 +380,7 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   // 计算当前block处理的Query的token范围
   const int num_q_tokens =
       MIN(num_tokens_per_block, seqlen_q - m_block_offset);
-  // 目前是填充到max_seqlen_q, 有些seq填充的tokens数可能大于num_tokens_per_block
+  // Queries are packed; extra grid blocks exit when this seq has no queries.
   if (num_q_tokens <= 0) return;
 
   // A vector type to store a part of a key or a query.
@@ -825,8 +825,8 @@ void single_query_cached_kv_attention(
 template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128, int TM = 4>
 void varlen_query_cached_kv_attention_launcher(
     torch::Tensor &out,               // [num_tokens, num_heads, head_size]            
-    torch::Tensor &query,             // [max_seqlen_q * num_seqs, 
-                                      //  num_heads, head_size]
+    torch::Tensor &query,             // [num_tokens, num_heads, head_size],
+                                      // packed by sequence
     torch::Tensor &key_cache,         // [num_blocks, num_heads,
                                       //  head_size/x, block_size, x]
     torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]   
@@ -908,7 +908,7 @@ void varlen_query_cached_kv_attention_launcher(
 
 void varlen_query_cached_kv_attention(
     torch::Tensor &out,               // [num_tokens, num_heads, head_size]     
-    torch::Tensor &query,             // [max_seqlen_q * num_seqs, num_heads, heda_size]  
+    torch::Tensor &query,             // [num_tokens, num_heads, head_size], packed by seq
     torch::Tensor &key_cache,         // [num_blocks, num_heads, head_size/x, block_size, x]      
     torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]        
     torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]

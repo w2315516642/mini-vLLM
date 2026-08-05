@@ -13,7 +13,7 @@ void single_query_cached_kv_attention(
 
 void varlen_query_cached_kv_attention(
   torch::Tensor &out,               // [num_tokens, num_heads, head_size]     
-  torch::Tensor &query,             // [max_seqlen_q * num_seqs, num_heads, heda_size]  
+  torch::Tensor &query,             // [num_tokens, num_heads, head_size], packed by seq
   torch::Tensor &key_cache,         // [num_blocks, num_heads, head_size/x, block_size, x]      
   torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]        
   torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]

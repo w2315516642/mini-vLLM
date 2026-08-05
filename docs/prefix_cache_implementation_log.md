@@ -81,4 +81,22 @@
 
 ## 阶段四：集成验证与文档收尾
 
-状态：待开始
+状态：已完成
+
+完成内容：
+
+- 修复显存满载时的容量高估：本轮准备复用的 cache-only 命中块不再计入可淘汰容量。
+- 分配未命中后缀物理块前先增加命中块的 Sequence 引用，避免命中块在同次分配中被淘汰和复用。
+- 增加满载缓存回归测试，覆盖“容量不足时拒绝”和“容量恰好时只淘汰非命中块”。
+- Worker 输入规划测试扩展为多个不同长度的缓存后缀，验证 packed query 的累计长度和 block table。
+- `benchmark_prefix_cache.py` 显式打开 `enable_prefix_caching`。
+- 重写 `hash_prefix_caching.md`，记录开关、数据约定、执行流程、当前边界和 Chunked Prefill 接入点。
+
+最终验证：
+
+- 所有 Python 命令均通过 `conda run -n mini-vllm` 执行。
+- `python -m unittest discover -s tests -v`：共 10 项测试通过。
+- `python -m compileall -q minivllm tests benchmarks/benchmark_prefix_cache.py`：通过。
+- `git diff --check`：通过。
+- 当前 conda 环境未安装 `ray` 和 `xformers`，无法启动完整模型推理链路。
+- attention CUDA 扩展首次编译耗时较长，已按要求中止；因此本轮没有完成 varlen kernel 的编译和数值对照测试，该限制不会隐藏为“已验证”。

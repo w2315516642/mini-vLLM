@@ -35,6 +35,7 @@ def main(args: argparse.Namespace):
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=args.batch_size,
         max_num_batched_tokens=args.batch_size * args.input_len,
+        enable_prefix_caching=True,
     )
 
     sampling_params = SamplingParams(
