@@ -49,8 +49,16 @@ class BlockAllocator:
 
 
 class BlockHashManager:
+    """Maps prefix hashes to GPU blocks and maintains LRU order.
+
+    Every entry owns one reference to its block. A block with ref_count == 1
+    is therefore only kept alive by the prefix cache and can be evicted.
+    """
+
     def __init__(self) -> None:
-        self.hash_to_block: OrderedDict[BlockHash, LogicalTokenBlock] = {}
+        self.hash_to_block: OrderedDict[
+            BlockHash, PhysicalTokenBlock
+        ] = OrderedDict()
 
     def add_blocks(
         self,
@@ -64,8 +72,11 @@ class BlockHashManager:
 
         for block_hash, block in zip(block_hashes, blocks):
             if block_hash in self.hash_to_block:
-                self.hash_to_block.move_to_end(block)
+                self.hash_to_block.move_to_end(block_hash)
                 continue
+            assert block.device == Device.GPU
+            # This reference belongs to the cache, not to a sequence.
+            block.ref_count += 1
             self.hash_to_block[block_hash] = block
 
     def get_block(
@@ -101,6 +112,27 @@ class BlockHashManager:
         evicted_block = self.hash_to_block.pop(block_hash, None)
         return evicted_block
 
+    def evict_lru(self) -> PhysicalTokenBlock | None:
+        """Remove the oldest block that is only owned by the cache."""
+        for block_hash, block in self.hash_to_block.items():
+            if block.ref_count == 1:
+                del self.hash_to_block[block_hash]
+                return block
+        return None
+
+    def get_num_evictable_blocks(self) -> int:
+        return sum(
+            block.ref_count == 1 for block in self.hash_to_block.values()
+        )
+
+    def clear(self) -> List[PhysicalTokenBlock]:
+        blocks = list(self.hash_to_block.values())
+        self.hash_to_block.clear()
+        return blocks
+
+    def __len__(self) -> int:
+        return len(self.hash_to_block)
+
 
 BlockTable = List[PhysicalTokenBlock]
 
@@ -130,35 +162,59 @@ class BlockSpaceManager:
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
+    def _get_num_available_gpu_blocks(self) -> int:
+        return (self.gpu_allocator.get_num_free_blocks()
+                + self.hash_manager.get_num_evictable_blocks())
+
+    def _allocate_gpu_block(self) -> PhysicalTokenBlock:
+        """Allocate a block, evicting one cache-only LRU block if needed."""
+        if self.gpu_allocator.get_num_free_blocks() == 0:
+            evicted_block = self.hash_manager.evict_lru()
+            if evicted_block is None:
+                raise ValueError("Out of memory! No evictable GPU blocks.")
+            # Drop the reference owned by the prefix cache.
+            self.gpu_allocator.free(evicted_block)
+        return self.gpu_allocator.allocate()
+
     def cache_blocks(self, seq: Sequence) -> None:
         block_table = self.block_tables[seq.seq_id]
-        uncached_hashes = seq.block_hashes[seq.num_cached_blocks:]
-        uncached_blocks = block_table[seq.num_cached_blocks:]
-        # Drop the unfull block.
-        last_block = seq.logical_token_blocks[-1]
-        if not last_block.is_full():
-            uncached_blocks = uncached_blocks[:-1]
-        # Cache blocks.
+        # Logical blocks exist before model execution. Only the blocks covered
+        # by num_computed_tokens are guaranteed to contain valid KV data.
+        num_cacheable_blocks = min(
+            seq.num_computed_tokens // self.block_size,
+            len(seq.block_hashes),
+            len(block_table),
+        )
+        if num_cacheable_blocks <= seq.num_cached_blocks:
+            return
+
+        start = seq.num_cached_blocks
         self.hash_manager.add_blocks(
-            uncached_hashes, uncached_blocks)
-        seq.num_cached_blocks += len(uncached_blocks)
+            seq.block_hashes[start:num_cacheable_blocks],
+            block_table[start:num_cacheable_blocks],
+        )
+        seq.num_cached_blocks = num_cacheable_blocks
     
     def can_allocate(self, seq_group: SequenceGroup) -> bool:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs()[0]
-        num_required_blocks = len(seq.logical_token_blocks)
-        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_hit_blocks = len(self.find_longest_cache_hit(seq))
+        num_required_blocks = len(seq.logical_token_blocks) - num_hit_blocks
+        num_available_blocks = self._get_num_available_gpu_blocks()
         # Use watermark to avoid frequent cache eviction.
-        return num_free_gpu_blocks - num_required_blocks > self.watermark_blocks
+        return (num_available_blocks - num_required_blocks
+                >= self.watermark_blocks)
 
     def find_longest_cache_hit(self, seq: Sequence) -> BlockTable:
         # Allocate new physical token blocks that will store the prompt tokens.
         # 这里找prompt命中的缓存块，找不到的再从gpu_allocator要
-        max_num_tokens = seq.get_prompt_len() - 1
-        hit_blocks = self.find_longest_cache_hit(
+        # Keep the final known token for logits. With full-block reuse, an
+        # aligned prompt therefore recomputes its final block.
+        max_num_tokens = max(seq.get_len() - 1, 0)
+        hit_blocks = self.hash_manager.find_longest_cache_hit(
             seq.block_hashes, max_num_tokens)
-        return BlockTable(hit_blocks)
+        return list(hit_blocks)
 
     def allocate(self, seq_group: SequenceGroup) -> None:
         # NOTE: Here we assume that all sequences in the group have the same prompt.
@@ -171,25 +227,34 @@ class BlockSpaceManager:
             f"Number of logical_token_blocks {len(seq.logical_token_blocks)} "
             f"should be greater than or equal to hit_blocks {len(block_table)}."
         )
+        hit_blocks = block_table.copy()
+        new_blocks: BlockTable = []
         for _ in range(num_need_blocks):
-            block = self.gpu_allocator.allocate()
+            block = self._allocate_gpu_block()
             block_table.append(block)
-        # Add ref_count
-        for block in block_table:
-            block.ref_count += seq_group.num_seqs()
+            new_blocks.append(block)
+
+        num_seqs = seq_group.num_seqs()
+        # Cached blocks already have a cache-owned reference. New blocks get
+        # their first sequence reference from BlockAllocator.allocate().
+        for block in hit_blocks:
+            block.ref_count += num_seqs
+        for block in new_blocks:
+            block.ref_count += num_seqs - 1
         
         # Assign the block table for each sequence.
         # 一个seq group里面所有seq共享相同的初始block table（因为prompt相同）
         for seq in seq_group.get_seqs():
             seq.num_computed_tokens = num_computed_tokens
+            seq.num_cached_blocks = len(hit_blocks)
             self.block_tables[seq.seq_id] = block_table.copy()
     
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block
         # for each sequence, we can append.
-        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_available_blocks = self._get_num_available_gpu_blocks()
         num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
-        return num_seqs <= num_free_gpu_blocks
+        return num_seqs <= num_available_blocks
 
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
@@ -199,7 +264,7 @@ class BlockSpaceManager:
         if len(block_table) < len(logical_blocks):
             # The sequence has a new logical block.
             # Allocate a new physical block.
-            block = self.gpu_allocator.allocate()
+            block = self._allocate_gpu_block()
             block_table.append(block)
             return None
         
@@ -212,7 +277,7 @@ class BlockSpaceManager:
         else:
             # The last block is shared with other sequences.
             # Copy on Write: Allocate a new block and copy the tokens.
-            new_block = self.gpu_allocator.allocate()
+            new_block = self._allocate_gpu_block()
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return last_block.block_id, new_block.block_id
@@ -245,12 +310,13 @@ class BlockSpaceManager:
     def can_swap_in(self, seq_group: SequenceGroup) -> bool:
         blocks = self._get_physical_blocks(seq_group)
         num_swapped_seqs = seq_group.num_seqs(status=SequenceStatus.SWAPPED)
-        num_free_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_available_blocks = self._get_num_available_gpu_blocks()
         # NOTE: Conservatively, we assume that every sequence will allocate
         # at least one free block right after the swap-in.
         # NOTE: This should match the logic in can_append_slot().
         num_required_blocks = len(blocks) + num_swapped_seqs
-        return num_free_blocks - num_required_blocks >= self.watermark_blocks
+        return (num_available_blocks - num_required_blocks
+                >= self.watermark_blocks)
 
     def swap_in(self, seq_group: SequenceGroup) -> Dict[int, int]:
         # CPU block -> GPU block.
@@ -266,7 +332,7 @@ class BlockSpaceManager:
                     gpu_block = mapping[cpu_block]
                     gpu_block.ref_count += 1
                 else:
-                    gpu_block = self.gpu_allocator.allocate()
+                    gpu_block = self._allocate_gpu_block()
                     mapping[cpu_block] = gpu_block
                 new_block_table.append(gpu_block)
                 # Free the CPU block swapped in to GPU.
@@ -313,9 +379,9 @@ class BlockSpaceManager:
     def _free_block_table(self, block_table: BlockTable) -> None:
         for block in block_table:
             if block.device == Device.CPU:
-                self.gpu_allocator.free(block)
-            else:
                 self.cpu_allocator.free(block)
+            else:
+                self.gpu_allocator.free(block)
     
     def free(self, seq: Sequence) -> None:
         if seq.seq_id not in self.block_tables:
@@ -329,6 +395,9 @@ class BlockSpaceManager:
         for block_table in self.block_tables.values():
             self._free_block_table(block_table)
         self.block_tables.clear()
+        # Sequence references are gone; now release the cache-owned references.
+        for block in self.hash_manager.clear():
+            self.gpu_allocator.free(block)
 
     def get_block_table(self, seq: Sequence) -> List[int]:
         block_table = self.block_tables[seq.seq_id]

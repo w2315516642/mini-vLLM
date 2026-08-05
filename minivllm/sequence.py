@@ -167,10 +167,14 @@ class Sequence:
         return SequenceStatus.is_finished(self.status)
 
     def fork(self, child_seq: 'Sequence') -> None:
-        # TODO: Optimized by prefix caching.
         child_seq.logical_token_blocks = copy.deepcopy(self.logical_token_blocks)
         child_seq.output_logprobs = copy.deepcopy(self.output_logprobs)
         child_seq.data = copy.deepcopy(self.data)
+        # The child shares the parent's physical blocks, so it must describe
+        # the same computed KV prefix and the same block hashes.
+        child_seq.num_computed_tokens = self.num_computed_tokens
+        child_seq.num_cached_blocks = self.num_cached_blocks
+        child_seq.block_hashes = self.block_hashes.copy()
         return None
 
     def __repr__(self) -> str:

@@ -1,15 +1,18 @@
-from typing import Callable, Any, NewType, List, Optional
+from typing import Any, Callable, List, NewType, Optional, TYPE_CHECKING
 import hashlib
 import pickle
 import os
 
-from minivllm.sequence import Sequence
+if TYPE_CHECKING:
+    from minivllm.sequence import Sequence
 
 
 BlockHash = NewType("BlockHash", bytes)
-BlockHasher = Callable[[Sequence], List[BlockHash]]
+BlockHasher = Callable[["Sequence"], List[BlockHash]]
 
-NONE_HASH: BlockHash
+# LLMEngine replaces this value before constructing sequences. Keeping an
+# initial value also makes the utility safe to import in isolation.
+NONE_HASH: BlockHash = BlockHash(b"")
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]) -> None:
     global NONE_HASH
@@ -66,7 +69,7 @@ def get_seq_block_hasher(
     Returns a function which computes the list of un-computed block hashes
     of a sequence group."""
 
-    def seq_block_hasher(seq: Sequence) -> List[BlockHash]:
+    def seq_block_hasher(seq: "Sequence") -> List[BlockHash]:
 
         if seq.is_finished():
             return []
@@ -75,14 +78,14 @@ def get_seq_block_hasher(
         end_token_idx = start_token_idx + seq.block_size
         num_tokens = seq.get_len()
 
-        new_block_hashes = []
+        new_block_hashes: List[BlockHash] = []
         prev_block_hash = seq.block_hashes[-1] if seq.block_hashes else None
+        all_token_ids = seq.get_token_ids()
         while end_token_idx <= num_tokens:
-            all_token_ids = seq.get_token_ids()
             block_tokens = all_token_ids[start_token_idx:end_token_idx]
 
             block_hash = hash_block_tokens(
-                caching_hash_fn, block_tokens, prev_block_hash
+                caching_hash_fn, prev_block_hash, block_tokens
             )
 
             new_block_hashes.append(block_hash)
