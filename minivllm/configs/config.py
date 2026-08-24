@@ -3,6 +3,7 @@ from typing import Optional
 from loguru import logger
 from transformers import AutoConfig, PretrainedConfig
 
+from minivllm.configs.model_architecture import ModelArchitecture
 from minivllm.utils.device import get_cpu_memory
 
 _GiB = 1 << 30
@@ -24,44 +25,39 @@ class ModelConfig:
         self.seed = seed
 
         self.hf_config: PretrainedConfig = AutoConfig.from_pretrained(model)
-        self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
+        self.architecture = ModelArchitecture.from_hf_config(self.hf_config)
+        self.dtype = _get_and_verify_dtype(self.architecture.text_config, dtype)
 
     def verify_with_parallel_config(
         self,
         parallel_config: "ParallelConfig",
     ) -> None:
-        "tensor并行切的是注意力头吗"
-        total_num_attention_heads = self.hf_config.num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
-            raise ValueError(
-                f"Total number of attention heads ({total_num_attention_heads})"
-                " must be divisible by tensor parallel size "
-                f"({tensor_parallel_size}).")
-
-        "流水线并行切的是层数，n级就要分成n的倍数"
-        total_num_hidden_layers = self.hf_config.num_hidden_layers
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
-        if total_num_hidden_layers % pipeline_parallel_size != 0:
-            raise ValueError(
-                f"Total number of hidden layers ({total_num_hidden_layers}) "
-                "must be divisible by pipeline parallel size "
-                f"({pipeline_parallel_size}).")
+        self.architecture.verify_parallelism(
+            tensor_parallel_size, pipeline_parallel_size
+        )
 
     def get_hidden_size(self) -> int:
-        return self.hf_config.hidden_size
-    
+        return self.architecture.hidden_size
+
     def get_head_size(self) -> int:
-        # FIXME: 对 GQA、MQA 这种是不成立的
-        return self.hf_config.hidden_size // self.hf_config.num_attention_heads
+        return self.architecture.head_size
 
     def get_num_heads(self, parallel_config: "ParallelConfig") -> int:
-        total_num_attention_heads = self.hf_config.num_attention_heads
-        return total_num_attention_heads // parallel_config.tensor_parallel_size
+        return self.architecture.get_num_attention_heads(
+            parallel_config.tensor_parallel_size
+        )
+
+    def get_num_kv_heads(self, parallel_config: "ParallelConfig") -> int:
+        return self.architecture.get_num_kv_heads(
+            parallel_config.tensor_parallel_size
+        )
 
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
-        total_num_hidden_layers = self.hf_config.num_hidden_layers
-        return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+        return self.architecture.get_num_layers(
+            parallel_config.pipeline_parallel_size
+        )
 
 
 class CacheConfig:

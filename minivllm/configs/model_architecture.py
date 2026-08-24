@@ -66,41 +66,131 @@ class ModelArchitecture:
         ``text_config``. Raise ``ValueError`` with a useful field name when a
         structural invariant is violated.
         """
-        # TODO(student): Stage 1 assignment. Do not special-case model names.
-        raise NotImplementedError
+        root_config = hf_config
+        architectures = tuple(
+            _get_default_config_value(hf_config, "architectures", ())
+        )
+
+        text_config = _get_default_config_value(
+            hf_config, "text_config", hf_config
+        )
+
+        hidden_size = _get_config_value(text_config, "hidden_size")
+        num_hidden_layers = _get_config_value(text_config, "num_hidden_layers")
+        num_attention_heads = _get_config_value(text_config, "num_attention_heads")
+
+        head_size = getattr(text_config, "head_dim", None)
+        if head_size is None:
+            if hidden_size % num_attention_heads != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden_size}) must be divisible by "
+                    f"num_attention_heads ({num_attention_heads}) when "
+                    "head_dim is not provided"
+                )
+            head_size = hidden_size // num_attention_heads
+
+        num_key_value_heads = _get_default_config_value(
+            text_config,
+            "num_key_value_heads",
+            num_attention_heads,
+        )
+
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is None:
+            layer_types = [FULL_ATTENTION] * num_hidden_layers
+        else:
+            for layer in layer_types:
+                if layer not in SUPPORTED_LAYER_TYPES:
+                    raise ValueError(
+                        f"layer {layer} is not supported yet"
+                    )
+        layer_types = tuple(layer_types)
+
+        if num_attention_heads % num_key_value_heads != 0:
+            raise ValueError(
+                f"query heads ({num_attention_heads}) must be grouped "
+                f"evenly by KV heads ({num_key_value_heads})"
+            )
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"layer_types contains {len(layer_types)} entries, but "
+                f"num_hidden_layers is {num_hidden_layers}"
+            )
+
+        return cls(
+            root_config=root_config,
+            text_config=text_config,
+            architectures=architectures,
+            hidden_size=hidden_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_size=head_size,
+            layer_types=layer_types,
+        )
 
     @property
     def num_full_attention_layers(self) -> int:
         """Return the number of layers that allocate paged KV cache."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        return sum(layer == FULL_ATTENTION for layer in self.layer_types)
 
     @property
     def num_linear_attention_layers(self) -> int:
         """Return the number of layers that allocate recurrent state."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        return sum(layer == LINEAR_ATTENTION for layer in self.layer_types)
 
     @property
     def is_hybrid(self) -> bool:
         """Whether the model mixes full and linear attention layers."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        return self.num_full_attention_layers != 0 and self.num_linear_attention_layers != 0
 
     def get_num_attention_heads(self, tensor_parallel_size: int) -> int:
         """Return query heads owned by one tensor-parallel rank."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        if tensor_parallel_size <= 0:
+            raise ValueError(
+                "tensor_parallel_size must be positive, but got "
+                f"{tensor_parallel_size}"
+            )
+
+        if self.num_attention_heads % tensor_parallel_size != 0:
+            raise ValueError(
+                f"Total number of attention heads ({self.num_attention_heads})"
+                " must be divisible by tensor parallel size "
+                f"({tensor_parallel_size})."
+            )
+        return self.num_attention_heads // tensor_parallel_size
 
     def get_num_kv_heads(self, tensor_parallel_size: int) -> int:
         """Return KV heads owned by one tensor-parallel rank."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        if tensor_parallel_size <= 0:
+            raise ValueError(
+                "tensor_parallel_size must be positive, but got "
+                f"{tensor_parallel_size}"
+            )
+
+        if self.num_key_value_heads % tensor_parallel_size != 0:
+            raise ValueError(
+                f"Total number of KV heads ({self.num_key_value_heads})"
+                " must be divisible by tensor parallel size "
+                f"({tensor_parallel_size})."
+            )
+        return self.num_key_value_heads // tensor_parallel_size
 
     def get_num_layers(self, pipeline_parallel_size: int) -> int:
         """Return decoder layers owned by one pipeline-parallel rank."""
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        if pipeline_parallel_size <= 0:
+            raise ValueError(
+                "pipeline_parallel_size must be positive, but got "
+                f"{pipeline_parallel_size}"
+            )
+
+        if self.num_hidden_layers % pipeline_parallel_size != 0:
+            raise ValueError(
+                f"Total number of hidden layers ({self.num_hidden_layers}) "
+                "must be divisible by pipeline parallel size "
+                f"({pipeline_parallel_size})."
+            )
+        return self.num_hidden_layers // pipeline_parallel_size
 
     def verify_parallelism(
         self,
@@ -113,8 +203,14 @@ class ModelArchitecture:
         heads, KV heads, and decoder layers. Error messages should include the
         invalid dimension and requested parallel size.
         """
-        # TODO(student): Stage 1 assignment.
-        raise NotImplementedError
+        self.get_num_attention_heads(tensor_parallel_size)
+        self.get_num_kv_heads(tensor_parallel_size)
+        self.get_num_layers(pipeline_parallel_size)
+
+
+def _get_default_config_value(config: Any, field_name: str, default: Any) -> Any:
+    candidate = getattr(config, field_name, None)
+    return candidate if candidate is not None else default
 
 
 def _get_config_value(config: Any, field_name: str) -> Any:
@@ -124,5 +220,14 @@ def _get_config_value(config: Any, field_name: str) -> Any:
     missing-field errors are important when a newly released model changes its
     config schema.
     """
-    # TODO(student): Stage 1 assignment.
-    raise NotImplementedError
+    try:
+        candidate = getattr(config, field_name, None)
+    except AttributeError as e:
+        raise ValueError(
+            f"required config field {field_name} is missing from {type(config).__name__}"
+        ) from e
+    if candidate is None:
+        raise ValueError(
+            f"required config field {field_name} is None in {type(config).__name__}"
+        )
+    return candidate

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from minivllm.configs import config as config_module
 from minivllm.configs.config import ModelConfig, ParallelConfig
 from minivllm.configs.model_architecture import (
     FULL_ATTENTION,
@@ -56,6 +57,21 @@ class ModelArchitectureTest(unittest.TestCase):
         self.assertIs(architecture.root_config, config)
         self.assertIs(architecture.text_config, config)
         self.assertEqual(architecture.architectures, ("LlamaForCausalLM",))
+
+    def test_optional_none_values_use_structural_defaults(self):
+        config = llama_config(
+            architectures=None,
+            text_config=None,
+            num_key_value_heads=None,
+        )
+        architecture = ModelArchitecture.from_hf_config(config)
+
+        self.assertIs(architecture.text_config, config)
+        self.assertEqual(architecture.architectures, ())
+        self.assertEqual(
+            architecture.num_key_value_heads,
+            architecture.num_attention_heads,
+        )
 
     def test_nested_config_uses_text_config_dimensions(self):
         config = qwen_config()
@@ -160,7 +176,7 @@ class ModelArchitectureTest(unittest.TestCase):
 
 class ModelConfigIntegrationTest(unittest.TestCase):
 
-    @patch("minivllm.configs.config.AutoConfig.from_pretrained")
+    @patch.object(config_module.AutoConfig, "from_pretrained")
     def test_model_config_exposes_normalized_architecture(self, from_pretrained):
         from_pretrained.return_value = qwen_config()
         with patch("torch.cuda.get_device_capability", return_value=(8, 9)):
@@ -178,7 +194,7 @@ class ModelConfigIntegrationTest(unittest.TestCase):
         self.assertEqual(model_config.get_hidden_size(), 5120)
         self.assertEqual(model_config.get_head_size(), 256)
 
-    @patch("minivllm.configs.config.AutoConfig.from_pretrained")
+    @patch.object(config_module.AutoConfig, "from_pretrained")
     def test_model_config_delegates_parallel_values(self, from_pretrained):
         from_pretrained.return_value = qwen_config()
         with patch("torch.cuda.get_device_capability", return_value=(8, 9)):
