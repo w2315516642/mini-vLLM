@@ -4,6 +4,7 @@
 
 - 每个阶段由 Codex 完成外围脚手架、测试和接口说明。
 - 每阶段开始时，在 `docs/qwen38-learning/` 提供一份不纳入 Git 的背景与实现讲义。
+- 每份讲义先说明本阶段模块在端到端推理链路中的位置、调用时机、上下游数据和对后续模块的影响，再讲模块内部实现。
 - 学习者负责一个约 100 到 300 行的核心模块，部分阶段的核心模块是 CUDA 算子。
 - 作业验收前不提交阶段完成 commit。
 - Codex 默认只提供概念级提示，不直接覆盖作业实现。
@@ -15,7 +16,7 @@
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | 1 | 配置归一化与结构校验 | 已完成 |
-| 2 | 模型注册与嵌套配置接入 | 未开始 |
+| 2 | 模型注册与嵌套配置接入 | 已完成 |
 | 3 | GQA 与独立 KV 头 | 未开始 |
 | 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 未开始 |
 | 5 | Gated DeltaNet 参考实现 | 未开始 |
@@ -92,3 +93,81 @@ Llama 的语言模型字段直接位于根配置中；Qwen3.8 的根配置同时
 - 验证结果：阶段测试 19/19 通过，Prefix Cache 回归 10/10 通过，完整测试 29/29 通过，`git diff --check` 无空白错误。
 - 已知限制：本阶段只验证结构归一化与现有调用链，尚未加载真实 Qwen3.8 权重；模型注册、GQA 执行路径和混合注意力将在后续既定阶段完成。
 - 下一阶段：阶段 2“模型注册与嵌套配置接入”，保持未开始，等待讲义和作业脚手架准备。
+
+## 阶段 2：模型注册与嵌套配置接入
+
+### 为什么需要独立注册表
+
+当前 `model_loader.py` 使用硬编码类字典，并把 Hugging Face 根配置直接传给模型构造函数。Qwen3.8-27B 的官方 architecture 是 `Qwen3_5ForConditionalGeneration`，但语言维度位于 `text_config`。本阶段将“根据根 architecture 选类”和“使用文本配置构造语言骨干”分离，并通过惰性注册避免查询配置时提前导入所有模型及 CUDA 依赖。
+
+### Codex 负责
+
+- 提供 `ModelRegistration`、`ModelRegistry` 的稳定类型和公开接口。
+- 将 `model_loader.py` 接到归一化 architecture 与 `text_config`。
+- 登记 Llama 和 Qwen3.8 的官方 architecture 字符串目标。
+- 提供注册、解析、惰性导入、错误诊断和 loader 集成测试。
+- 在忽略的 `docs/qwen38-learning/stage-02-model-registry.md` 提供阶段讲义。
+
+### 学习者负责
+
+完成 `minivllm/model_executor/models/registry.py` 中全部 `TODO(student)`：
+
+1. 校验 architecture 和 eager/lazy target。
+2. 实现重复注册与显式覆盖。
+3. 按 Hugging Face architecture 顺序解析首个支持项。
+4. 使用 `importlib` 惰性加载 `module:ClassName`。
+5. 验证解析结果是 `torch.nn.Module` 子类。
+6. 为不支持、导入失败和类型错误提供可诊断异常。
+
+预计自然实现量约 100 到 200 行，不需要为了行数增加抽象。
+
+### 约束
+
+- 不根据模型仓库名称或字符串前缀猜模型族。
+- 不把未知模型静默回退成 Llama。
+- 不在注册或查询支持列表时导入 lazy target。
+- 不改变 Hugging Face `architectures` 的声明顺序。
+- 不在本阶段实现 Qwen 模型主体、Attention、DeltaNet、Cache 或权重映射。
+- Qwen lazy target 在后续模型阶段落地前允许尚不可实例化，但 architecture 必须准确登记。
+
+### 验收命令
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_model_registry.py' -v
+```
+
+回归测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_model_architecture.py' -v
+
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_prefix_cache*.py' -v
+```
+
+### 预提交基线
+
+- 新测试应能正常导入。
+- loader 的 `text_config` 接线测试应通过。
+- registry 核心测试应只在 `TODO(student)` 处失败。
+- 阶段 1 与 Prefix Cache 回归应继续通过。
+- 2026-08-25 基线：阶段 2 测试 2/10 通过，其余 8 项停在保留 TODO；完整测试 31/39 通过，无非预期失败。
+
+### 原理验收
+
+- 为什么 Qwen3.8 使用 `Qwen3_5ForConditionalGeneration` 作为注册名称？
+- 为什么根配置用于选类，而 `text_config` 用于构造语言骨干？
+- lazy import 为什么能降低多进程 GPU 初始化风险？
+- 为什么 architecture 顺序不能使用集合重排？
+
+### 完成记录
+
+- 完成时间：2026-08-25。
+- 学习者完成：architecture 与 eager/lazy target 校验、重复注册和显式覆盖、按声明顺序解析首个支持项、`module:ClassName` 惰性加载，以及加载结果的 `nn.Module` 子类校验。
+- Codex 收尾：补齐包含 architecture、target 和支持列表的诊断信息，收窄异常捕获边界并保留 lazy 加载的原始 cause，增加通过公开接口注册 lazy target 时不提前导入的回归测试。
+- 验证环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128、Transformers 5.7.0，CUDA 12.8 可用。
+- 验证结果：阶段测试 11/11 通过，阶段 1 回归 19/19 通过，Prefix Cache 回归 10/10 通过，完整测试 40/40 通过；`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
+- 已知限制：本阶段只完成模型路由和嵌套文本配置接线；Qwen 的 lazy target 尚未实现，真实权重加载、GQA、混合注意力和 Cache 留在后续既定阶段。
+- 下一阶段：阶段 3“GQA 与独立 KV 头”保持未开始，等待讲义和作业脚手架准备。

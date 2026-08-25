@@ -1,37 +1,27 @@
 
-from typing import Type
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 
 from minivllm.configs import ModelConfig
-from minivllm.model_executor.models import LlamaForCausalLM
+from minivllm.model_executor.models.registry import MODEL_REGISTRY, ModelClass
 from minivllm.model_executor.weight_utils import initialize_dummy_weights
 from minivllm.utils import counter
 
-_MODEL_REGISTRY = {
-    "LlamaForCausalLM": LlamaForCausalLM
-}
 
-
-def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
-    architectures = getattr(config, "architectures", [])
-    for arch in architectures:
-        if arch in _MODEL_REGISTRY:
-            return _MODEL_REGISTRY[arch]
-    raise ValueError(
-        f"Model architectures {architectures} are not supported for now. "
-        f"Supported architectures: {list(_MODEL_REGISTRY.keys())}"
+def _get_model_architecture(model_config: ModelConfig) -> ModelClass:
+    """Resolve the model class from the normalized root architectures."""
+    return MODEL_REGISTRY.resolve_model_class(
+        model_config.architecture.architectures
     )
 
 
 def get_model(model_config: ModelConfig) -> nn.Module:
-    model_class = _get_model_architecture(model_config.hf_config)
+    model_class = _get_model_architecture(model_config)
     torch.set_default_dtype(model_config.dtype)
 
     # Create a model instance.
     # The weights will be initialized as empty tensors.
-    model = model_class(model_config.hf_config)
+    model = model_class(model_config.architecture.text_config)
     if model_config.use_dummy_weights:
         model = model.cuda()
         # Set random value to the weights.

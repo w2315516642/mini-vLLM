@@ -1,6 +1,12 @@
-from minivllm.model_executor.models.llama import LlamaForCausalLM
+from minivllm.model_executor.models.registry import (
+    MODEL_REGISTRY,
+    ModelRegistration,
+    ModelRegistry,
+)
 
 
 __all__ = [
-    "LlamaForCausalLM"
+    "MODEL_REGISTRY",
+    "ModelRegistration",
+    "ModelRegistry",
 ]
