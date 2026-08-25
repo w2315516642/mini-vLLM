@@ -74,14 +74,15 @@ template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE,
 __global__ void single_query_cached_kv_attention_kernel(
     scalar_t *__restrict__ out,           // [num_seqs, num_heads, head_size]
     const scalar_t *__restrict__ q,       // [num_seqs, num_heads, head_size]
-    const scalar_t *__restrict__ k_cache, // [num_blocks, num_heads,
+    const scalar_t *__restrict__ k_cache, // [num_blocks, num_kv_heads,
                                           // head_size/x, block_size, x]
     const scalar_t
-        *__restrict__ v_cache, // [num_blocks, num_heads, head_size, block_size]
+        *__restrict__ v_cache, // [num_blocks, num_kv_heads, head_size, block_size]
     const float scale,
     const int *__restrict__ block_tables, // [num_seqs, max_num_blocks_per_seq]
     const int *__restrict__ context_lens, // [num_seqs]
-    const int max_num_blocks_per_seq, const int q_stride) {
+    const int max_num_blocks_per_seq,
+    const int num_kv_heads, const int q_stride) {
   // block-size是一个block里面的token数量
   // THREAD_GROUP_SIZE 表示多少个线程处理block中的一个token的特征
   // 例如这里可以是32/16=2个线程处理一个token的特征
@@ -99,6 +100,9 @@ __global__ void single_query_cached_kv_attention_kernel(
   const int head_idx = blockIdx.x;
   const int num_heads = gridDim.x;
   const int seq_idx = blockIdx.y;
+
+  const int queries_per_kv = num_heads / num_kv_heads;
+  const int head_idx_kv = head_idx / queries_per_kv;
 
   // A vector type to store a part of a key or a query.
   // The vector size is configured in such a way that the threads in a thread
@@ -168,8 +172,8 @@ __global__ void single_query_cached_kv_attention_kernel(
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
         const scalar_t *k_ptr =
             k_cache +
-            physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE +
-            head_idx * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
+            physical_block_number * num_kv_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx_kv * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
@@ -259,8 +263,8 @@ __global__ void single_query_cached_kv_attention_kernel(
                *reinterpret_cast<Float_L_vec *>(logits + token_idx));
 
     const scalar_t *v_ptr =
-        v_cache + physical_block_number * num_heads * HEAD_SIZE * BLOCK_SIZE +
-        head_idx * HEAD_SIZE * BLOCK_SIZE;
+        v_cache + physical_block_number * num_kv_heads * HEAD_SIZE * BLOCK_SIZE +
+        head_idx_kv * HEAD_SIZE * BLOCK_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
@@ -343,14 +347,15 @@ __global__ void varlen_query_cached_kv_attention_kernel(
     scalar_t *__restrict__ out,           // [num_tokens, num_heads, head_size]
     const scalar_t *__restrict__ q,       // [num_tokens, num_heads, head_size],
                                           // packed by sequence
-    const scalar_t *__restrict__ k_cache, // [num_blocks, num_heads,
-                                          // head_size/x, block_size, x]
-    const scalar_t *__restrict__ v_cache, // [num_blocks, num_heads, head_size, block_size]
+    const scalar_t *__restrict__ k_cache, // [num_blocks, num_kv_heads,
+                                           // head_size/x, block_size, x]
+    const scalar_t *__restrict__ v_cache, // [num_blocks, num_kv_heads, head_size, block_size]
     const int *__restrict__ cu_seqlens_q, // [num_seqs + 1]
     const int max_seqlen_q, const float scale,
     const int *__restrict__ block_tables, // [num_seqs, max_num_blocks_per_seq]
     const int *__restrict__ context_lens, // [num_seqs]
-    const int max_num_blocks_per_seq, const int q_stride) {
+    const int max_num_blocks_per_seq,
+    const int num_kv_heads, const int q_stride) {
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
   constexpr int NUM_TOKENS_PER_THREAD_GROUP =
       (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
@@ -360,13 +365,16 @@ __global__ void varlen_query_cached_kv_attention_kernel(
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
   const int lane_idx = thread_idx % WARP_SIZE;
-  
+
   const int head_idx = blockIdx.y;
   const int seq_idx = blockIdx.z;
 
   const int num_blocks_per_seq = gridDim.x;
   const int num_heads = gridDim.y;
   const int num_seqs = gridDim.z;
+
+  const int queries_per_kv = num_heads / num_kv_heads;
+  const int head_idx_kv = head_idx / queries_per_kv;
 
   const int num_tokens_per_block =
       (max_seqlen_q + num_blocks_per_seq - 1) / num_blocks_per_seq;
@@ -489,8 +497,8 @@ __global__ void varlen_query_cached_kv_attention_kernel(
 
         K_vec k_vecs[NUM_VECS_PER_THREAD];
         const scalar_t* k_ptr =
-            k_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE +
-            head_idx * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
+            k_cache + physical_block_id * num_kv_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx_kv * HEAD_SIZE * BLOCK_SIZE + physical_block_offset * x;
 #pragma unroll
         for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
           const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
@@ -601,8 +609,8 @@ __global__ void varlen_query_cached_kv_attention_kernel(
                                   row_logits + physical_block_offset));
 
         const scalar_t* v_ptr =
-            v_cache + physical_block_id * num_heads * HEAD_SIZE * BLOCK_SIZE +
-            head_idx * HEAD_SIZE * BLOCK_SIZE;
+            v_cache + physical_block_id * num_kv_heads * HEAD_SIZE * BLOCK_SIZE +
+            head_idx_kv * HEAD_SIZE * BLOCK_SIZE;
 #pragma unroll
         for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
           const int row_idx =
@@ -683,7 +691,7 @@ __global__ void varlen_query_cached_kv_attention_kernel(
       <<<grid, block, shared_mem_size, stream>>>(                              \
           out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale,           \
           block_tables_ptr, context_lens_ptr, max_num_blocks_per_seq,          \
-          query_stride);
+          num_kv_heads, query_stride);
 
 // TODO(woosuk): Tune NUM_THREADS.
 template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128>
@@ -693,6 +701,13 @@ void single_query_cached_kv_attention_launcher(
     torch::Tensor &context_lens, int max_context_len) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
+  int num_kv_heads = key_cache.size(1);
+  TORCH_CHECK(num_kv_heads > 0, "KV head count must be positive");
+  TORCH_CHECK(num_heads % num_kv_heads == 0,
+              "Query heads must be divisible by KV heads");
+  TORCH_CHECK(value_cache.size(1) == num_kv_heads,
+              "Key and value caches must have the same KV head count");
+
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
   int query_stride = query.stride(0);
@@ -820,16 +835,16 @@ void single_query_cached_kv_attention(
       <<<grid, block, shared_mem_size, stream>>>(                                   \
           out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q_ptr,     \
           max_seqlen_q, scale, block_tables_ptr, context_lens_ptr,                  \
-          max_num_blocks_per_seq, query_stride)
+          max_num_blocks_per_seq, num_kv_heads, query_stride)
 
 template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128, int TM = 4>
 void varlen_query_cached_kv_attention_launcher(
     torch::Tensor &out,               // [num_tokens, num_heads, head_size]            
     torch::Tensor &query,             // [num_tokens, num_heads, head_size],
                                       // packed by sequence
-    torch::Tensor &key_cache,         // [num_blocks, num_heads,
+    torch::Tensor &key_cache,         // [num_blocks, num_kv_heads,
                                       //  head_size/x, block_size, x]
-    torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]   
+    torch::Tensor &value_cache,       // [num_blocks, num_kv_heads, head_size, block_size]
     torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]      
     int max_seqlen_q, float scale,            
     torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]
@@ -837,6 +852,13 @@ void varlen_query_cached_kv_attention_launcher(
     int max_context_len) {
   int num_seqs = cu_seqlens_q.size(0) - 1;
   int num_heads = query.size(1);
+  int num_kv_heads = key_cache.size(1);
+  TORCH_CHECK(num_kv_heads > 0, "KV head count must be positive");
+  TORCH_CHECK(num_heads % num_kv_heads == 0,
+              "Query heads must be divisible by KV heads");
+  TORCH_CHECK(value_cache.size(1) == num_kv_heads,
+              "Key and value caches must have the same KV head count");
+
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
   int query_stride = query.stride(0);

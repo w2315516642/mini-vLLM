@@ -6,12 +6,14 @@ namespace vllm {
 template<typename scalar_t>
 __global__ void rotary_embedding_neox_kernel(
   const int64_t* __restrict__ positions,        // [num_tokens]
-  scalar_t* __restrict__ query,                 // [num_tokens, num_heads, head_size]
-  scalar_t* __restrict__ key,                   // [num_tokens, num_heads, head_size]
+  scalar_t* __restrict__ query,                 // [num_tokens, num_query_heads, head_size]
+  scalar_t* __restrict__ key,                   // [num_tokens, num_kv_heads, head_size]
   const scalar_t* __restrict__ cos_sin_cache,   // [max_position, 2, rot_dim // 2]
   const int rot_dim,
-  const int stride,
-  const int num_heads,
+  const int stride_q,
+  const int stride_k,
+  const int num_query_heads,
+  const int num_kv_heads,
   const int head_size) {
   // Each thread block is responsible for one token.
   const int token_idx = blockIdx.x;
@@ -19,17 +21,18 @@ __global__ void rotary_embedding_neox_kernel(
   const scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
 
   const int embed_dim = rot_dim / 2;
-  const int n = num_heads * embed_dim;
+  const int n = num_query_heads * embed_dim;
+  const int m = num_kv_heads * embed_dim;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     const int head_idx = i / embed_dim;
-    const int token_head = token_idx * stride + head_idx * head_size;
+    const int token_head = token_idx * stride_q + head_idx * head_size;
 
     const int rot_offset = i % embed_dim;
     const int x_index = rot_offset;
     const int y_index = embed_dim + rot_offset;
 
-    const int out_x = token_idx * stride + head_idx * head_size + x_index;
-    const int out_y = token_idx * stride + head_idx * head_size + y_index;
+    const int out_x = token_idx * stride_q + head_idx * head_size + x_index;
+    const int out_y = token_idx * stride_q + head_idx * head_size + y_index;
 
     const scalar_t cos = __ldg(cache_ptr + x_index);
     const scalar_t sin = __ldg(cache_ptr + y_index);
@@ -39,10 +42,18 @@ __global__ void rotary_embedding_neox_kernel(
     query[out_x] = q_x * cos - q_y * sin;
     query[out_y] = q_y * cos + q_x * sin;
 
-    const scalar_t k_x = key[token_head + x_index];
-    const scalar_t k_y = key[token_head + y_index];
-    key[out_x] = k_x * cos - k_y * sin;
-    key[out_y] = k_y * cos + k_x * sin;
+    if (i < m) {
+      const int head_idx_k = i / embed_dim;
+      const int token_head_k = token_idx * stride_k + head_idx_k * head_size;
+
+      const int out_x_k = token_idx * stride_k + head_idx_k * head_size + x_index;
+      const int out_y_k = token_idx * stride_k + head_idx_k * head_size + y_index;
+
+      const scalar_t k_x = key[token_head_k + x_index];
+      const scalar_t k_y = key[token_head_k + y_index];
+      key[out_x_k] = k_x * cos - k_y * sin;
+      key[out_y_k] = k_y * cos + k_x * sin;
+    }
   }
 }
 
@@ -50,19 +61,20 @@ __global__ void rotary_embedding_neox_kernel(
 
 void rotary_embedding_neox(
   torch::Tensor& positions,         // [num_tokens]
-  torch::Tensor& query,             // [num_tokens, num_heads * head_size]
-  torch::Tensor& key,               // [num_tokens, num_heads * head_size]
+  torch::Tensor& query,             // [num_tokens, num_query_heads * head_size]
+  torch::Tensor& key,               // [num_tokens, num_kv_heads * head_size]
   int head_size,
   torch::Tensor& cos_sin_cache)     // [max_position, rot_dim]
 {
+  // Pass independent Q/K layouts without requiring equal token strides.
   int num_tokens = query.size(0);
   int rot_dim = cos_sin_cache.size(1);
-  int num_heads = query.size(1) / head_size;
-  int stride = query.stride(0);
-  TORCH_CHECK(stride == key.stride(0));
-
+  int num_query_heads = query.size(1) / head_size;
+  int num_kv_heads = key.size(1) / head_size;
+  int stride_q = query.stride(0);
+  int stride_k = key.stride(0);
   dim3 grid(num_tokens);
-  dim3 block(std::min(num_heads * rot_dim / 2, 512));
+  dim3 block(std::min(num_query_heads * rot_dim / 2, 512));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
@@ -76,8 +88,10 @@ void rotary_embedding_neox(
         key.data_ptr<scalar_t>(),
         cos_sin_cache.data_ptr<scalar_t>(),
         rot_dim,
-        stride,
-        num_heads,
+        stride_q,
+        stride_k,
+        num_query_heads,
+        num_kv_heads,
         head_size);
     });
 }

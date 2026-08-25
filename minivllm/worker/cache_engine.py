@@ -26,7 +26,7 @@ class CacheEngine:
 
         self.head_size = model_config.get_head_size() 
         self.num_layers = model_config.get_num_layers(parallel_config)
-        self.num_heads = model_config.get_num_heads(parallel_config)
+        self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.dtype = model_config.dtype
 
         self.block_size = cache_config.block_size   
@@ -47,7 +47,7 @@ class CacheEngine:
         # 要凑齐 16 字节，需要连续读取多少个元素
         x = 16 // element_size
         return (
-            self.num_heads,
+            self.num_kv_heads,
             self.head_size // x,
             self.block_size,
             x,
@@ -55,7 +55,7 @@ class CacheEngine:
     
     def get_value_block_shape(self) -> Tuple[int, int, int]:
         return (
-            self.num_heads,
+            self.num_kv_heads,
             self.head_size,
             self.block_size,
         )
@@ -141,10 +141,10 @@ class CacheEngine:
     ) -> int:
         head_size = model_config.get_head_size() 
         num_layers = model_config.get_num_layers(parallel_config)
-        num_heads = model_config.get_num_heads(parallel_config)
+        num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         # Size of key cache in bytes.
-        key_cache_block = block_size * num_heads * head_size
+        key_cache_block = block_size * num_kv_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
         dtype_size = _get_dtype_size(model_config.dtype)

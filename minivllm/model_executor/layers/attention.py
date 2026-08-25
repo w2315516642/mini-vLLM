@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,10 +46,19 @@ class PagedAttention(nn.Module):
         self, 
         num_heads: int, 
         head_size: int, 
-        scale: float
+        scale: float,
+        num_kv_heads: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = (
+            num_heads if num_kv_heads is None else num_kv_heads
+        )
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError("Query and KV head counts must be positive")
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("Query heads must be grouped evenly by KV heads")
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_size = head_size
         self.scale = scale
         self.attn_op = xops.fmha.cutlass.FwOp()
@@ -58,35 +67,68 @@ class PagedAttention(nn.Module):
             raise ValueError(f"head size ({self.head_size}) is not supported. "
                              f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}")
 
-    # FIXME: 这里假设q数量和kv数量是相等的
+    def _reshape_qkv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore explicit query and compact KV head dimensions."""
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        return query, key, value
+
+    def _grouped_prefill_inputs(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build xFormers [B, T, KV groups, Q per group, D] views."""
+        kv_groups = self.num_kv_heads
+        q_per_group = self.num_heads // kv_groups
+
+        query = query.view(-1, kv_groups, q_per_group, self.head_size).unsqueeze(0)
+        key = key.unsqueeze(-2).expand(-1, -1, q_per_group, -1).unsqueeze(0)
+        value = value.unsqueeze(-2).expand(-1, -1, q_per_group, -1).unsqueeze(0)
+        return query, key, value
+
     def multi_query_kv_attention(
         self,
-        output: torch.Tensor,               # [num_prompt_tokens, num_heads, head_size]                                       
-        query: torch.Tensor,                # [num_prompt_tokens, num_heads, head_size]    
-        key: torch.Tensor,                  # [num_prompt_tokens, num_heads, head_size]
-        value: torch.Tensor,                # [num_prompt_tokens, num_heads, head_size]
+        output: torch.Tensor,       # [num_prompt_tokens, num_query_heads, head_size]
+        query: torch.Tensor,        # [num_prompt_tokens, num_query_heads, head_size]
+        key: torch.Tensor,          # [num_prompt_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,        # [num_prompt_tokens, num_kv_heads, head_size]
         attn_bias: xops.AttentionBias,
     ) -> torch.Tensor:
         # TODO(woosuk): The unsqueeze op may incur some CPU overhead. Optimize.
+        if self.num_heads == self.num_kv_heads:
+            xformers_query = query.unsqueeze(0)
+            xformers_key = key.unsqueeze(0)
+            xformers_value = value.unsqueeze(0)
+        else:
+            xformers_query, xformers_key, xformers_value = (
+                self._grouped_prefill_inputs(query, key, value)
+            )
         out = xops.memory_efficient_attention_forward(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
+            xformers_query,
+            xformers_key,
+            xformers_value,
             attn_bias=attn_bias,
             p=0.0,
             scale=self.scale,
             op=self.attn_op
         )
-        # TODO: Unnecessary copy.
-        output.copy_(out.squeeze(0))
+        output.copy_(out.reshape_as(output))
         return output
 
     def single_query_cached_kv_attention(
         self,
-        output: torch.Tensor,           # [num_generation_tokens, num_heads, head_size]
-        query: torch.Tensor,            # [num_generation_tokens, num_heads, head_size]
-        key_cache: torch.Tensor,        # [num_blocks, num_heads, head_size/x, block_size, x]
-        value_cache: torch.Tensor,      # [num_blocks, num_heads, head_size, block_size]
+        output: torch.Tensor,       # [num_generation_tokens, num_query_heads, head_size]
+        query: torch.Tensor,        # [num_generation_tokens, num_query_heads, head_size]
+        key_cache: torch.Tensor,    # [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, block_size]
         input_metadata: InputMetadata
     ) -> None:
         block_size = value_cache.shape[3]
@@ -131,21 +173,15 @@ class PagedAttention(nn.Module):
 
     def forward(
         self,
-        query: torch.Tensor,                    # [num_tokens, num_heads * head_size]
-        key: torch.Tensor,                      # [num_tokens, num_heads * head_size]
-        value: torch.Tensor,                    # [num_tokens, num_heads * head_size]
-        key_cache: Optional[torch.Tensor],      # [num_blocks, num_heads, head_size/x, block_size, x]
-        value_cache: Optional[torch.Tensor],    # [num_blocks, num_heads, head_size, block_size]
+        query: torch.Tensor,  # [num_tokens, num_query_heads * head_size]
+        key: torch.Tensor,    # [num_tokens, num_kv_heads * head_size]
+        value: torch.Tensor,  # [num_tokens, num_kv_heads * head_size]
+        key_cache: Optional[torch.Tensor],
+        value_cache: Optional[torch.Tensor],
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
-        # NOTE: The query, key, and value tensors must be sliced from a qkv
-        # tensor of shape [num_tokens, 3 * num_heads * head_size].
-        # 就是 qkv 的地址必须得是连续的
-
-        query = query.view(-1, self.num_heads, self.head_size)
-        key = key.view(-1, self.num_heads, self.head_size)
-        value = value.view(-1, self.num_heads, self.head_size)
+        query, key, value = self._reshape_qkv(query, key, value)
 
         output = torch.empty_like(query)
 
@@ -228,8 +264,14 @@ class PagedAttentionWithRoPE(PagedAttention):
         max_position: int = 8192,       # max model len
         # TODO: The base can be a float.
         base: int = 10000,
+        num_kv_heads: Optional[int] = None,
     ) -> None:
-        super().__init__(num_heads, head_size, scale)
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads=num_kv_heads,
+        )
 
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2) / rotary_dim))
         t = torch.arange(max_position).float()
@@ -245,11 +287,11 @@ class PagedAttentionWithRoPE(PagedAttention):
     def forward(
         self,
         positions: torch.Tensor,                # [num_tokens]
-        query: torch.Tensor,                    # [num_tokens, num_heads * head_size]
-        key: torch.Tensor,                      # [num_tokens, num_heads * head_size]
-        value: torch.Tensor,                    # [num_tokens, num_heads * head_size]
-        key_cache: Optional[torch.Tensor],      # [num_blocks, num_heads, head_size/x, block_size, x]
-        value_cache: Optional[torch.Tensor],    # [num_blocks, num_heads, head_size, block_size]
+        query: torch.Tensor,  # [num_tokens, num_query_heads * head_size]
+        key: torch.Tensor,    # [num_tokens, num_kv_heads * head_size]
+        value: torch.Tensor,  # [num_tokens, num_kv_heads * head_size]
+        key_cache: Optional[torch.Tensor],
+        value_cache: Optional[torch.Tensor],
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:

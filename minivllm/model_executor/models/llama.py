@@ -19,6 +19,40 @@ from minivllm.model_executor.parallel_utils.tensor_parallel import (
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+
+def _split_qkv(
+    qkv: torch.Tensor,  # [num_tokens, q_size + 2 * kv_size]
+    q_size: int,
+    kv_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split one rank-local packed projection into unequal Q/K/V parts."""
+    return torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+
+
+def _load_qkv_weight(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    tensor_model_parallel_rank: int,
+    q_size: int,
+    kv_size: int,
+) -> None:
+    """Copy one global checkpoint Q/K/V shard into a local packed weight."""
+    # Q/K/V shard size, offset in the packed weight
+    qkv_map = {"q": [q_size, 0], "k": [kv_size, q_size], "v": [kv_size, q_size + kv_size]}
+    shard_size, offset = qkv_map[shard_id]
+
+    cur_tp_weight = loaded_weight[
+        shard_size * tensor_model_parallel_rank:
+        shard_size * (tensor_model_parallel_rank + 1)]
+    param_slice = param.data[offset : offset + shard_size]
+    assert param_slice.shape == cur_tp_weight.shape, (
+        f"Parameter slice shape {param_slice.shape} does not match "
+        f"cur_tp_weight shape {cur_tp_weight.shape}"
+    )
+    param_slice.copy_(cur_tp_weight)
+
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -55,19 +89,36 @@ class LlamaAttention(nn.Module):
         self,
         hidden_size: int,
         num_heads: int,
+        num_kv_heads: int,
+        head_dim: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tensor_model_parallel_world_size == 0
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_heads % tensor_model_parallel_world_size != 0:
+            raise ValueError("Query heads must be divisible by TP size")
+        if self.total_num_kv_heads % tensor_model_parallel_world_size != 0:
+            raise ValueError("KV heads must be divisible by TP size")
+        if self.total_num_heads % self.total_num_kv_heads != 0:
+            raise ValueError("Query heads must be grouped evenly by KV heads")
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
-        self.head_dim = hidden_size // self.total_num_heads
+        self.num_kv_heads = (
+            self.total_num_kv_heads // tensor_model_parallel_world_size
+        )
+        self.head_dim = (
+            hidden_size // self.total_num_heads
+            if head_dim is None else head_dim
+        )
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
         self.qkv_proj = ColumnParallelLinear(
             hidden_size,
-            3 * self.total_num_heads * self.head_dim,
+            (self.total_num_heads + 2 * self.total_num_kv_heads)
+            * self.head_dim,
             bias=False,
             gather_output=False,
             perform_initialization=False,
@@ -80,7 +131,11 @@ class LlamaAttention(nn.Module):
             perform_initialization=False,
         )
         self.attn = PagedAttentionWithRoPE(
-            self.num_heads, self.head_dim, self.scaling, rotary_dim=self.head_dim
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            rotary_dim=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
         )
 
     def forward(
@@ -92,7 +147,7 @@ class LlamaAttention(nn.Module):
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k ,v = qkv.chunk(chunks=3, dim=-1)
+        q, k, v = _split_qkv(qkv, self.q_size, self.kv_size)
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -112,6 +167,11 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
+            num_kv_heads=(
+                getattr(config, "num_key_value_heads", None)
+                or config.num_attention_heads
+            ),
+            head_dim=getattr(config, "head_dim", None),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -228,6 +288,21 @@ class LlamaForCausalLM(nn.Module):
         use_np_cache: bool = False
     ) -> None:
         tensor_model_parallel_rank = get_tensor_model_parallel_rank()
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        total_num_heads = self.config.num_attention_heads
+        total_num_kv_heads = (
+            getattr(self.config, "num_key_value_heads", None)
+            or total_num_heads
+        )
+        head_dim = getattr(self.config, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.config.hidden_size // total_num_heads
+        q_size = (
+            total_num_heads // tensor_model_parallel_world_size * head_dim
+        )
+        kv_size = (
+            total_num_kv_heads // tensor_model_parallel_world_size * head_dim
+        )
         state_dict = self.state_dict()
 
         for name, loaded_weight in hf_model_weights_iterator(
@@ -239,14 +314,14 @@ class LlamaForCausalLM(nn.Module):
                 if att_weight_name not in name:
                     continue
                 param = state_dict[name.replace(att_weight_name, "qkv_proj")]
-                shard_size = param.shape[0] // 3
-                loaded_weight = loaded_weight[
-                    shard_size * tensor_model_parallel_rank:
-                    shard_size * (tensor_model_parallel_rank + 1)]
-                param_slice = param.data[shard_size * stride_id:
-                                         shard_size * (stride_id + 1)]
-                assert param_slice.shape == loaded_weight.shape
-                param_slice.copy_(loaded_weight)
+                _load_qkv_weight(
+                    param,
+                    loaded_weight,
+                    ("q", "k", "v")[stride_id],
+                    tensor_model_parallel_rank,
+                    q_size,
+                    kv_size,
+                )
                 is_attn_weight = True
                 break
             if is_attn_weight:

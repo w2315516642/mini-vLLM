@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | 1 | 配置归一化与结构校验 | 已完成 |
 | 2 | 模型注册与嵌套配置接入 | 已完成 |
-| 3 | GQA 与独立 KV 头 | 未开始 |
+| 3 | GQA 与独立 KV 头 | 已完成 |
 | 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 未开始 |
 | 5 | Gated DeltaNet 参考实现 | 未开始 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 未开始 |
@@ -171,3 +171,112 @@ Llama 的语言模型字段直接位于根配置中；Qwen3.8 的根配置同时
 - 验证结果：阶段测试 11/11 通过，阶段 1 回归 19/19 通过，Prefix Cache 回归 10/10 通过，完整测试 40/40 通过；`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
 - 已知限制：本阶段只完成模型路由和嵌套文本配置接线；Qwen 的 lazy target 尚未实现，真实权重加载、GQA、混合注意力和 Cache 留在后续既定阶段。
 - 下一阶段：阶段 3“GQA 与独立 KV 头”保持未开始，等待讲义和作业脚手架准备。
+
+## 阶段 3：GQA 与独立 KV 头
+
+### 为什么这一层位于 Qwen 模型主体之前
+
+阶段 1 已归一化 Query/KV 头数，阶段 2 已能按 architecture 选择模型类，但当前 attention 热路径仍假设 Q/K/V 等宽：Llama 使用 `qkv.chunk(3)`，PagedAttention 用同一个 `num_heads` reshape Q/K/V，RoPE 与 paged-attention CUDA kernel 也共用 Q 头 stride。阶段 3 先在现有 Llama 路径打通紧凑 GQA，使阶段 4 的 Qwen Gated Full Attention 可以复用可靠的 Q/K/V、RoPE 和 KV Cache shape contract。
+
+### Codex 负责
+
+- 将 Llama 构造链接到独立 `num_key_value_heads` 和显式 `head_dim`。
+- 让 packed QKV 投影和 output projection 使用正确的全局宽度。
+- 将 CacheEngine 的 head 维度与块字节计算接到本地 KV 头数。
+- 保留 MHA 兼容默认值并提供 GQA 比例校验。
+- 提供 shape、TP 权重切片、Cache 显存、CUDA 数值 reference 和集成测试。
+- 在忽略的 `docs/qwen38-learning/stage-03-gqa-independent-kv-heads.md` 提供阶段讲义。
+
+### 学习者负责
+
+完成以下生产路径中的全部 `TODO(student)`：
+
+1. `minivllm/model_executor/models/llama.py`
+   - `_split_qkv`：按 `[q_size, kv_size, kv_size]` 切分 rank-local packed projection。
+   - `_load_qkv_weight`：分别计算全局 checkpoint 的 TP 源切片和本地 packed 目标 offset。
+2. `minivllm/model_executor/layers/attention.py`
+   - `_reshape_qkv`：恢复 `[T, Hq, D]` 与紧凑 `[T, Hkv, D]`。
+   - `_grouped_prefill_inputs`：生成 xFormers 五维 grouped layout，并用 broadcast view 共享 K/V。
+3. `csrc/pos_encoding_kernels.cu`
+   - 让 Q/K 使用独立头数和 token stride 执行 GPT-NeoX RoPE。
+4. `csrc/attention/attention_kernels.cu`
+   - 在 decode 与 cached-prefill kernel 中实现 `query_head -> kv_head` 映射。
+   - 区分 Q/output 的 `Hq` stride 与 KV Cache 的 `Hkv` stride。
+
+预计自然实现量约 150 到 250 行，包含必要的 shape 与地址计算注释，不需要增加新框架抽象。
+
+### 约束
+
+- KV Cache 必须保持紧凑，不允许把整个 Cache 实体复制到 Query 头数。
+- fresh prefill 使用项目当前 xFormers CUTLASS `FwOp` 的五维 GQA layout。
+- 不改变 Query head 的输出宽度，output projection 仍消费全部 Query 头。
+- 不改变 Hugging Face checkpoint 中独立 `q_proj`、`k_proj`、`v_proj` 的语义。
+- 保持 MHA (`Hq == Hkv`) 行为兼容。
+- 不在本阶段实现 Qwen 模型类、Q/K RMSNorm、attention gate、M-RoPE、head size 256 specialization、DeltaNet 或 Hybrid Cache。
+- 当前仍要求 Query 头数和 KV 头数都能被 TP size 整除，不实现 KV head replication。
+
+### 验收命令
+
+普通 shape、权重和集成测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gqa.py' -v
+```
+
+完成 CUDA 源码后先重新编译扩展：
+
+```bash
+cd /mnt/e/Projects/mini-vllm
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m pip install \
+  -v -e . --no-build-isolation
+```
+
+然后显式开启 CUDA 数值测试：
+
+```bash
+MINIVLLM_RUN_CUDA_GQA_TESTS=1 \
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gqa_cuda.py' -v
+```
+
+回归与完整测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_model_architecture.py' -v
+
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_model_registry.py' -v
+
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_prefix_cache*.py' -v
+
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -v
+```
+
+### 预提交基线
+
+- 2026-08-25：阶段 3 测试共 11 项，外围接线 4 项通过，4 项精确停在 Python 保留 TODO，3 项 CUDA 数值测试在未重编译前按设计跳过。
+- 完整测试共 51 项：44 项通过、4 项预期 TODO 错误、3 项 CUDA 跳过；阶段 1、阶段 2 与 Prefix Cache 无额外回归。
+- CUDA 源码中的 TODO 不在预提交基线编译；学习者完成后必须重新编译，并开启 `MINIVLLM_RUN_CUDA_GQA_TESTS=1` 验证真实扩展。
+
+### 原理验收
+
+- 为什么 GQA 的 Query 输出宽度不变，但 KV Cache 可以缩小？
+- 为什么 xFormers prefill 可以 broadcast K/V，decode 却不能每步展开整个 Cache？
+- 为什么 CUDA grid 使用 Query 头数，而 cache block stride 使用 KV 头数？
+- 为什么 TP 权重加载必须分别计算 checkpoint 源切片和本地 packed 目标 offset？
+- 为什么 RoPE 数学上允许 Q/K 头数不同，而当前 kernel 实现却不允许？
+
+### 完成记录
+
+- 完成时间：2026-08-26。
+- 学习者完成：rank-local packed QKV 切分与 TP 权重装载、独立 Q/KV head reshape、xFormers 五维 GQA prefill、独立 Q/K stride 的 RoPE kernel，以及 decode 和 cached-prefill 的 Query head 到紧凑 KV head 映射。
+- Codex 收尾：接入独立 KV 头配置和紧凑 Cache 分配，补齐 GQA shape 与 launcher 运行时校验、fresh-prefill 输出缓冲区契约，并修正 CUDA 数值测试的 `slot_mapping` dtype。
+- 验证环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128、Transformers 5.7.0，CUDA 12.8 可用。
+- 验证结果：CUDA 扩展编译成功；RoPE、decode、cached-prefill 三项 CUDA 数值测试分别 1/1 通过；最终完整测试 51 项通过，其中 48 项执行通过、3 项 CUDA 用例按开关跳过；`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
+- 验证说明：cached-prefill 的最终 `assert` 到 `TORCH_CHECK` 机械替换按用户要求未再次复编译；替换前同一计算路径已成功编译并通过数值测试。
+- 已知限制：本阶段不包含 Qwen 模型类、Q/K RMSNorm、attention gate、M-RoPE、head size 256 specialization、DeltaNet、Hybrid Cache 或 KV head replication。
+- 下一阶段：阶段 4“Qwen Gated Full Attention”保持未开始，等待讲义和作业脚手架准备。
