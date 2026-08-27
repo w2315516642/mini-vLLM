@@ -18,7 +18,7 @@
 | 1 | 配置归一化与结构校验 | 已完成 |
 | 2 | 模型注册与嵌套配置接入 | 已完成 |
 | 3 | GQA 与独立 KV 头 | 已完成 |
-| 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 未开始 |
+| 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 已完成 |
 | 5 | Gated DeltaNet 参考实现 | 未开始 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 未开始 |
 | 7 | Hybrid Cache | 未开始 |
@@ -280,3 +280,105 @@ MINIVLLM_RUN_CUDA_GQA_TESTS=1 \
 - 验证说明：cached-prefill 的最终 `assert` 到 `TORCH_CHECK` 机械替换按用户要求未再次复编译；替换前同一计算路径已成功编译并通过数值测试。
 - 已知限制：本阶段不包含 Qwen 模型类、Q/K RMSNorm、attention gate、M-RoPE、head size 256 specialization、DeltaNet、Hybrid Cache 或 KV head replication。
 - 下一阶段：阶段 4“Qwen Gated Full Attention”保持未开始，等待讲义和作业脚手架准备。
+
+## 阶段 4：Qwen Gated Full Attention
+
+### 在推理链路中的位置
+
+阶段 1 已提供嵌套文本配置和逐层 `layer_types`，阶段 2 已登记 Qwen3.8 checkpoint 使用的 `Qwen3_5ForConditionalGeneration`，阶段 3 已打通紧凑 GQA、RoPE 与 KV Cache。本阶段实现 Qwen hybrid decoder 中 `full_attention` 分支的 token mixer：它接收 decoder block 的归一化 hidden states，生成 Q/Gate/K/V，调用已有 PagedAttention，使用 gate 调制 attention output，再经过 output projection 回到残差流。
+
+完整 Qwen 模型仍不会在本阶段提前落地。`linear_attention` 分支、Gated DeltaNet recurrent state 和 Hybrid Cache 分别属于后续既定阶段；在这些语义完整前，不使用 Llama Attention 或空操作伪装成可执行的混合模型。
+
+### Codex 负责
+
+- 新增 `Qwen3_5Attention` 的稳定构造、TP 尺寸、partial RoPE 与 PagedAttention 接线。
+- 新增 Qwen 零中心 RMSNorm 和 sigmoid output gate 的公开接口。
+- 沿用现有 `activation_ops` 扩展，提供 `sigmoid_and_mul` C++ binding 与 CUDA 作业边界。
+- 为现有 decode/cached-prefill attention launcher 开启 Qwen 所需的 `head_dim=256` specialization。
+- 提供 per-head Q/Gate layout、Q/K norm、TP 权重、调用顺序、CUDA 数值和 head size 256 测试。
+- 在忽略的 `docs/qwen38-learning/stage-04-qwen-gated-full-attention.md` 提供包含完整推理上下文和源码链接的阶段讲义。
+
+### 学习者负责
+
+完成全部 `TODO(student, stage 4)`：
+
+1. `minivllm/model_executor/layers/layer_norm.py`
+   - 实现 `Qwen3_5RMSNorm.forward` 的 FP32 归一化和 `(1 + weight)` 语义。
+2. `minivllm/model_executor/models/qwen3_5.py`
+   - 按每个 Query head 的 `[Q | gate]` 布局实现 `_split_q_gate_kv`。
+   - 实现独立 checkpoint Q/K/V 到 rank-local packed 参数的 TP 权重装载。
+   - 完成 Q/K per-head norm 的 `_project_qkv` 和 full-attention `forward`。
+3. `csrc/activation_kernels.cu`
+   - 实现 `attention_output * sigmoid(gate)` CUDA kernel、参数校验、dtype dispatch 和 current-stream launcher。
+
+预计自然实现量约 150 到 250 行。shape 推导、公式、实现顺序、CUDA 线程划分与参考源码均见阶段讲义。
+
+### 约束
+
+- `q_proj` layout 是逐 head `[q_head | gate_head]`，不能对扁平 segment 直接 `chunk(2)`。
+- Q/K RMSNorm 只沿 `head_dim` 归一化，位于 RoPE 之前；V 不做该归一化。
+- gate 不参与 QK 点积、不写 KV Cache，门控位于 PagedAttention 之后、`o_proj` 之前。
+- Qwen norm 使用零中心 checkpoint 参数，effective weight 是 `1 + weight`。
+- KV Cache 保持紧凑 GQA layout，不展开到 Query head 数。
+- 本阶段只验证文本位置下的 partial RoPE 数据通路，不实现视觉三轴 M-RoPE。
+- 不实现 DeltaNet、Hybrid Cache、FP8、MTP、Chunked Prefill 或完整 Qwen 模型类。
+- 不把 Q/K norm、RoPE 与 gate 一次性融合成大型 kernel；本阶段只新增可独立理解和验收的 sigmoid gate 算子。
+
+### 验收命令
+
+Python shape、权重与集成测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_qwen_gated_attention.py' -v
+```
+
+完成 CUDA TODO 后重新编译：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m pip install \
+  -v -e . --no-build-isolation
+```
+
+CUDA 数值测试：
+
+```bash
+MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_qwen_gated_attention_cuda.py' -v
+```
+
+完整回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+```
+
+### 预提交基线
+
+- 2026-08-26：阶段 4 共 12 项测试；2 项外围构造/校验测试通过，7 项精确停在 learner TODO，3 项 CUDA 测试在未重编译前按设计跳过。
+- 完整测试共 63 项：50 项通过、7 项预期 TODO 错误、6 项 CUDA 按开关跳过；阶段 1~3 与 Prefix Cache 无额外回归。
+- CUDA 源码中的 `sigmoid_and_mul` 目前以显式 `TORCH_CHECK` 占位，预提交基线未重新编译扩展；学习者完成后必须重新编译，并开启 CUDA 测试验证 gate 数值和 head size 256 的 decode/cached-prefill launcher。
+
+### 原理验收
+
+- 为什么 `q_proj` 输出不能直接在最后一维平分成 Query 与 gate？
+- 为什么 Q/K RMSNorm 参数只有 `head_dim` 宽，并且 effective weight 是 `1 + weight`？
+- gate 为什么不进入 KV Cache，decode 步的 gate 来自哪里？
+- TP=2 时，Q checkpoint 源切片为什么是 `2 * q_size`？
+- 为什么 gate 位于 PagedAttention 之后、`o_proj` 之前？
+- 当前可读实现相较 vLLM 的 fused QK norm/RoPE/gate 少融合了哪些步骤？
+
+### 完成记录
+
+- 完成时间：2026-08-27。
+- 学习者完成：Qwen 零中心 per-head RMSNorm、逐 Query head 的 Q/gate 拆分、Q/K/V TP 权重装载、Q/K norm 与 gated full-attention 前向链路，以及 FP32 中间计算的 sigmoid-and-mul CUDA 核心逻辑。
+- Codex 收尾：补齐 QKV shard 错误诊断、门控算子 binding 与必要 shape 契约，开放 `head_size=256` 的 decode/cached-prefill specialization，并提供 Python、CUDA 数值和相邻 GQA 回归测试。
+- 验证环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128、CUDA 12.8、NVIDIA GeForce RTX 4070 Laptop GPU、GCC/G++ 13.3.0。
+- 编译结果：固定 `CC=/usr/bin/gcc`、`CXX=/usr/bin/g++` 后，全量构建并安装五个 CUDA 扩展成功；最终精简版 `activation_ops` 又从当前源码增量重编译成功。
+- 验证结果：Python shape、权重与集成测试 9/9 通过；Qwen CUDA 测试 3/3 通过，覆盖 FP16/BF16/FP32 数值、shape 错误和 `head_size=256`；原有 GQA CUDA 回归 3/3 通过；完整测试共 63 项，其中 57 项执行通过、6 项 CUDA 用例按默认开关跳过，这 6 项均已显式开启并执行通过。
+- 静态检查：`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
+- 编译提示：既有 `cache_kernels.cu` 仍有 `void*` 指针算术警告，既有 attention kernel 仍有未使用局部变量警告；本阶段新增 `sigmoid_and_mul` 未产生编译警告。
+- 已知限制：门控算子是框架内部接口，依赖 `Qwen3_5Attention` 调用路径保证 CUDA、同 device/dtype 和 contiguous；本阶段仍不包含完整 Qwen 模型、视觉 M-RoPE、DeltaNet、Hybrid Cache、FP8、MTP 或 Chunked Prefill。
+- 原理题保留作阶段复盘，本次按用户要求直接收口提交。
+- 下一阶段：阶段 5“Gated DeltaNet 参考实现”保持未开始，等待讲义与作业脚手架准备。

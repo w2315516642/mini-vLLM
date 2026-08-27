@@ -9,7 +9,7 @@ from minivllm import cache_ops
 from minivllm import pos_encoding_ops
 from minivllm.model_executor.input_metadata import InputMetadata
 
-_SUPPORTED_HEAD_SIZES = {64, 80, 96, 128}
+_SUPPORTED_HEAD_SIZES = {64, 80, 96, 128, 256}
 
 class PagedAttention(nn.Module):
     """(by original author) GPT-style multi-head PagedAttention.
@@ -262,8 +262,7 @@ class PagedAttentionWithRoPE(PagedAttention):
         scale: float,
         rotary_dim: int,
         max_position: int = 8192,       # max model len
-        # TODO: The base can be a float.
-        base: int = 10000,
+        base: float = 10000,
         num_kv_heads: Optional[int] = None,
     ) -> None:
         super().__init__(

@@ -36,3 +36,21 @@ class SiluAndMul(nn.Module):
         out = torch.empty(num_tokens, d, dtype=x.dtype, device=x.device)
         activation_ops.silu_and_mul(out, x)
         return out
+
+
+class SigmoidAndMul(nn.Module):
+    """Apply the Qwen full-attention output gate.
+
+    Computes ``value * sigmoid(gate)`` without materializing the sigmoid as a
+    separate tensor. Both inputs use the same rank-local ``[tokens, width]``
+    layout.
+    """
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.empty_like(value)
+        activation_ops.sigmoid_and_mul(out, value, gate)
+        return out

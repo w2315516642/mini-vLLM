@@ -174,7 +174,7 @@ _BUILTIN_MODEL_TARGETS: Mapping[str, ModelTarget] = {
         "minivllm.model_executor.models.llama:LlamaForCausalLM"
     ),
     # Qwen3.8 checkpoints retain the Qwen3.5 schema and architecture name.
-    # The target module will be implemented in later model stages.
+    # The full model target follows after its hybrid decoder is implemented.
     "Qwen3_5ForConditionalGeneration": (
         "minivllm.model_executor.models.qwen3_5:"
         "Qwen3_5ForConditionalGeneration"

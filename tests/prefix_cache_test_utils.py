@@ -137,6 +137,9 @@ def load_worker_module():
         "minivllm.model_executor.parallel_utils.parallel_state")
     parallel_state.initialize_all_reduce_launcher = lambda *args, **kwargs: None
     parallel_state.initialize_model_parallel = lambda *args, **kwargs: None
+    parallel_state.get_tensor_model_parallel_rank = lambda: 0
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state.get_all_reduce_launcher = lambda: None
     sys.modules[
         "minivllm.model_executor.parallel_utils.parallel_state"
     ] = parallel_state

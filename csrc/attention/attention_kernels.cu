@@ -734,7 +734,7 @@ void single_query_cached_kv_attention_launcher(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   switch (head_size) {
   // NOTE(woosuk): To reduce the compilation time, we omitted head sizes
-  // 32, 160, 192, 256.
+  // 32, 160, 192.
   // case 32:
   //   LAUNCH_ATTENTION_KERNEL(T, 32, BLOCK_SIZE, NUM_THREADS);
   //   break;
@@ -756,9 +756,9 @@ void single_query_cached_kv_attention_launcher(
   // case 192:
   //   LAUNCH_ATTENTION_KERNEL(T, 192, BLOCK_SIZE, NUM_THREADS);
   //   break;
-  // case 256:
-  //   LAUNCH_ATTENTION_KERNEL(T, 256, BLOCK_SIZE, NUM_THREADS);
-  //   break;
+  case 256:
+    LAUNCH_ATTENTION_KERNEL(T, 256, BLOCK_SIZE, NUM_THREADS);
+    break;
   default:
     TORCH_CHECK(false, "Unsupported head size: ", head_size);
     break;
@@ -899,6 +899,9 @@ void varlen_query_cached_kv_attention_launcher(
     break;
   case 128:
     LAUNCH_VARLEN_ATTENTION_KERNEL(T, 128, BLOCK_SIZE, NUM_THREADS, TM);
+    break;
+  case 256:
+    LAUNCH_VARLEN_ATTENTION_KERNEL(T, 256, BLOCK_SIZE, NUM_THREADS, TM);
     break;
   default:
     TORCH_CHECK(false, "Unsupported head size: ", head_size);

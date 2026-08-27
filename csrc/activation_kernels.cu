@@ -22,6 +22,24 @@ __global__ void silu_and_mul_kernel(
   }
 }
 
+template<typename scalar_t>
+__global__ void sigmoid_and_mul_kernel(
+  scalar_t* __restrict__ out,               // [num_tokens, d]
+  const scalar_t* __restrict__ input,       // [num_tokens, d]
+  const scalar_t* __restrict__ gate,        // [num_tokens, d]
+  const int d
+) {
+  const int token_idx = blockIdx.x;
+  for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
+    const scalar_t x = __ldg(&input[token_idx * d + idx]);
+    const scalar_t y = __ldg(&gate[token_idx * d + idx]);
+    // sigmoid
+    float gate_fp32 = static_cast<float>(y);
+    float sigmoid = 1.0f / (1.0f + expf(-gate_fp32));
+    out[token_idx * d + idx] = static_cast<scalar_t>(sigmoid * static_cast<float>(x));
+  }
+}
+
 } // namespace vllm
 
 void silu_and_mul(
@@ -45,4 +63,38 @@ void silu_and_mul(
         input.data_ptr<scalar_t>(),
         d);
     });
+}
+
+
+void sigmoid_and_mul(
+  torch::Tensor& out,      // [num_tokens, width]
+  torch::Tensor& input,    // [num_tokens, width]
+  torch::Tensor& gate)     // [num_tokens, width]
+{
+  TORCH_CHECK(input.sizes() == gate.sizes(),
+              "input and gate shape must match, but got ",
+              input.sizes(), " and ", gate.sizes());
+  TORCH_CHECK(input.sizes() == out.sizes(),
+              "input and out shape must match, but got ",
+              input.sizes(), " and ", out.sizes());
+
+  int num_tokens = input.size(0);
+  int width = input.size(1);
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(width, 1024));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+    at::ScalarType::Half,
+    at::ScalarType::BFloat16,
+    input.scalar_type(),
+    "sigmoid_and_mul_kernel",
+    [&] {
+      vllm::sigmoid_and_mul_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        out.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        gate.data_ptr<scalar_t>(),
+        width);
+    }
+  );
 }
