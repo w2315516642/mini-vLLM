@@ -19,7 +19,7 @@
 | 2 | 模型注册与嵌套配置接入 | 已完成 |
 | 3 | GQA 与独立 KV 头 | 已完成 |
 | 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 已完成 |
-| 5 | Gated DeltaNet 参考实现 | 未开始 |
+| 5 | Gated DeltaNet 参考实现 | 已完成 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 未开始 |
 | 7 | Hybrid Cache | 未开始 |
 | 8 | 真实小模型端到端推理 | 未开始 |
@@ -382,3 +382,96 @@ MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
 - 已知限制：门控算子是框架内部接口，依赖 `Qwen3_5Attention` 调用路径保证 CUDA、同 device/dtype 和 contiguous；本阶段仍不包含完整 Qwen 模型、视觉 M-RoPE、DeltaNet、Hybrid Cache、FP8、MTP 或 Chunked Prefill。
 - 原理题保留作阶段复盘，本次按用户要求直接收口提交。
 - 下一阶段：阶段 5“Gated DeltaNet 参考实现”保持未开始，等待讲义与作业脚手架准备。
+
+## 阶段 5：Gated DeltaNet 参考实现
+
+### 在推理链路中的位置
+
+Qwen hybrid decoder 根据 `layer_types` 在 `full_attention` 与 `linear_attention` token mixer 之间切换。阶段 4 已实现 full-attention 分支；本阶段实现 linear-attention 分支的可读 PyTorch reference，覆盖 Q/K/V、z/a/b 投影、causal depthwise convolution、Gated Delta Rule、gated RMSNorm 和 output projection。
+
+Reference 暂不接入 `Worker` 热路径：阶段 6 会用它验证 decode recurrence 与 prefill chunk kernel，阶段 7 再让 Hybrid Cache 管理 Conv State 和 Recurrent State，阶段 8 才装配完整 Qwen decoder 与真实 checkpoint。这个依赖顺序保证后续 kernel/cache 出错时仍有独立的数值 oracle。
+
+### Codex 负责
+
+- 定义 `GatedDeltaNetState`、reference 函数和完整层的稳定 shape/state 接口。
+- 提供未分片的 Qwen projection、参数和 state 分配脚手架。
+- 提供单 token 手算、因果性、prefill/decode 状态等价、gated RMSNorm、head grouping 和完整层集成测试。
+- 在忽略的 `docs/qwen38-learning/stage-05-gated-deltanet-reference.md` 提供调用链、公式、shape、实现步骤和外部源码讲义。
+
+### 学习者负责
+
+完成 `minivllm/model_executor/layers/gated_delta_net.py` 中全部 `TODO(student, stage 5)`：
+
+1. `causal_depthwise_conv1d_reference`
+   - 实现 `[B,T,C]` depthwise causal convolution、SiLU 和可续接 Conv State。
+2. `recurrent_gated_delta_rule_reference`
+   - 实现 FP32 Q/K L2 normalize、Query scale，以及 decay/read/delta/write/output token recurrence。
+3. `RMSNormGated.forward`
+   - 实现沿 `value_head_dim` 的 FP32 RMSNorm、direct weight 和 `silu(z)` gate。
+4. `Qwen3_5GatedDeltaNetReference.forward`
+   - 串联五组投影、卷积、Q/K head expansion、beta/log-decay、recurrence、gated norm、flatten 和 output projection，并返回两类 final state。
+
+预计自然实现量约 150 到 250 行，不需要为了行数增加抽象。
+
+### 约束
+
+- Reference 使用全局、未做 TP 切分的 `[batch, sequence, feature]` 张量；TP 留到真实模型集成阶段。
+- Conv State 固定为 `[B, conv_dim, kernel_size]`，Recurrent State 固定为 `[B, Hv, Dk, Dv]`，二者都以 FP32 保存。
+- `beta = sigmoid(b)`；`g = -exp(A_log) * softplus(a + dt_bias)`；实际 decay 是 `exp(g)`。
+- Q/K 按最后一维 L2 normalize，只有 Q 再乘 `Dk^-0.5`。
+- state 更新顺序固定为 decay、read、delta、write，再从更新后的 state 计算 output。
+- Q/K heads 必须 repeat 到 value-head 数后再进入 recurrence。
+- GDN 输出 gate 使用 `silu(z)`，不能复用阶段 4 的 sigmoid gate 公式。
+- 不原地修改调用者传入的 initial state。
+- 不依赖 FLA、causal-conv1d、vLLM 或 SGLang 的现成 kernel；本模块必须保持独立 oracle。
+- 本阶段不实现 CUDA/Triton、chunk scan、Hybrid Cache、完整模型、TP、FP8、MTP 或视觉 M-RoPE。
+
+### 验收命令
+
+阶段 reference 测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gated_delta_net_reference.py' -v
+```
+
+阶段 4 相邻回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_qwen_gated_attention.py' -v
+```
+
+完整回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+```
+
+### 预提交基线
+
+- 2026-08-27：阶段 5 共 11 项测试；构造、参数/state shape 和非法 head grouping 2 项通过，其余 9 项精确停在四个 `TODO(student, stage 5)`。
+- 阶段 4 Python 回归 9/9 通过。
+- 完整测试共 74 项：59 项执行通过、9 项预期 learner TODO 错误、6 项 CUDA 按既有环境变量开关跳过；没有语法、导入、fixture 或非预期回归。
+- 本阶段为纯 PyTorch reference，不需要重新编译 CUDA extension。
+
+### 原理验收
+
+- 为什么 recurrent state 是固定 `[Hv, Dk, Dv]`，而不像 KV Cache 那样随 token 数增长？
+- 为什么 delta 写入的是 `v_t - k_t @ S_bar`？
+- `alpha=exp(g)` 与 `beta=sigmoid(b)` 分别控制什么？
+- 为什么 Q/K 都做 L2 normalize，但只有 Query 乘 `Dk^-0.5`？
+- 为什么 prefill 与逐 token decode 必须得到相同 output、Conv State 和 Recurrent State？
+- GDN 的 `silu(z)` gate 与 full-attention sigmoid gate 在计算链路中的位置有什么区别？
+- 为什么优化 kernel 不能反过来充当本阶段 reference？
+
+### 完成记录
+
+- 完成时间：2026-08-30。
+- 学习者完成：可续接的 causal depthwise convolution、FP32 Gated Delta Rule 递推、per-value-head gated RMSNorm，以及串联 QKV/z/a/b 投影、head grouping、两类 state 和 output projection 的完整 Gated DeltaNet reference。
+- Codex 收尾：补齐卷积、递推、gated norm 和完整层的 shape/state 错误诊断，统一 FP32 state 与输出 dtype 契约，清理命名和格式，并增加 malformed-input 回归测试。
+- 验证环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128，CUDA 可用。
+- 验证结果：阶段 5 测试 14/14 通过，阶段 4 Qwen Gated Attention 回归 9/9 通过；完整测试共 77 项，其中 71 项执行通过、6 项既有 CUDA 用例按默认开关跳过。
+- 静态检查：阶段文件无 learner TODO、`NotImplementedError` 或尾随空格；`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
+- 已知限制：本阶段是未分片、batch-major 的 PyTorch correctness oracle，尚未进入 Worker 热路径；优化 kernel、Hybrid Cache、完整模型装配和真实 checkpoint 分别留在后续既定阶段。
+- 下一阶段：阶段 6“Gated DeltaNet Kernel”保持未开始，等待讲义和作业脚手架准备。
