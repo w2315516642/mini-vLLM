@@ -115,6 +115,17 @@ activation_extension = CUDAExtension(
 )
 ext_modules.append(activation_extension)
 
+# Gated DeltaNet state-update kernels.
+gated_delta_net_extension = CUDAExtension(
+    name="minivllm.gated_delta_net_ops",
+    sources=[
+        "csrc/gated_delta_net.cpp",
+        "csrc/gated_delta_net_kernels.cu",
+    ],
+    extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
+)
+ext_modules.append(gated_delta_net_extension)
+
 
 def get_path(*file_path) -> str:
     return os.path.join(ROOT_DIR, *file_path)

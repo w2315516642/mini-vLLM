@@ -20,7 +20,7 @@
 | 3 | GQA 与独立 KV 头 | 已完成 |
 | 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 已完成 |
 | 5 | Gated DeltaNet 参考实现 | 已完成 |
-| 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 未开始 |
+| 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 已完成 |
 | 7 | Hybrid Cache | 未开始 |
 | 8 | 真实小模型端到端推理 | 未开始 |
 | 9 | FP8 权重 | 未开始 |
@@ -475,3 +475,106 @@ Reference 暂不接入 `Worker` 热路径：阶段 6 会用它验证 decode recu
 - 静态检查：阶段文件无 learner TODO、`NotImplementedError` 或尾随空格；`git diff --check` 无空白错误，仅有 Windows Git 的 LF/CRLF 转换提示。
 - 已知限制：本阶段是未分片、batch-major 的 PyTorch correctness oracle，尚未进入 Worker 热路径；优化 kernel、Hybrid Cache、完整模型装配和真实 checkpoint 分别留在后续既定阶段。
 - 下一阶段：阶段 6“Gated DeltaNet Kernel”保持未开始，等待讲义和作业脚手架准备。
+
+## 阶段 6：Gated DeltaNet Kernel
+
+### 在推理链路中的位置
+
+阶段 5 已实现 Qwen `linear_attention` 分支的独立 PyTorch oracle。本阶段优化其中两个逐 token 热点：causal depthwise convolution 的 decode state update，以及 Gated Delta Rule 的单 token decode 和分块 prefill。投影、Q/K normalize 与 query scale 位于算子上游，RMSNormGated 和 output projection 位于算子下游。
+
+本阶段通过独立 Python wrapper 调用 CUDA 扩展并和 reference 对照，暂不接入 `Worker`。Conv State 和 Recurrent State 仍由调用者显式传入并原地更新；请求到 state slot 的映射、混合层缓存布局和生命周期由阶段 7 Hybrid Cache 负责。
+
+### Codex 负责
+
+- 新增独立 `gated_delta_net_ops` CUDA extension 和三个稳定 binding。
+- 在 C++ 边界校验 CUDA、contiguous、shape、device、dtype 与 FP32 state 契约。
+- 提供 lazy-import Python wrapper、FP32 Q/K normalize 和 query scale helper。
+- 提供无需重编译的 wrapper contract 测试，以及默认跳过的 CUDA 数值测试。
+- 在忽略的 `docs/qwen38-learning/stage-06-gated-deltanet-kernels.md` 提供调用链、公式、布局、线程划分、实现顺序和外部参考资料。
+
+### 学习者负责
+
+完成 `csrc/gated_delta_net_kernels.cu` 中全部 `TODO(student, stage 6)`：
+
+1. `causal_conv1d_update_kernel`：原地移动短卷积窗口、写入当前 token、FP32 depthwise accumulation 和 SiLU。
+2. `gated_delta_rule_decode_kernel`：以 `(batch, head)` 为 block、以 value dimension 为线程所有权，完成 decay/read/delta/write/output。
+3. `gated_delta_rule_prefill_chunk_kernel`：在一个 chunk 内顺序复用 decode recurrence，并由 launcher 在当前 CUDA stream 上按 chunk 发起 kernel。
+4. 三个 launcher：完成 float/half/bfloat16 dispatch、grid/block、指针传递与 current stream。
+
+预计自然实现量约 200 到 300 行。不要改阶段 5 reference，也不需要新增框架抽象。
+
+### 约束
+
+- Conv State 固定为 `[B,C,K]` FP32，Recurrent State 固定为 `[B,H,Dk,Dv]` FP32，二者都原地更新。
+- Q/K/V、beta 和输出允许 FP16、BF16、FP32；`log_decay`、所有递推累积和 state write 使用 FP32。
+- recurrence operator 接收已经 L2 normalize 的 Q/K，且 Query 已乘 `Dk^-0.5`。
+- decode 与 prefill 使用同一个 decay、read、delta、write、output 顺序。
+- prefill 最后一个 chunk 可以短于 `chunk_size`；chunk 间不得清零或复制 state。
+- CUDA grid 将 `(batch, head)` 展平到 `grid.x`，不依赖 `grid.y/grid.z`。
+- 所有 launcher 使用 PyTorch 当前 CUDA stream，不插入 host 同步。
+- 本阶段的 prefill 是顺序 chunk scan，不提前实现 FLA 的 WY 并行 chunk algorithm。
+- 不实现 Hybrid Cache、packed request metadata、完整 Qwen 模型、TP、FP8、MTP 或视觉 M-RoPE。
+
+### 验收命令
+
+无需编译的 wrapper contract 测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gated_delta_net_cuda_contract.py' -v
+```
+
+完成 CUDA TODO 后重新编译：
+
+```bash
+cd /mnt/e/Projects/mini-vllm
+CC=/usr/bin/gcc CXX=/usr/bin/g++ \
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m pip install \
+  -v -e . --no-build-isolation
+```
+
+CUDA 数值测试：
+
+```bash
+MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gated_delta_net_cuda.py' -v
+```
+
+Reference 与完整回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  discover -s tests -p 'test_gated_delta_net_reference.py' -v
+
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+```
+
+### 预提交基线
+
+- 2026-08-30：无需编译的阶段 6 wrapper contract 测试 7/7 通过，覆盖 FP32 Q/K 预处理、lazy extension import、三个算子的输出分配、state 原地语义和 `chunk_size` 校验。
+- 阶段 5 reference 回归 14/14 通过。
+- 完整测试共 89 项：78 项执行通过，5 项阶段 6 CUDA 数值测试因尚未完成并重编译 kernel 按设计跳过，另有 6 项既有 CUDA 开关测试跳过；没有导入、语法或旧功能回归。
+- `csrc/gated_delta_net_kernels.cu` 保留三个 kernel 和三个 launcher 的显式 learner TODO。预提交基线不编译该扩展；完成 TODO 后必须重新编译，并开启 `MINIVLLM_RUN_CUDA_GDN_TESTS=1` 验证真实数值和 state continuation。
+
+### 原理验收
+
+- 为什么一个线程独占一个 value dimension 可以避免 recurrence 中的线程同步？
+- 为什么跨 token 保存的 state 使用 FP32，而输出仍保持模型 dtype？
+- 为什么同一 CUDA stream 上的 chunk launch 不需要逐次 host synchronize？
+- 为什么 Q/K normalize 和 query scale 留在 operator 外部？
+- 本阶段 chunk scan 与 FLA 的并行 chunk algorithm 有什么区别？
+- 为什么请求 state slot 的所有权属于 Hybrid Cache，而不属于数值 kernel？
+
+### 完成记录
+
+- 完成时间：2026-08-30。
+- 学习者完成：单 token causal depthwise convolution state update、以一个 block 对应一个 `(batch, head)` 的 Gated Delta Rule decode、共享 Q/K 的 chunk 内顺序 prefill，以及三个 current-stream CUDA launcher；Conv State 与 Recurrent State 均按接口原地更新。
+- Codex 收尾：提供独立 C++ binding、lazy-import Python wrapper、FP32 Q/K 预处理、CUDA/reference 数值测试和 build 接线；清理尾随空格，并让 launch 错误处理保持项目现有风格一致。
+- 验证环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128、CUDA Toolkit 12.8.93、NVIDIA GeForce RTX 4070 Laptop GPU（SM 8.9）、GCC/G++ 13.3.0。
+- 编译结果：六个 CUDA extension 全量编译、链接和 editable install 成功；`gated_delta_net_ops` 未产生新增编译警告。PyTorch 未找到 Ninja 可执行入口而退回 distutils；既有 `cache_kernels.cu` 的 `void*` 指针算术警告和 attention kernel 的未使用变量警告仍存在。
+- 验证结果：wrapper contract 7/7、Gated DeltaNet CUDA 数值测试 5/5、阶段 5 reference 14/14、GQA CUDA 回归 3/3、Qwen Gated Attention CUDA 回归 3/3 均通过；完整测试共 89 项，其中 78 项执行通过、11 项按默认 CUDA 开关跳过，这 11 项均已分别显式开启并执行通过。
+- 边界与连续性：CUDA 数值测试覆盖 FP16/BF16/FP32、batch/head、非整 chunk 尾部、`chunk_size` 为 1/4/16、prefill final state 接续 decode 和 FP32 state 契约；额外 smoke 确认非 contiguous decode 输入在 binding 前置拒绝。
+- 信息性计时：在 `B=2,T=64,H=4,Dk=Dv=128,FP16,chunk=16`、5 次 warmup 后，20 次 prefill 平均约 1.5592 ms，100 次 decode 平均约 0.0478 ms，最终 state 全部有限；本阶段不设置性能门槛。
+- 已知限制：prefill 是同 stream 上按 chunk launch、chunk 内按 token 串行的教学实现，不是 FLA 的 WY 并行 chunk algorithm；算子仍使用 batch-major contiguous tensor 和显式 state，尚未接入 Worker、packed request metadata 或请求级 state slot。
+- 下一阶段：阶段 7“Hybrid Cache”保持未开始，等待讲义和作业脚手架准备。
