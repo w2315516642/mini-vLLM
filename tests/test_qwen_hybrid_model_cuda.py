@@ -9,7 +9,10 @@ from minivllm.configs.model_architecture import (
     LINEAR_ATTENTION,
 )
 from minivllm.model_executor.input_metadata import InputMetadata
-from minivllm.model_executor.models.qwen3_5 import Qwen3_5Model
+from minivllm.model_executor.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5Model,
+)
 from minivllm.model_executor.parallel_utils import parallel_state
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData
@@ -46,6 +49,9 @@ def _config():
         linear_value_head_dim=16,
         linear_conv_kernel_dim=4,
         layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        mtp_num_hidden_layers=1,
+        mtp_use_dedicated_embeddings=False,
+        eos_token_id=127,
     )
 
 
@@ -61,7 +67,14 @@ def _kv_cache(dtype):
     return key, value
 
 
-def _metadata(query_len, start, *, is_prompt, state_cache):
+def _metadata(
+    query_len,
+    start,
+    *,
+    is_prompt,
+    state_cache,
+    enable_mtp=False,
+):
     seq_id = 10
     sampling_params = SamplingParams(temperature=0.0)
     seq_data = {seq_id: SequenceData(list(range(start + query_len)))}
@@ -118,6 +131,7 @@ def _metadata(query_len, start, *, is_prompt, state_cache):
         ),
         prompt_seq_ids=prompt_seq_ids,
         generation_seq_ids=generation_seq_ids,
+        enable_mtp=enable_mtp,
     )
     metadata.state_slot_mapping = state_cache.acquire([seq_id])
     return metadata
@@ -307,6 +321,97 @@ class QwenHybridModelCudaTest(unittest.TestCase):
             torch.float8_e4m3fn,
         )
         self.assertTrue(torch.isfinite(output[:4]).all())
+
+    def test_native_mtp_proposes_and_verifies_one_token(self):
+        torch.manual_seed(113)
+        config = _config()
+        model = Qwen3_5ForConditionalGeneration(
+            config
+        ).cuda().half().eval()
+        for parameter in model.parameters():
+            if parameter.numel():
+                torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+        cache = _hybrid_cache(config, _kv_cache(torch.float16))
+        prompt = [3, 5, 7, 9]
+        prompt_tokens = torch.tensor(
+            prompt + [0, 0, 0, 0], device="cuda"
+        )
+        prompt_positions = torch.tensor(
+            [0, 1, 2, 3, 0, 0, 0, 0], device="cuda"
+        )
+
+        with torch.inference_mode():
+            first = model(
+                prompt_tokens,
+                prompt_positions,
+                cache,
+                _metadata(
+                    4,
+                    0,
+                    is_prompt=True,
+                    state_cache=cache,
+                    enable_mtp=True,
+                ),
+                None,
+            )[10]
+
+            self.assertIsNotNone(first.draft_token_id)
+            current_token = first.output_token
+            draft_token = first.draft_token_id
+            seq_data = {10: SequenceData(prompt + [current_token])}
+            speculative_metadata = InputMetadata(
+                seq_groups=[],
+                seq_data=seq_data,
+                prompt_lens=[2],
+                slot_mapping=torch.tensor(
+                    [4, 5], dtype=torch.int32, device="cuda"
+                ),
+                context_lens=torch.empty(
+                    0, dtype=torch.int32, device="cuda"
+                ),
+                max_context_len=0,
+                block_tables=torch.empty(
+                    (0, 0), dtype=torch.int32, device="cuda"
+                ),
+                fresh_prompt_lens=[],
+                cached_prompt_query_lens=[2],
+                cached_prompt_cu_seqlens=torch.tensor(
+                    [0, 2], dtype=torch.int32, device="cuda"
+                ),
+                cached_prompt_context_lens=torch.tensor(
+                    [6], dtype=torch.int32, device="cuda"
+                ),
+                cached_prompt_block_tables=torch.tensor(
+                    [[0]], dtype=torch.int32, device="cuda"
+                ),
+                max_cached_prompt_context_len=6,
+                prompt_seq_ids=[10],
+                prompt_sample_indices=[],
+                speculative_seq_ids=[10],
+                speculative_token_ids=[draft_token],
+                speculative_hidden_indices=[(0, 1)],
+                speculative_sampling_params=[
+                    SamplingParams(temperature=0.0)
+                ],
+                enable_mtp=True,
+            )
+            speculative_metadata.state_slot_mapping = cache.acquire([10])
+            verified = model(
+                torch.tensor(
+                    [current_token, draft_token, 0, 0, 0, 0, 0, 0],
+                    device="cuda",
+                ),
+                torch.tensor(
+                    [4, 5, 0, 0, 0, 0, 0, 0], device="cuda"
+                ),
+                cache,
+                speculative_metadata,
+                None,
+            )[10]
+
+        self.assertIn(verified.num_computed_tokens, (1, 2))
+        self.assertIn(len(verified.output_token_ids), (1, 2))
+        self.assertIsNotNone(verified.draft_token_id)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ class SchedulerOutputs:
         sampled_seq_ids: Optional[Set[int]] = None,
         state_seq_ids_to_release: Optional[List[int]] = None,
         state_copies: Optional[Dict[int, int]] = None,
+        speculative_seq_ids: Optional[Set[int]] = None,
     ) -> None:
         self.blocks_to_swap_in = blocks_to_swap_in
         self.blocks_to_swap_out = blocks_to_swap_out
@@ -47,6 +48,7 @@ class SchedulerOutputs:
         self.state_seq_ids_to_release = state_seq_ids_to_release or []
         # child_seq_id -> parent_seq_id
         self.state_copies = state_copies or {}
+        self.speculative_seq_ids = speculative_seq_ids or set()
         # Swap in and swap out should never happen at the same time.
         assert not (blocks_to_swap_in and blocks_to_swap_out)
 
@@ -122,6 +124,23 @@ class Scheduler:
         self._pending_state_releases.clear()
         self._pending_state_copies.clear()
         return releases, copies
+
+    def _can_speculate(self, seq_group: SequenceGroup) -> bool:
+        if getattr(self.scheduler_config, "num_speculative_tokens", 0) != 1:
+            return False
+        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        if len(seqs) != 1 or seqs[0].speculative_token_id is None:
+            return False
+        params = seq_group.sampling_params
+        return (
+            params.temperature == 0.0
+            and params.best_of == 1
+            and not params.use_beam_search
+            and params.presence_penalty == 0.0
+            and params.frequency_penalty == 0.0
+            and not params.stop
+            and seqs[0].get_output_len() + 2 <= params.max_tokens
+        )
     
     def _schedule(self) -> Tuple[SchedulerOutputs, List[str]]:
         # Blocks that need to be swaped or copied before model execution.
@@ -130,6 +149,7 @@ class Scheduler:
         blocks_to_copy: Dict[int, List[int]] = {}
         num_scheduled_tokens: Dict[int, int] = {}
         sampled_seq_ids: Set[int] = set()
+        speculative_seq_ids: Set[int] = set()
         num_batched_tokens = 0
         prompt_group_ids: List[str] = []
         
@@ -188,7 +208,9 @@ class Scheduler:
                 running.append(seq_group)
                 continue
 
-            num_decode_tokens = len(running_seqs)
+            use_speculation = self._can_speculate(seq_group)
+            tokens_per_seq = 2 if use_speculation else 1
+            num_decode_tokens = len(running_seqs) * tokens_per_seq
             if (
                 num_batched_tokens + num_decode_tokens
                 > self.scheduler_config.max_num_batched_tokens
@@ -196,7 +218,9 @@ class Scheduler:
                 running.append(seq_group)
                 running.extend(pending_running)
                 break
-            while not self.block_manager.can_append_slot(seq_group):
+            while not self.block_manager.can_append_slots(
+                seq_group, tokens_per_seq
+            ):
                 if pending_running:
                     # Preempt the lowest-priority sequence groups.
                     victim_seq_group = pending_running.pop(-1)
@@ -212,8 +236,11 @@ class Scheduler:
                 # Append new slots to the sequence group.
                 self._append_slot(seq_group, blocks_to_copy)
                 for seq in running_seqs:
-                    num_scheduled_tokens[seq.seq_id] = 1
+                    num_scheduled_tokens[seq.seq_id] = tokens_per_seq
                     sampled_seq_ids.add(seq.seq_id)
+                    if use_speculation:
+                        self.block_manager.append_lookahead_slot(seq)
+                        speculative_seq_ids.add(seq.seq_id)
                 num_batched_tokens += num_decode_tokens
                 running.append(seq_group)
         self.running = running
@@ -313,6 +340,7 @@ class Scheduler:
             sampled_seq_ids=sampled_seq_ids,
             state_seq_ids_to_release=state_releases,
             state_copies=state_copies,
+            speculative_seq_ids=speculative_seq_ids,
         )
         if not self.log_stats:
             return scheduler_outputs, prompt_group_ids
@@ -336,7 +364,13 @@ class Scheduler:
             ]
             if not scheduled_seqs:
                 continue
-            is_prompt = seq_group.request_id in prompt_group_ids
+            is_speculative = any(
+                seq.seq_id in scheduler_outputs.speculative_seq_ids
+                for seq in scheduled_seqs
+            )
+            is_prompt = (
+                seq_group.request_id in prompt_group_ids or is_speculative
+            )
 
             seq_data: Dict[int, SequenceData] = {}
             block_tables: Dict[int, List[int]] = {}
@@ -358,10 +392,16 @@ class Scheduler:
                 block_tables=block_tables,
                 num_computed_tokens=num_computed_tokens,
                 num_scheduled_tokens=num_scheduled_tokens,
-                do_sample=all(
+                do_sample=(not is_speculative and all(
                     seq.seq_id in scheduler_outputs.sampled_seq_ids
                     for seq in scheduled_seqs
-                ),
+                )),
+                is_speculative=is_speculative,
+                speculative_token_ids={
+                    seq.seq_id: seq.speculative_token_id
+                    for seq in scheduled_seqs
+                    if seq.speculative_token_id is not None
+                },
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs
@@ -384,10 +424,18 @@ class Scheduler:
             # The model has consumed these known tokens. Advance the KV
             # progress before beam forking or appending newly sampled tokens.
             for seq in scheduled_seqs:
+                output = seq_outputs.get(seq.seq_id)
                 num_scheduled_tokens = (
-                    scheduler_outputs.num_scheduled_tokens[seq.seq_id])
+                    output.num_computed_tokens
+                    if output is not None
+                    and output.num_computed_tokens is not None
+                    else scheduler_outputs.num_scheduled_tokens[seq.seq_id]
+                )
                 seq.num_computed_tokens += num_scheduled_tokens
-                assert seq.num_computed_tokens <= seq.get_len(), (
+                max_computed = seq.get_len() + (
+                    seq.seq_id in scheduler_outputs.speculative_seq_ids
+                )
+                assert seq.num_computed_tokens <= max_computed, (
                     f"Sequence {seq.seq_id} computed "
                     f"{seq.num_computed_tokens} tokens, but has "
                     f"{seq.get_len()} known tokens."
@@ -431,7 +479,11 @@ class Scheduler:
             for seq in scheduled_seqs:
                 # Append a new token to the sequence.
                 output = seq_outputs[seq.seq_id]
-                seq.append_token_id(output.output_token, output.logprobs)
+                for token_id, logprobs in zip(
+                    output.output_token_ids, output.output_logprobs
+                ):
+                    seq.append_token_id(token_id, logprobs)
+                seq.speculative_token_id = output.draft_token_id
                 self.block_manager.cache_blocks(seq)
             sampled_groups.append(seq_group)
         # Return a shallow copy of the running queue to prevent the queue
@@ -442,6 +494,7 @@ class Scheduler:
         seq.status = finish_status
         # TODO: 解计数
         self.block_manager.free(seq)
+        seq.speculative_token_id = None
         self._pending_state_releases.add(seq.seq_id)
         self._pending_state_copies.pop(seq.seq_id, None)
 
@@ -513,6 +566,7 @@ class Scheduler:
             # immediately restore part of this progress from the LRU cache.
             seq.num_computed_tokens = 0
             seq.num_cached_blocks = 0
+            seq.speculative_token_id = None
             self._pending_state_releases.add(seq.seq_id)
         # NOTE: For FCFS, we insert the preempted sequence group to the front
         # of the waiting queue.

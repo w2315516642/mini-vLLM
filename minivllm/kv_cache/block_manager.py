@@ -291,6 +291,18 @@ class BlockSpaceManager:
         num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
         return num_seqs <= num_available_blocks
 
+    def can_append_slots(
+        self,
+        seq_group: SequenceGroup,
+        num_slots: int,
+    ) -> bool:
+        """Conservatively reserve decode plus speculative lookahead slots."""
+        if num_slots <= 0:
+            raise ValueError("num_slots must be positive")
+        num_available_blocks = self._get_num_available_gpu_blocks()
+        num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
+        return num_seqs * num_slots <= num_available_blocks
+
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
         logical_blocks = seq.logical_token_blocks
@@ -316,6 +328,16 @@ class BlockSpaceManager:
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return last_block.block_id, new_block.block_id
+
+    def append_lookahead_slot(self, seq: Sequence) -> None:
+        """Ensure the one-token MTP proposal has a writable physical block."""
+        block_table = self.block_tables[seq.seq_id]
+        num_tokens_with_lookahead = seq.get_len() + 1
+        required_blocks = (
+            num_tokens_with_lookahead + self.block_size - 1
+        ) // self.block_size
+        while len(block_table) < required_blocks:
+            block_table.append(self._allocate_gpu_block())
     
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.

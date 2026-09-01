@@ -26,6 +26,7 @@ class EngineArgs:
     gpu_memory_utilization: float = 0.9
     max_num_batched_tokens: int = 2560
     max_num_seqs: int = 256
+    num_speculative_tokens: int = 0
     disable_log_stats: bool = False
 
     def __post_init__(self) -> None:
@@ -92,6 +93,13 @@ class EngineArgs:
         parser.add_argument('--max-num-seqs', type=int,
                             default=EngineArgs.max_num_seqs,
                             help='maximum number of sequences per iteration')
+        parser.add_argument(
+            '--num-speculative-tokens',
+            type=int,
+            default=EngineArgs.num_speculative_tokens,
+            choices=[0, 1],
+            help='enable one-token native Qwen MTP speculative decoding',
+        )
         parser.add_argument('--disable-log-stats', action='store_true',
                             help='disable logging statistics')
         return parser
@@ -122,7 +130,9 @@ class EngineArgs:
             self.tensor_parallel_size, self.worker_use_ray
         )
         scheduler_config = SchedulerConfig(
-            self.max_num_batched_tokens, self.max_num_seqs
+            self.max_num_batched_tokens,
+            self.max_num_seqs,
+            self.num_speculative_tokens,
         )
         return model_config, cache_config, parallel_config, scheduler_config
 

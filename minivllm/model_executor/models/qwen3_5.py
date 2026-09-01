@@ -6,7 +6,7 @@ stream, while :class:`HybridCache` provides the different cache type required
 by each layer.
 """
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,7 @@ from minivllm.model_executor.parallel_utils.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    gather_from_tensor_model_parallel_region,
 )
 from minivllm.model_executor.weight_utils import (
     hf_model_weights_iterator,
@@ -323,13 +324,18 @@ class Qwen3_5Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: Optional[KVCache],
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         q, k, v, gate = self._project_qkv(hidden_states)
 
-        k_cache, v_cache = kv_cache
+        # The native MTP layer attends over independent one-token prompts and
+        # deliberately has no persistent target-model KV cache.
+        if kv_cache is None:
+            k_cache = v_cache = None
+        else:
+            k_cache, v_cache = kv_cache
         attn_out = self.attn(
             positions, q, k, v, k_cache, v_cache, input_metadata, cache_event
         )
@@ -680,10 +686,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5DecoderLayer(nn.Module):
     """One residual decoder block with a config-selected token mixer."""
 
-    def __init__(self, config, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        layer_type: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.layer_type = config.layer_types[layer_idx]
+        self.layer_type = (
+            config.layer_types[layer_idx] if layer_type is None else layer_type
+        )
         if self.layer_type == FULL_ATTENTION:
             self.self_attn = Qwen3_5Attention(config)
             self.linear_attn = None
@@ -731,6 +744,86 @@ class Qwen3_5DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
+
+
+class Qwen3_5MultiTokenPredictor(nn.Module):
+    """Native Qwen MTP-1 head sharing the target embedding and lm_head."""
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        num_layers = getattr(config, "mtp_num_hidden_layers", 0)
+        if num_layers != 1:
+            raise ValueError("The mini runtime supports exactly one Qwen MTP layer")
+        if getattr(config, "mtp_use_dedicated_embeddings", False):
+            raise ValueError("Dedicated Qwen MTP embeddings are not supported")
+        self.config = config
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        # Official FP8 checkpoints intentionally keep mtp.fc in BF16.
+        self.fc = ColumnParallelLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+            perform_initialization=False,
+            quant_config=None,
+        )
+        self.layers = nn.ModuleList([
+            Qwen3_5DecoderLayer(
+                config, layer_idx=0, layer_type=FULL_ATTENTION
+            )
+        ])
+        self.norm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if inputs_embeds.ndim != 2 or target_hidden_states.ndim != 2:
+            raise ValueError("MTP inputs must be [batch, hidden] tensors")
+        if inputs_embeds.shape != target_hidden_states.shape:
+            raise ValueError("MTP embedding and target hidden shapes must match")
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        target_hidden_states = self.pre_fc_norm_hidden(target_hidden_states)
+        hidden_states, _ = self.fc(torch.cat(
+            (inputs_embeds, target_hidden_states), dim=-1
+        ))
+
+        batch_size = inputs_embeds.shape[0]
+        metadata = InputMetadata(
+            seq_groups=[],
+            seq_data={},
+            prompt_lens=[1] * batch_size,
+            slot_mapping=torch.zeros(
+                batch_size, dtype=torch.int32, device=inputs_embeds.device
+            ),
+            context_lens=torch.empty(
+                0, dtype=torch.int32, device=inputs_embeds.device
+            ),
+            max_context_len=0,
+            block_tables=torch.empty(
+                (0, 0), dtype=torch.int32, device=inputs_embeds.device
+            ),
+            fresh_prompt_lens=[1] * batch_size,
+            prompt_sample_indices=[],
+        )
+        hidden_states = self.layers[0](
+            positions,
+            hidden_states,
+            cache=None,
+            input_metadata=metadata,
+            cache_event=None,
+            state_cache=None,
+        )
+        return self.norm(hidden_states)
 
 
 class Qwen3_5Model(nn.Module):
@@ -799,6 +892,185 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             perform_initialization=False,
         )
         self.sampler = Sampler(config.vocab_size)
+        self.mtp = (
+            Qwen3_5MultiTokenPredictor(config)
+            if getattr(config, "mtp_num_hidden_layers", 0)
+            else None
+        )
+
+    def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = F.linear(hidden_states, self.lm_head.weight)
+        logits = gather_from_tensor_model_parallel_region(logits)
+        return logits[:, :self.config.vocab_size].float()
+
+    @staticmethod
+    def _token_logprobs(
+        logprobs: torch.Tensor,
+        token_id: int,
+        num_logprobs: Optional[int],
+    ) -> Dict[int, float]:
+        result: Dict[int, float] = {}
+        if num_logprobs:
+            values, indices = torch.topk(logprobs, num_logprobs)
+            result.update({
+                int(index): float(value)
+                for index, value in zip(indices.tolist(), values.tolist())
+            })
+        result[token_id] = float(logprobs[token_id])
+        return result
+
+    def _is_eos(self, token_id: int) -> bool:
+        eos_token_id = getattr(self.config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple, set)):
+            return token_id in eos_token_id
+        return eos_token_id is not None and token_id == eos_token_id
+
+    @staticmethod
+    def _mtp_params_are_supported(sampling_params) -> bool:
+        return (
+            sampling_params.temperature == 0.0
+            and sampling_params.best_of == 1
+            and not sampling_params.use_beam_search
+            and sampling_params.presence_penalty == 0.0
+            and sampling_params.frequency_penalty == 0.0
+            and not sampling_params.stop
+        )
+
+    def _verify_speculative_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> Tuple[
+        Dict[int, SequenceOutputs],
+        List[Tuple[SequenceOutputs, torch.Tensor, torch.Tensor, object]],
+    ]:
+        outputs: Dict[int, SequenceOutputs] = {}
+        proposal_contexts = []
+        for seq_id, draft_token_id, indices, sampling_params in zip(
+            input_metadata.speculative_seq_ids,
+            input_metadata.speculative_token_ids,
+            input_metadata.speculative_hidden_indices,
+            input_metadata.speculative_sampling_params,
+        ):
+            first_idx, second_idx = indices
+            pair_logits = self._compute_logits(
+                hidden_states[[first_idx, second_idx]]
+            )
+            pair_logprobs = F.log_softmax(pair_logits, dim=-1)
+            target_token_id = int(torch.argmax(pair_logits[0]).item())
+
+            if target_token_id == draft_token_id:
+                bonus_token_id = int(torch.argmax(pair_logits[1]).item())
+                token_ids = [draft_token_id]
+                token_logprobs = [self._token_logprobs(
+                    pair_logprobs[0],
+                    draft_token_id,
+                    sampling_params.logprobs,
+                )]
+                if not self._is_eos(draft_token_id):
+                    token_ids.append(bonus_token_id)
+                    token_logprobs.append(self._token_logprobs(
+                        pair_logprobs[1],
+                        bonus_token_id,
+                        sampling_params.logprobs,
+                    ))
+                selected_hidden = hidden_states[second_idx]
+                selected_position = positions[second_idx]
+                consumed_tokens = 2
+            else:
+                token_ids = [target_token_id]
+                token_logprobs = [self._token_logprobs(
+                    pair_logprobs[0],
+                    target_token_id,
+                    sampling_params.logprobs,
+                )]
+                selected_hidden = hidden_states[first_idx]
+                selected_position = positions[first_idx]
+                consumed_tokens = 1
+
+            output = SequenceOutputs(
+                seq_id=seq_id,
+                parent_seq_id=seq_id,
+                output_token=token_ids[0],
+                logprobs=token_logprobs[0],
+                output_token_ids=token_ids,
+                output_logprobs=token_logprobs,
+                num_computed_tokens=consumed_tokens,
+            )
+            outputs[seq_id] = output
+            final_token_id = token_ids[-1]
+            if (
+                sampling_params.ignore_eos
+                or not self._is_eos(final_token_id)
+            ):
+                proposal_contexts.append((
+                    output,
+                    selected_hidden,
+                    selected_position,
+                    sampling_params,
+                ))
+        return outputs, proposal_contexts
+
+    def _standard_proposal_contexts(
+        self,
+        outputs: Dict[int, SequenceOutputs],
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> List[Tuple[SequenceOutputs, torch.Tensor, torch.Tensor, object]]:
+        contexts = []
+        decode_offset = input_metadata.num_prompt_tokens
+        for group_idx, (seq_ids, sampling_params) in enumerate(
+            input_metadata.seq_groups
+        ):
+            if group_idx < input_metadata.num_prompt_samples:
+                hidden_idx = input_metadata.prompt_sample_indices[group_idx]
+                hidden_indices = [hidden_idx] * len(seq_ids)
+            else:
+                hidden_indices = list(range(
+                    decode_offset, decode_offset + len(seq_ids)
+                ))
+                decode_offset += len(seq_ids)
+            if not self._mtp_params_are_supported(sampling_params):
+                continue
+            for seq_id, hidden_idx in zip(seq_ids, hidden_indices):
+                output = outputs[seq_id]
+                if (
+                    not sampling_params.ignore_eos
+                    and self._is_eos(output.output_token)
+                ):
+                    continue
+                contexts.append((
+                    output,
+                    hidden_states[hidden_idx],
+                    positions[hidden_idx],
+                    sampling_params,
+                ))
+        return contexts
+
+    def _attach_mtp_drafts(
+        self,
+        contexts: List[Tuple[SequenceOutputs, torch.Tensor, torch.Tensor, object]],
+    ) -> None:
+        if self.mtp is None or not contexts:
+            return
+        token_ids = torch.tensor(
+            [context[0].output_token_ids[-1] for context in contexts],
+            dtype=torch.long,
+            device=contexts[0][1].device,
+        )
+        target_hidden = torch.stack([context[1] for context in contexts])
+        next_positions = torch.stack([context[2] for context in contexts]) + 1
+        mtp_hidden = self.mtp(
+            self.model.embed_tokens(token_ids),
+            next_positions,
+            target_hidden,
+        )
+        draft_logits = self._compute_logits(mtp_hidden)
+        draft_token_ids = torch.argmax(draft_logits, dim=-1).tolist()
+        for context, draft_token_id in zip(contexts, draft_token_ids):
+            context[0].draft_token_id = int(draft_token_id)
 
     def forward(
         self,
@@ -816,13 +1088,28 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             input_metadata,
             cache_events,
         )
-        if not input_metadata.seq_groups:
-            return {}
-        return self.sampler(
-            self.lm_head.weight,
-            hidden_states,
-            input_metadata,
-        )
+        outputs: Dict[int, SequenceOutputs] = {}
+        proposal_contexts = []
+        if input_metadata.seq_groups:
+            outputs.update(self.sampler(
+                self.lm_head.weight,
+                hidden_states,
+                input_metadata,
+            ))
+            proposal_contexts.extend(self._standard_proposal_contexts(
+                outputs, hidden_states, positions, input_metadata
+            ))
+        if input_metadata.speculative_seq_ids:
+            speculative_outputs, speculative_contexts = (
+                self._verify_speculative_tokens(
+                    hidden_states, positions, input_metadata
+                )
+            )
+            outputs.update(speculative_outputs)
+            proposal_contexts.extend(speculative_contexts)
+        if input_metadata.enable_mtp:
+            self._attach_mtp_drafts(proposal_contexts)
+        return outputs
 
     def load_weights(
         self,
@@ -865,6 +1152,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             "in_proj_b.weight",
             "linear_attn.dt_bias",
             "linear_attn.A_log",
+            "mtp.fc.weight",
         ]
         row_parallel_weights = [
             "self_attn.o_proj.weight",
@@ -888,10 +1176,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             else:
                 name = checkpoint_name
 
-            # Vision and MTP modules are loaded by their own stages. Keeping
-            # these prefixes explicit prevents a changed text key from being
-            # silently ignored.
-            if name.startswith(("model.visual.", "model.vision_tower.", "mtp.")):
+            # Vision weights are loaded by the multimodal stage. MTP weights
+            # below intentionally share the text loader's packed TP rules.
+            if name.startswith(("model.visual.", "model.vision_tower.")):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue

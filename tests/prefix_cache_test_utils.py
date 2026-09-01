@@ -85,10 +85,16 @@ def make_group(request_id, seqs):
     return sequence.SequenceGroup(request_id, seqs, None, 0.0)
 
 
-def make_scheduler(max_tokens=32, max_seqs=8, num_gpu_blocks=16):
+def make_scheduler(
+    max_tokens=32,
+    max_seqs=8,
+    num_gpu_blocks=16,
+    num_speculative_tokens=0,
+):
     scheduler_config = types.SimpleNamespace(
         max_num_batched_tokens=max_tokens,
         max_num_seqs=max_seqs,
+        num_speculative_tokens=num_speculative_tokens,
     )
     cache_config = types.SimpleNamespace(
         block_size=4,

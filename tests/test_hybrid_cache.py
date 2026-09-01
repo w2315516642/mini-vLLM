@@ -186,6 +186,29 @@ class HybridCacheTest(unittest.TestCase):
             torch.full_like(child_state.recurrent_state, 6.0),
         )
 
+    def test_snapshot_restores_only_rejected_sequences(self):
+        cache = _make_cache(max_num_seqs=2)
+        slots = cache.acquire([10, 20])
+        original = _filled_state(cache.state_spec, 2, 2.0)
+        original.conv_state[1].fill_(4.0)
+        original.recurrent_state[1].fill_(4.0)
+        cache.write_state(0, slots, original)
+        snapshot = cache.snapshot([10, 20])
+
+        changed = _filled_state(cache.state_spec, 2, 9.0)
+        cache.write_state(0, slots, changed)
+        cache.restore(snapshot, [20])
+
+        restored = cache.read_state(0, slots)
+        torch.testing.assert_close(
+            restored.conv_state[0],
+            torch.full_like(restored.conv_state[0], 9.0),
+        )
+        torch.testing.assert_close(
+            restored.conv_state[1],
+            torch.full_like(restored.conv_state[1], 4.0),
+        )
+
     def test_write_validation_and_reset(self):
         cache = _make_cache(max_num_seqs=2)
         slots = cache.acquire([10])

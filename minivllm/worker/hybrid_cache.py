@@ -113,6 +113,14 @@ class GatedDeltaNetStateSpec:
         )
 
 
+@dataclass
+class HybridStateSnapshot:
+    """Temporary recurrent-state checkpoint used for MTP rejection rollback."""
+
+    seq_ids: Tuple[int, ...]
+    layer_states: Dict[int, GatedDeltaNetState]
+
+
 class RequestStateSlotAllocator:
     """Map active sequence IDs to a bounded set of stable state slots."""
 
@@ -442,6 +450,59 @@ class HybridCache:
         ]
         self.release(active_seq_ids)
 
+    def snapshot(self, seq_ids: Sequence[int]) -> HybridStateSnapshot:
+        """Clone selected recurrent states before speculative verification."""
+        normalized = self._normalize_seq_ids(seq_ids)
+        slots = torch.tensor(
+            [self._slots.lookup(seq_id) for seq_id in normalized],
+            dtype=torch.long,
+            device=self.device,
+        )
+        layer_states = {}
+        for layer_idx, pool in self._linear_state_pools.items():
+            layer_states[layer_idx] = GatedDeltaNetState(
+                conv_state=pool.conv_state.index_select(0, slots).clone(),
+                recurrent_state=(
+                    pool.recurrent_state.index_select(0, slots).clone()
+                ),
+            )
+        return HybridStateSnapshot(normalized, layer_states)
+
+    def restore(
+        self,
+        snapshot: HybridStateSnapshot,
+        seq_ids: Sequence[int],
+    ) -> None:
+        """Restore a subset of sequences from an earlier snapshot."""
+        normalized = self._normalize_seq_ids(seq_ids)
+        snapshot_indices = {
+            seq_id: index for index, seq_id in enumerate(snapshot.seq_ids)
+        }
+        try:
+            selected_indices = [snapshot_indices[seq_id] for seq_id in normalized]
+        except KeyError as exc:
+            raise ValueError("sequence is absent from the state snapshot") from exc
+        destination_slots = torch.tensor(
+            [self._slots.lookup(seq_id) for seq_id in normalized],
+            dtype=torch.long,
+            device=self.device,
+        )
+        source_indices = torch.tensor(
+            selected_indices, dtype=torch.long, device=self.device
+        )
+        for layer_idx, saved in snapshot.layer_states.items():
+            pool = self._linear_state_pools[layer_idx]
+            pool.conv_state.index_copy_(
+                0,
+                destination_slots,
+                saved.conv_state.index_select(0, source_indices),
+            )
+            pool.recurrent_state.index_copy_(
+                0,
+                destination_slots,
+                saved.recurrent_state.index_select(0, source_indices),
+            )
+
     def reset(self) -> None:
         """Clear every state pool and reset all request-slot ownership."""
         for state in self._linear_state_pools.values():
@@ -453,6 +514,7 @@ class HybridCache:
 __all__ = [
     "GatedDeltaNetStateSpec",
     "HybridCache",
+    "HybridStateSnapshot",
     "KVCache",
     "RequestStateSlotAllocator",
 ]

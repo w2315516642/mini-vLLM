@@ -191,6 +191,10 @@ class Worker:
         prompt_seq_ids: List[int] = []
         generation_seq_ids: List[int] = []
         prompt_sample_indices: List[int] = []
+        speculative_seq_ids: List[int] = []
+        speculative_token_ids: List[int] = []
+        speculative_hidden_indices: List[Tuple[int, int]] = []
+        speculative_sampling_params: List[SamplingParams] = []
 
         prompt_metadata = [
             metadata for metadata in seq_group_metadata_list
@@ -217,7 +221,21 @@ class Worker:
             start = metadata.num_computed_tokens[seq_id]
             query_len = metadata.num_scheduled_tokens[seq_id]
             end = start + query_len
-            assert 0 < query_len and end <= seq_data.get_len()
+            if metadata.is_speculative:
+                assert query_len == 2 and start + 1 == seq_data.get_len()
+                draft_token_id = metadata.speculative_token_ids[seq_id]
+                query_token_ids = [
+                    seq_data.get_token_ids()[start], draft_token_id
+                ]
+                speculative_seq_ids.append(seq_id)
+                speculative_token_ids.append(draft_token_id)
+                speculative_hidden_indices.append(
+                    (len(input_token_ids), len(input_token_ids) + 1)
+                )
+                speculative_sampling_params.append(metadata.sampling_params)
+            else:
+                assert 0 < query_len and end <= seq_data.get_len()
+                query_token_ids = seq_data.get_token_ids()[start:end]
 
             if metadata.do_sample:
                 seq_groups.append((seq_ids, metadata.sampling_params))
@@ -226,7 +244,7 @@ class Worker:
                 )
             prompt_seq_ids.append(seq_id)
             prompt_lens.append(query_len)
-            input_token_ids.extend(seq_data.get_token_ids()[start:end])
+            input_token_ids.extend(query_token_ids)
             input_positions.extend(range(start, end))
 
             if metadata.block_tables is None:
@@ -320,6 +338,18 @@ class Worker:
             prompt_seq_ids=prompt_seq_ids,
             generation_seq_ids=generation_seq_ids,
             prompt_sample_indices=prompt_sample_indices,
+            speculative_seq_ids=speculative_seq_ids,
+            speculative_token_ids=speculative_token_ids,
+            speculative_hidden_indices=speculative_hidden_indices,
+            enable_mtp=(
+                getattr(
+                    getattr(self, "scheduler_config", None),
+                    "num_speculative_tokens",
+                    0,
+                )
+                == 1
+            ),
+            speculative_sampling_params=speculative_sampling_params,
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -368,6 +398,11 @@ class Worker:
                 input_metadata.prompt_seq_ids
                 + input_metadata.generation_seq_ids
             )
+        state_snapshot = None
+        if self.hybrid_cache is not None and input_metadata.speculative_seq_ids:
+            state_snapshot = self.hybrid_cache.snapshot(
+                input_metadata.speculative_seq_ids
+            )
         
         # Execute the model.
         # output: List[int (seq_id), SequenceOutputs]
@@ -378,7 +413,97 @@ class Worker:
             input_metadata=input_metadata,
             cache_events=cache_events,
         )
+        rejected_seq_ids = [
+            seq_id for seq_id in input_metadata.speculative_seq_ids
+            if output[seq_id].num_computed_tokens == 1
+        ]
+        if rejected_seq_ids:
+            assert self.hybrid_cache is not None and state_snapshot is not None
+            self.hybrid_cache.restore(state_snapshot, rejected_seq_ids)
+            self._replay_rejected_speculative_tokens(
+                seq_group_metadata_list, rejected_seq_ids
+            )
         return output
+
+    def _replay_rejected_speculative_tokens(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        rejected_seq_ids: List[int],
+    ) -> None:
+        """Rebuild target state through only the accepted verification input."""
+        rejected = set(rejected_seq_ids)
+        token_ids: List[int] = []
+        positions: List[int] = []
+        slot_mapping: List[int] = []
+        block_tables: List[List[int]] = []
+        seq_data: Dict[int, SequenceData] = {}
+        replay_seq_ids: List[int] = []
+        for metadata in seq_group_metadata_list:
+            if not metadata.is_speculative:
+                continue
+            seq_id = next(iter(metadata.seq_data))
+            if seq_id not in rejected:
+                continue
+            data = metadata.seq_data[seq_id]
+            position = metadata.num_computed_tokens[seq_id]
+            block_table = metadata.block_tables[seq_id]
+            token_ids.append(data.get_token_ids()[position])
+            positions.append(position)
+            slot_mapping.append(
+                _get_slot_id(block_table, position, self.block_size)
+            )
+            block_tables.append(block_table)
+            seq_data[seq_id] = data
+            replay_seq_ids.append(seq_id)
+
+        num_tokens = len(token_ids)
+        padded_tokens = _pad_to_alignment(token_ids, multiple_of=8)
+        padded_positions = _pad_to_alignment(positions, multiple_of=8)
+        device = torch.device("cuda")
+        cu_seqlens = torch.arange(
+            num_tokens + 1, dtype=torch.int32, device=device
+        )
+        replay_metadata = InputMetadata(
+            seq_groups=[],
+            seq_data=seq_data,
+            prompt_lens=[1] * num_tokens,
+            slot_mapping=torch.tensor(
+                slot_mapping, dtype=torch.int32, device=device
+            ),
+            context_lens=torch.empty(0, dtype=torch.int32, device=device),
+            max_context_len=0,
+            block_tables=torch.empty((0, 0), dtype=torch.int32, device=device),
+            fresh_prompt_lens=[],
+            cached_prompt_query_lens=[1] * num_tokens,
+            cached_prompt_cu_seqlens=cu_seqlens,
+            cached_prompt_context_lens=torch.tensor(
+                [position + 1 for position in positions],
+                dtype=torch.int32,
+                device=device,
+            ),
+            cached_prompt_block_tables=_make_block_table_tensor(block_tables),
+            max_cached_prompt_context_len=max(
+                (position + 1 for position in positions), default=0
+            ),
+            prompt_seq_ids=replay_seq_ids,
+            prompt_sample_indices=[],
+            enable_mtp=False,
+        )
+        replay_metadata.state_slot_mapping = self.hybrid_cache.acquire(
+            replay_seq_ids
+        )
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        self.model(
+            input_ids=torch.tensor(
+                padded_tokens, dtype=torch.long, device=device
+            ),
+            positions=torch.tensor(
+                padded_positions, dtype=torch.long, device=device
+            ),
+            kv_caches=self.gpu_cache,
+            input_metadata=replay_metadata,
+            cache_events=[None] * num_layers,
+        )
 
     def apply_hybrid_state_operations(
         self,

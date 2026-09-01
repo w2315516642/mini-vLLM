@@ -314,14 +314,17 @@ class LLMEngine:
         """Decodes the sequence outputs."""
         for seq_group in seq_groups:
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-                new_token, new_output_text = detokenize_incrementally(
-                    self.tokenizer,
-                    seq.output_tokens,
-                    seq.get_last_token_id(),
-                    skip_special_tokens=True,
-                )
-                seq.output_tokens.append(new_token)
-                seq.output_text += new_output_text
+                while len(seq.output_tokens) < seq.get_output_len():
+                    token_index = len(seq.output_tokens)
+                    token_id = seq.get_output_token_ids()[token_index]
+                    new_token, new_output_text = detokenize_incrementally(
+                        self.tokenizer,
+                        seq.output_tokens,
+                        token_id,
+                        skip_special_tokens=True,
+                    )
+                    seq.output_tokens.append(new_token)
+                    seq.output_text += new_output_text
 
     def _stop_sequences(self, seq_groups: List[SequenceGroup]) -> None:
         """Stop the finished sequences."""
@@ -343,7 +346,7 @@ class LLMEngine:
                     continue
                     
                 # Check if the sequence has reached max_tokens.
-                if seq.get_output_len() == sampling_params.max_tokens:
+                if seq.get_output_len() >= sampling_params.max_tokens:
                     self.scheduler.free_seq(
                         seq, SequenceStatus.FINISHED_LENGTH_CAPPED
                     )

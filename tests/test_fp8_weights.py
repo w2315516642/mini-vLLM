@@ -297,6 +297,39 @@ class QwenSafetensorsLoaderTest(unittest.TestCase):
             ),
         )
 
+    def test_mtp_weights_use_shared_packing_rules(self):
+        q_weight = torch.arange(1, 33, dtype=torch.float32).reshape(8, 4)
+        k_weight = torch.arange(41, 49, dtype=torch.float32).reshape(2, 4)
+        v_weight = torch.arange(51, 59, dtype=torch.float32).reshape(2, 4)
+        fc_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        checkpoint = {
+            "mtp.fc.weight": fc_weight,
+            "mtp.layers.0.self_attn.q_proj.weight": q_weight,
+            "mtp.layers.0.self_attn.k_proj.weight": k_weight,
+            "mtp.layers.0.self_attn.v_proj.weight": v_weight,
+            "mtp.norm.weight": torch.arange(4, dtype=torch.float32),
+        }
+        targets = {
+            "mtp.fc.weight": torch.zeros_like(fc_weight),
+            "mtp.layers.0.self_attn.qkv_gate_proj.weight": torch.zeros(
+                12, 4
+            ),
+            "mtp.norm.weight": torch.zeros(4),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_file(checkpoint, Path(tmpdir) / "model.safetensors")
+            _QwenLoaderHarness(targets).load_weights(tmpdir)
+
+        torch.testing.assert_close(targets["mtp.fc.weight"], fc_weight)
+        torch.testing.assert_close(
+            targets["mtp.layers.0.self_attn.qkv_gate_proj.weight"],
+            torch.cat((q_weight, k_weight, v_weight)),
+        )
+        torch.testing.assert_close(
+            targets["mtp.norm.weight"], torch.arange(4, dtype=torch.float32)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

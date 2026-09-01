@@ -94,6 +94,8 @@ class Sequence:
         # Number of tokens which have been computed.
         self.num_computed_tokens: int = 0
         self.num_cached_blocks: int = 0
+        # Native MTP proposes at most one token beyond the normal decode input.
+        self.speculative_token_id: Optional[int] = None
 
         self.block_hashes: List[BlockHash] = []
         self.logical_token_blocks: List[LogicalTokenBlock] = []
@@ -175,6 +177,7 @@ class Sequence:
         child_seq.num_computed_tokens = self.num_computed_tokens
         child_seq.num_cached_blocks = self.num_cached_blocks
         child_seq.block_hashes = self.block_hashes.copy()
+        child_seq.speculative_token_id = self.speculative_token_id
         return None
 
     def __repr__(self) -> str:
@@ -233,6 +236,8 @@ class SequenceGroupMetadata:
         num_computed_tokens: Optional[Dict[int, int]] = None,
         num_scheduled_tokens: Optional[Dict[int, int]] = None,
         do_sample: bool = True,
+        is_speculative: bool = False,
+        speculative_token_ids: Optional[Dict[int, int]] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
@@ -249,6 +254,8 @@ class SequenceGroupMetadata:
         }
         # Intermediate prefill chunks update caches but do not produce tokens.
         self.do_sample = do_sample
+        self.is_speculative = is_speculative
+        self.speculative_token_ids = speculative_token_ids or {}
         
 
 class SequenceOutputs:
@@ -258,22 +265,37 @@ class SequenceOutputs:
         parent_seq_id: int,
         output_token: int,
         logprobs: Dict[int, float],
+        output_token_ids: Optional[List[int]] = None,
+        output_logprobs: Optional[List[Dict[int, float]]] = None,
+        num_computed_tokens: Optional[int] = None,
+        draft_token_id: Optional[int] = None,
     ) -> None:
         self.seq_id = seq_id
         self.parent_seq_id = parent_seq_id
         self.output_token = output_token
         self.logprobs = logprobs
+        self.output_token_ids = output_token_ids or [output_token]
+        self.output_logprobs = output_logprobs or [logprobs]
+        if len(self.output_token_ids) != len(self.output_logprobs):
+            raise ValueError(
+                "output_token_ids and output_logprobs must have equal length"
+            )
+        self.num_computed_tokens = num_computed_tokens
+        self.draft_token_id = draft_token_id
 
     def __repr__(self) -> str:
         return (f'SequenceOutputs(seq_id={self.seq_id}, '
                 f'parent_seq_id={self.parent_seq_id}, '
-                f'output_token={self.output_token}), '
-                f'logprobs={self.logprobs}')
+                f'output_token_ids={self.output_token_ids}, '
+                f'num_computed_tokens={self.num_computed_tokens}, '
+                f'draft_token_id={self.draft_token_id})')
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SequenceOutputs):
             return NotImplemented
         return (self.seq_id == other.seq_id and
                 self.parent_seq_id == other.parent_seq_id and
-                self.output_token == other.output_token and
-                self.logprobs == other.logprobs)
+                self.output_token_ids == other.output_token_ids and
+                self.output_logprobs == other.output_logprobs and
+                self.num_computed_tokens == other.num_computed_tokens and
+                self.draft_token_id == other.draft_token_id)

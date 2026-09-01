@@ -35,6 +35,11 @@ class InputMetadata:
         generation_seq_ids: Optional[List[int]] = None,
         state_slot_mapping: Optional[torch.Tensor] = None,
         prompt_sample_indices: Optional[List[int]] = None,
+        speculative_seq_ids: Optional[List[int]] = None,
+        speculative_token_ids: Optional[List[int]] = None,
+        speculative_hidden_indices: Optional[List[Tuple[int, int]]] = None,
+        enable_mtp: bool = False,
+        speculative_sampling_params: Optional[List[SamplingParams]] = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -70,6 +75,18 @@ class InputMetadata:
                 offset += prompt_len
         self.prompt_sample_indices = prompt_sample_indices
         self.num_prompt_samples = len(prompt_sample_indices)
+        self.speculative_seq_ids = speculative_seq_ids or []
+        self.speculative_token_ids = speculative_token_ids or []
+        self.speculative_hidden_indices = speculative_hidden_indices or []
+        self.enable_mtp = enable_mtp
+        self.speculative_sampling_params = speculative_sampling_params or []
+        if not (
+            len(self.speculative_seq_ids)
+            == len(self.speculative_token_ids)
+            == len(self.speculative_hidden_indices)
+            == len(self.speculative_sampling_params)
+        ):
+            raise ValueError("Speculative metadata lists must have equal length")
         self.num_prompt_tokens = sum(prompt_lens)
         self.num_fresh_prompt_tokens = sum(self.fresh_prompt_lens)
         self.num_cached_prompt_tokens = sum(self.cached_prompt_query_lens)
@@ -110,6 +127,7 @@ class InputMetadata:
                 f'num_cached_prompt_tokens={self.num_cached_prompt_tokens}, '
                 f'num_prompts={self.num_prompts}, '
                 f'num_prompt_samples={self.num_prompt_samples}, '
+                f'num_speculative_seqs={len(self.speculative_seq_ids)}, '
                 f'prompt_lens={self.prompt_lens}, '
                 f'num_generation_tokens={self.num_generation_tokens}, '
                 f'prompt_seq_ids={self.prompt_seq_ids}, '

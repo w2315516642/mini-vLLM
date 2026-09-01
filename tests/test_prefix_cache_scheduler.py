@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from prefix_cache_test_utils import (
     make_group,
@@ -18,6 +19,18 @@ def make_output(seq_id, token_id=99):
 
 
 class PrefixCacheSchedulerTest(unittest.TestCase):
+
+    @staticmethod
+    def _greedy_params(max_tokens=8):
+        return SimpleNamespace(
+            temperature=0.0,
+            best_of=1,
+            use_beam_search=False,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            stop=[],
+            max_tokens=max_tokens,
+        )
 
     def _cache_prompt(self, scheduler, seq):
         group = make_group("cached", [seq])
@@ -153,6 +166,73 @@ class PrefixCacheSchedulerTest(unittest.TestCase):
         releases, copies = scheduler.pop_pending_state_operations()
         self.assertEqual(releases, [])
         self.assertEqual(copies, {second.seq_id: first.seq_id})
+
+    def test_mtp_verification_schedules_two_tokens_and_accepts_bonus(self):
+        scheduler = make_scheduler(
+            max_tokens=4, num_speculative_tokens=1
+        )
+        seq = make_seq(0, list(range(4)))
+        seq.append_token_id(90, {90: 0.0})
+        seq.speculative_token_id = 91
+        group = make_group("mtp", [seq])
+        group.sampling_params = self._greedy_params()
+        scheduler.block_manager.allocate(group)
+        seq.status = sequence.SequenceStatus.RUNNING
+        seq.num_computed_tokens = 4
+        scheduler.running.append(group)
+
+        metadata, scheduler_outputs = scheduler.scheduler()
+
+        self.assertTrue(metadata[0].is_prompt)
+        self.assertTrue(metadata[0].is_speculative)
+        self.assertFalse(metadata[0].do_sample)
+        self.assertEqual(metadata[0].num_scheduled_tokens[seq.seq_id], 2)
+        self.assertEqual(metadata[0].speculative_token_ids, {seq.seq_id: 91})
+
+        accepted = sequence.SequenceOutputs(
+            seq_id=seq.seq_id,
+            parent_seq_id=seq.seq_id,
+            output_token=91,
+            logprobs={91: -0.1},
+            output_token_ids=[91, 92],
+            output_logprobs=[{91: -0.1}, {92: -0.2}],
+            num_computed_tokens=2,
+            draft_token_id=93,
+        )
+        scheduler.update({seq.seq_id: accepted}, scheduler_outputs)
+
+        self.assertEqual(seq.num_computed_tokens, 6)
+        self.assertEqual(seq.get_output_token_ids(), [90, 91, 92])
+        self.assertEqual(seq.speculative_token_id, 93)
+
+    def test_mtp_rejection_advances_only_the_confirmed_input(self):
+        scheduler = make_scheduler(
+            max_tokens=4, num_speculative_tokens=1
+        )
+        seq = make_seq(0, list(range(4)))
+        seq.append_token_id(90, {90: 0.0})
+        seq.speculative_token_id = 91
+        group = make_group("mtp", [seq])
+        group.sampling_params = self._greedy_params()
+        scheduler.block_manager.allocate(group)
+        seq.status = sequence.SequenceStatus.RUNNING
+        seq.num_computed_tokens = 4
+        scheduler.running.append(group)
+        _, scheduler_outputs = scheduler.scheduler()
+
+        rejected = sequence.SequenceOutputs(
+            seq_id=seq.seq_id,
+            parent_seq_id=seq.seq_id,
+            output_token=95,
+            logprobs={95: -0.1},
+            num_computed_tokens=1,
+            draft_token_id=96,
+        )
+        scheduler.update({seq.seq_id: rejected}, scheduler_outputs)
+
+        self.assertEqual(seq.num_computed_tokens, 5)
+        self.assertEqual(seq.get_output_token_ids(), [90, 95])
+        self.assertEqual(seq.speculative_token_id, 96)
 
 
 if __name__ == "__main__":
