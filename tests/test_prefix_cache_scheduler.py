@@ -68,6 +68,92 @@ class PrefixCacheSchedulerTest(unittest.TestCase):
         self.assertEqual(seq.num_computed_tokens, 0)
         self.assertEqual(seq.num_cached_blocks, 0)
 
+    def test_long_prompt_runs_in_chunks_and_samples_only_at_the_end(self):
+        scheduler = make_scheduler(max_tokens=4)
+        seq = make_seq(0, list(range(10)))
+        scheduler.add_seq_group(make_group("chunked", [seq]))
+
+        for expected_start in (0, 4):
+            metadata, outputs = scheduler.scheduler()
+            self.assertEqual(
+                metadata[0].num_computed_tokens[seq.seq_id], expected_start)
+            self.assertEqual(
+                metadata[0].num_scheduled_tokens[seq.seq_id], 4)
+            self.assertFalse(metadata[0].do_sample)
+            self.assertEqual(scheduler.update({}, outputs), [])
+
+        metadata, outputs = scheduler.scheduler()
+        self.assertEqual(metadata[0].num_computed_tokens[seq.seq_id], 8)
+        self.assertEqual(metadata[0].num_scheduled_tokens[seq.seq_id], 2)
+        self.assertTrue(metadata[0].do_sample)
+        sampled = scheduler.update(
+            {seq.seq_id: make_output(seq.seq_id)}, outputs)
+
+        self.assertEqual(sampled[0].request_id, "chunked")
+        self.assertEqual(seq.num_computed_tokens, 10)
+        self.assertEqual(seq.get_len(), 11)
+
+    def test_decode_and_prompt_chunk_share_the_token_budget(self):
+        scheduler = make_scheduler(max_tokens=4)
+
+        decode_seq = make_seq(0, list(range(4)))
+        decode_seq.append_token_id(90, {90: 0.0})
+        decode_group = make_group("decode", [decode_seq])
+        scheduler.block_manager.allocate(decode_group)
+        decode_seq.status = sequence.SequenceStatus.RUNNING
+        decode_seq.num_computed_tokens = 4
+        scheduler.running.append(decode_group)
+
+        prompt_seq = make_seq(1, list(range(8)))
+        scheduler.add_seq_group(make_group("prompt", [prompt_seq]))
+
+        metadata, outputs = scheduler.scheduler()
+        by_request = {item.request_id: item for item in metadata}
+        self.assertFalse(by_request["decode"].is_prompt)
+        self.assertTrue(by_request["decode"].do_sample)
+        self.assertEqual(
+            by_request["prompt"].num_scheduled_tokens[prompt_seq.seq_id], 3)
+        self.assertFalse(by_request["prompt"].do_sample)
+        self.assertEqual(sum(outputs.num_scheduled_tokens.values()), 4)
+
+        sampled = scheduler.update(
+            {decode_seq.seq_id: make_output(decode_seq.seq_id)}, outputs)
+        self.assertEqual([group.request_id for group in sampled], ["decode"])
+        self.assertEqual(prompt_seq.num_computed_tokens, 3)
+
+    def test_recompute_queues_recurrent_state_release(self):
+        scheduler = make_scheduler()
+        seq = make_seq(7, list(range(4)))
+        group = make_group("request", [seq])
+        scheduler.block_manager.allocate(group)
+        seq.status = sequence.SequenceStatus.RUNNING
+        seq.num_computed_tokens = seq.get_len()
+
+        scheduler._preempt_by_recompute(group)
+
+        releases, copies = scheduler.pop_pending_state_operations()
+        self.assertEqual(releases, [7])
+        self.assertEqual(copies, {})
+
+    def test_best_of_prompt_queues_recurrent_state_copy(self):
+        scheduler = make_scheduler(max_tokens=8)
+        first = make_seq(0, list(range(4)))
+        second = make_seq(1, list(range(4)))
+        scheduler.add_seq_group(make_group("best-of", [first, second]))
+
+        _, outputs = scheduler.scheduler()
+        scheduler.update(
+            {
+                first.seq_id: make_output(first.seq_id),
+                second.seq_id: make_output(second.seq_id),
+            },
+            outputs,
+        )
+
+        releases, copies = scheduler.pop_pending_state_operations()
+        self.assertEqual(releases, [])
+        self.assertEqual(copies, {second.seq_id: first.seq_id})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -816,6 +816,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             input_metadata,
             cache_events,
         )
+        if not input_metadata.seq_groups:
+            return {}
         return self.sampler(
             self.lm_head.weight,
             hidden_states,

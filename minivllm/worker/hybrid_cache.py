@@ -154,6 +154,10 @@ class RequestStateSlotAllocator:
         except KeyError as exc:
             raise ValueError(f"sequence {seq_id} is not active") from exc
 
+    def contains(self, seq_id: int) -> bool:
+        _validate_seq_id(seq_id)
+        return seq_id in self._seq_to_slot
+
     def release(self, seq_id: int) -> int:
         """Release one active sequence and return its former slot."""
         _validate_seq_id(seq_id)
@@ -407,6 +411,18 @@ class HybridCache:
             )
         return child_slot
 
+    def copy(self, parent_seq_id: int, child_seq_id: int) -> None:
+        """Copy a parent's state, allocating the child slot when necessary."""
+        parent_slot = self._slots.lookup(parent_seq_id)
+        child_slot, _ = self._slots.acquire(child_seq_id)
+        if parent_slot == child_slot:
+            return
+        for state in self._linear_state_pools.values():
+            state.conv_state[child_slot].copy_(state.conv_state[parent_slot])
+            state.recurrent_state[child_slot].copy_(
+                state.recurrent_state[parent_slot]
+            )
+
     def release(self, seq_ids: Sequence[int]) -> None:
         """Release requests and clear their state before slot reuse."""
         normalized = self._normalize_seq_ids(seq_ids)
@@ -417,6 +433,14 @@ class HybridCache:
         for state in self._linear_state_pools.values():
             state.conv_state.index_fill_(0, slot_ids, 0.0)
             state.recurrent_state.index_fill_(0, slot_ids, 0.0)
+
+    def release_existing(self, seq_ids: Sequence[int]) -> None:
+        """Release active IDs while tolerating requests never run by a worker."""
+        active_seq_ids = [
+            seq_id for seq_id in self._normalize_seq_ids(seq_ids)
+            if self._slots.contains(seq_id)
+        ]
+        self.release(active_seq_ids)
 
     def reset(self) -> None:
         """Clear every state pool and reset all request-slot ownership."""

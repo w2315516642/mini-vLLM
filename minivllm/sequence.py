@@ -232,6 +232,7 @@ class SequenceGroupMetadata:
         block_tables: Dict[int, List[int]],
         num_computed_tokens: Optional[Dict[int, int]] = None,
         num_scheduled_tokens: Optional[Dict[int, int]] = None,
+        do_sample: bool = True,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
@@ -246,6 +247,8 @@ class SequenceGroupMetadata:
         self.num_scheduled_tokens = num_scheduled_tokens or {
             seq_id: seq.get_len() for seq_id, seq in seq_data.items()
         }
+        # Intermediate prefill chunks update caches but do not produce tokens.
+        self.do_sample = do_sample
         
 
 class SequenceOutputs:

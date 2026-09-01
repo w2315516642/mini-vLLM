@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 
 from torch.nn import parallel
 
@@ -190,6 +190,7 @@ class Worker:
         cached_prompt_block_tables: List[List[int]] = []
         prompt_seq_ids: List[int] = []
         generation_seq_ids: List[int] = []
+        prompt_sample_indices: List[int] = []
 
         prompt_metadata = [
             metadata for metadata in seq_group_metadata_list
@@ -216,9 +217,13 @@ class Worker:
             start = metadata.num_computed_tokens[seq_id]
             query_len = metadata.num_scheduled_tokens[seq_id]
             end = start + query_len
-            assert end == seq_data.get_len()
+            assert 0 < query_len and end <= seq_data.get_len()
 
-            seq_groups.append((seq_ids, metadata.sampling_params))
+            if metadata.do_sample:
+                seq_groups.append((seq_ids, metadata.sampling_params))
+                prompt_sample_indices.append(
+                    len(input_token_ids) + query_len - 1
+                )
             prompt_seq_ids.append(seq_id)
             prompt_lens.append(query_len)
             input_token_ids.extend(seq_data.get_token_ids()[start:end])
@@ -314,6 +319,7 @@ class Worker:
                 cached_prompt_context_lens, default=0),
             prompt_seq_ids=prompt_seq_ids,
             generation_seq_ids=generation_seq_ids,
+            prompt_sample_indices=prompt_sample_indices,
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -324,7 +330,11 @@ class Worker:
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
+        state_seq_ids_to_release: Optional[List[int]] = None,
+        state_copies: Optional[Dict[int, int]] = None,
     ) -> Dict[int, SequenceOutputs]:
+        self.apply_hybrid_state_operations(
+            state_seq_ids_to_release or [], state_copies or {})
         # Issue cache operations.
         issued_cache_op = False
         if blocks_to_swap_in:
@@ -369,6 +379,20 @@ class Worker:
             cache_events=cache_events,
         )
         return output
+
+    def apply_hybrid_state_operations(
+        self,
+        seq_ids_to_release: List[int],
+        state_copies: Dict[int, int],
+    ) -> None:
+        """Apply scheduler lifecycle changes to persistent GDN states."""
+        if self.hybrid_cache is None:
+            return
+        # Beam children need the parent's post-forward state before either
+        # sequence is released by a stopping rule in the same engine step.
+        for child_seq_id, parent_seq_id in state_copies.items():
+            self.hybrid_cache.copy(parent_seq_id, child_seq_id)
+        self.hybrid_cache.release_existing(seq_ids_to_release)
 
 
 def _init_distributed_environment(

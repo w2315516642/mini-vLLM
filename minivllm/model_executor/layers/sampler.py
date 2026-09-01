@@ -112,7 +112,7 @@ def _get_top_p_top_k(
         
         top_k = min(sampling_params.top_k, vocab_size)
         top_k = vocab_size if top_k == -1 else top_k
-        if i < input_metadata.num_prompts:
+        if i < input_metadata.num_prompt_samples:
             top_ps.append(top_p)
             top_ks.append(top_k)
         else:
@@ -132,7 +132,7 @@ def _get_temperatures(
         if temperature == 0.0:
             temperature = 1.0
         
-        if i < input_metadata.num_prompts:
+        if i < input_metadata.num_prompt_samples:
             temperatures.append(temperature)
         else:
             temperatures.extend([temperature] * len(seq_ids))
@@ -183,13 +183,10 @@ def _prune_hidden_states(
     hidden_states: torch.Tensor,
     input_metadata: InputMetadata,
 ) -> torch.Tensor:
-    start_idx = 0
-    last_token_indices: List[int] = []
-    for prompt_len in input_metadata.prompt_lens:
-        # 前一个token的ffn结果得到下一个token的logits
-        # 因此只留最后一个token的hidden states输入lm_head就行
-        last_token_indices.append(start_idx + prompt_len - 1)
-        start_idx += prompt_len
+    # Intermediate prefill chunks intentionally have no sample index. This
+    # keeps them out of lm_head and, importantly, does not consume sampler RNG.
+    last_token_indices = list(input_metadata.prompt_sample_indices)
+    start_idx = input_metadata.num_prompt_tokens
     last_token_indices.extend(
         range(start_idx, start_idx + input_metadata.num_generation_tokens))
     return hidden_states[last_token_indices]
@@ -204,7 +201,7 @@ def _get_penalties(
         seq_ids, sampling_params = seq_group
         p = sampling_params.presence_penalty
         f = sampling_params.frequency_penalty
-        if i < input_metadata.num_prompts:
+        if i < input_metadata.num_prompt_samples:
             # A prompt input.
             presence_penalties.append(p)
             frequency_penalties.append(f)
@@ -244,7 +241,7 @@ def _get_output_tokens(
     output_tokens: List[List[int]] = []
     for i, seq_group in enumerate(input_metadata.seq_groups):
         seq_ids, _ = seq_group
-        if i < input_metadata.num_prompts:
+        if i < input_metadata.num_prompt_samples:
             # A prompt input.
             # NOTE: While the prompt input usually has no output tokens,
             # it may have output tokens in the case of recomputation.
@@ -349,7 +346,7 @@ def _sample(
     idx = 0
     for i, seq_group in enumerate(input_metadata.seq_groups):
         seq_ids, sampling_params = seq_group
-        if i < input_metadata.num_prompts:
+        if i < input_metadata.num_prompt_samples:
             # Generate the next token from a prompt input
             assert len(seq_ids) == sampling_params.best_of
             prob = probs[idx]

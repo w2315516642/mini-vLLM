@@ -16,6 +16,7 @@ def make_metadata(
     is_prompt,
     num_computed_tokens,
     num_scheduled_tokens,
+    do_sample=True,
 ):
     seq_data = sequence.SequenceData(token_ids)
     if not is_prompt:
@@ -28,6 +29,7 @@ def make_metadata(
         block_tables={seq_id: block_table},
         num_computed_tokens={seq_id: num_computed_tokens},
         num_scheduled_tokens={seq_id: num_scheduled_tokens},
+        do_sample=do_sample,
     )
 
 
@@ -78,6 +80,21 @@ class PrefixCacheWorkerTest(unittest.TestCase):
             [seq_ids for seq_ids, _ in metadata.seq_groups],
             [[0], [1], [3], [2]],
         )
+
+    def test_intermediate_prompt_chunk_is_excluded_from_sampling(self):
+        chunk = make_metadata(
+            "chunk", 0, list(range(8)), [10, 11], True, 0, 4,
+            do_sample=False,
+        )
+        worker = object.__new__(worker_module.Worker)
+        worker.block_size = 4
+
+        tokens, _, metadata = worker._prepare_inputs([chunk])
+
+        self.assertEqual(tokens[:4].cpu().tolist(), [0, 1, 2, 3])
+        self.assertEqual(metadata.prompt_lens, [4])
+        self.assertEqual(metadata.prompt_sample_indices, [])
+        self.assertEqual(metadata.seq_groups, [])
 
 
 if __name__ == "__main__":

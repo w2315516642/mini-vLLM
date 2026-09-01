@@ -34,6 +34,7 @@ class InputMetadata:
         prompt_seq_ids: Optional[List[int]] = None,
         generation_seq_ids: Optional[List[int]] = None,
         state_slot_mapping: Optional[torch.Tensor] = None,
+        prompt_sample_indices: Optional[List[int]] = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -61,6 +62,14 @@ class InputMetadata:
             self.attn_bias = BlockDiagonalCausalMask.from_seqlens(
                 self.fresh_prompt_lens)
         self.num_prompts = len(prompt_lens)
+        if prompt_sample_indices is None:
+            prompt_sample_indices = []
+            offset = 0
+            for prompt_len in prompt_lens:
+                prompt_sample_indices.append(offset + prompt_len - 1)
+                offset += prompt_len
+        self.prompt_sample_indices = prompt_sample_indices
+        self.num_prompt_samples = len(prompt_sample_indices)
         self.num_prompt_tokens = sum(prompt_lens)
         self.num_fresh_prompt_tokens = sum(self.fresh_prompt_lens)
         self.num_cached_prompt_tokens = sum(self.cached_prompt_query_lens)
@@ -72,6 +81,8 @@ class InputMetadata:
             assert len(self.prompt_seq_ids) == self.num_prompts
         if self.generation_seq_ids:
             assert len(self.generation_seq_ids) == self.num_generation_tokens
+        assert self.num_prompt_samples <= self.num_prompts
+        assert len(self.seq_groups) >= self.num_prompt_samples
         if block_tables.numel() > 0:
             # Every row is padded to the same block-table length.
             self.max_num_blocks_per_seq = block_tables.shape[1]
@@ -98,6 +109,7 @@ class InputMetadata:
                 f'num_fresh_prompt_tokens={self.num_fresh_prompt_tokens}, '
                 f'num_cached_prompt_tokens={self.num_cached_prompt_tokens}, '
                 f'num_prompts={self.num_prompts}, '
+                f'num_prompt_samples={self.num_prompt_samples}, '
                 f'prompt_lens={self.prompt_lens}, '
                 f'num_generation_tokens={self.num_generation_tokens}, '
                 f'prompt_seq_ids={self.prompt_seq_ids}, '

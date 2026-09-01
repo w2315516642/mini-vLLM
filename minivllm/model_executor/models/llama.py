@@ -272,6 +272,8 @@ class LlamaForCausalLM(nn.Module):
     ) -> Dict[int, SequenceOutputs]:
         hidden_states = self.model(
             input_ids, positions, kv_caches, input_metadata, cache_events)
+        if not input_metadata.seq_groups:
+            return {}
         next_tokens = self.sampler(
             self.lm_head.weight, hidden_states, input_metadata)
         return next_tokens

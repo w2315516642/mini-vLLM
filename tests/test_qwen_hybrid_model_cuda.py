@@ -213,6 +213,64 @@ class QwenHybridModelCudaTest(unittest.TestCase):
             atol=3e-2,
         )
 
+    def test_chunked_prefill_matches_single_prefill(self):
+        torch.manual_seed(107)
+        config = _config()
+        chunked_model = Qwen3_5Model(config).cuda().half().eval()
+        for parameter in chunked_model.parameters():
+            if parameter.numel():
+                torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+        full_model = Qwen3_5Model(config).cuda().half().eval()
+        full_model.load_state_dict(chunked_model.state_dict())
+        chunked_cache = _hybrid_cache(config, _kv_cache(torch.float16))
+        full_cache = _hybrid_cache(config, _kv_cache(torch.float16))
+        tokens = torch.tensor([3, 5, 7, 9, 11], device="cuda")
+
+        with torch.inference_mode():
+            start = 0
+            chunked_output = None
+            for query_len in (2, 2, 1):
+                chunk_tokens = torch.zeros(8, dtype=torch.long, device="cuda")
+                chunk_positions = torch.zeros(
+                    8, dtype=torch.long, device="cuda"
+                )
+                chunk_tokens[:query_len] = tokens[start:start + query_len]
+                chunk_positions[:query_len] = torch.arange(
+                    start, start + query_len, device="cuda"
+                )
+                chunked_output = chunked_model(
+                    chunk_tokens,
+                    chunk_positions,
+                    chunked_cache,
+                    _metadata(
+                        query_len,
+                        start,
+                        is_prompt=True,
+                        state_cache=chunked_cache,
+                    ),
+                    None,
+                )
+                start += query_len
+
+            full_tokens = torch.cat(
+                (tokens, torch.zeros(3, dtype=torch.long, device="cuda"))
+            )
+            full_positions = torch.tensor(
+                [0, 1, 2, 3, 4, 0, 0, 0], device="cuda"
+            )
+            full_output = full_model(
+                full_tokens,
+                full_positions,
+                full_cache,
+                _metadata(5, 0, is_prompt=True, state_cache=full_cache),
+                None,
+            )
+
+        assert chunked_output is not None
+        torch.testing.assert_close(
+            chunked_output[0], full_output[4], rtol=3e-2, atol=3e-2
+        )
+
     def test_fp8_weights_remain_compressed_during_hybrid_forward(self):
         config = _config()
         config.quantization_config = {

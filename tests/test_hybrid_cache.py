@@ -150,6 +150,42 @@ class HybridCacheTest(unittest.TestCase):
             torch.full_like(parent_after.conv_state, 2.0),
         )
 
+    def test_active_beam_state_can_be_overwritten_and_released(self):
+        cache = _make_cache(max_num_seqs=2)
+        parent_slot, child_slot = cache.acquire([10, 20]).tolist()
+        cache.write_state(
+            0, [parent_slot], _filled_state(cache.state_spec, 1, 3.0)
+        )
+        cache.write_state(
+            0, [child_slot], _filled_state(cache.state_spec, 1, 8.0)
+        )
+
+        cache.copy(10, 20)
+        copied = cache.read_state(0, [child_slot])
+        torch.testing.assert_close(
+            copied.conv_state, torch.full_like(copied.conv_state, 3.0)
+        )
+
+        cache.release_existing([20, 999])
+        self.assertEqual(cache.num_active_slots, 1)
+        self.assertEqual(cache.num_free_slots, 1)
+
+    def test_initial_best_of_copy_allocates_the_child_slot(self):
+        cache = _make_cache(max_num_seqs=2)
+        parent_slot = cache.acquire([10])
+        cache.write_state(
+            0, parent_slot, _filled_state(cache.state_spec, 1, 6.0)
+        )
+
+        cache.copy(10, 20)
+
+        child_slot = cache.acquire([20])
+        child_state = cache.read_state(0, child_slot)
+        torch.testing.assert_close(
+            child_state.recurrent_state,
+            torch.full_like(child_state.recurrent_state, 6.0),
+        )
+
     def test_write_validation_and_reset(self):
         cache = _make_cache(max_num_seqs=2)
         slots = cache.acquire([10])

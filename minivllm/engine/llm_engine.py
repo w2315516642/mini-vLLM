@@ -141,7 +141,10 @@ class LLMEngine:
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
-            blocks_to_copy=scheduler_outputs.blocks_to_copy
+            blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            state_seq_ids_to_release=(
+                scheduler_outputs.state_seq_ids_to_release),
+            state_copies=scheduler_outputs.state_copies,
         )
         # Update the scheduler with the model outputs.
         seq_groups = self.scheduler.update(output, scheduler_outputs)
@@ -152,6 +155,7 @@ class LLMEngine:
         self._stop_sequences(seq_groups)
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
+        self._flush_pending_state_operations()
 
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
@@ -215,6 +219,7 @@ class LLMEngine:
     def abort_request(self, request_id: str) -> None:
         """Aborts a request with the given ID."""
         self.scheduler.abort_seq_group(request_id)
+        self._flush_pending_state_operations()
 
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
@@ -273,6 +278,9 @@ class LLMEngine:
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            state_seq_ids_to_release=(
+                scheduler_outputs.state_seq_ids_to_release),
+            state_copies=scheduler_outputs.state_copies,
         )
         # Update the scheduler with the model outputs.
         seq_groups = self.scheduler.update(output, scheduler_outputs)
@@ -283,6 +291,7 @@ class LLMEngine:
         self._stop_sequences(seq_groups)
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
+        self._flush_pending_state_operations()
         
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
@@ -290,6 +299,16 @@ class LLMEngine:
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
         return request_outputs
+
+    def _flush_pending_state_operations(self) -> None:
+        releases, copies = self.scheduler.pop_pending_state_operations()
+        if not releases and not copies:
+            return
+        self._run_workers(
+            "apply_hybrid_state_operations",
+            seq_ids_to_release=releases,
+            state_copies=copies,
+        )
 
     def _decode_sequences(self, seq_groups: List[SequenceGroup]) -> None:
         """Decodes the sequence outputs."""
