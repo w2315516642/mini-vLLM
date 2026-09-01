@@ -26,6 +26,85 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 }
 
 
+def _config_value(config, name, default=None):
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def get_fp8_block_size(quant_config):
+    """Return ``(output_block, input_block)`` for an FP8 checkpoint."""
+    if quant_config is None:
+        return None
+    quant_method = _config_value(quant_config, "quant_method")
+    quant_algo = _config_value(quant_config, "quant_algo")
+    block_size = _config_value(quant_config, "weight_block_size")
+    if quant_method != "fp8" and quant_algo not in {"FP8_PB_WO", "FP8"}:
+        return None
+    if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+        raise ValueError(
+            "FP8 block quantization requires weight_block_size=[N, K]"
+        )
+    if any(
+        not isinstance(size, int) or isinstance(size, bool) or size <= 0
+        for size in block_size
+    ):
+        raise ValueError("FP8 weight block dimensions must be positive integers")
+    return tuple(block_size)
+
+
+def dequantize_fp8_block_weight(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_size,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialize one block-scaled FP8 matrix in the compute dtype."""
+    if weight.ndim != 2 or weight_scale_inv.ndim != 2:
+        raise ValueError("FP8 weight and weight_scale_inv must be matrices")
+    block_n, block_k = block_size
+    expected_scale_shape = (
+        (weight.shape[0] + block_n - 1) // block_n,
+        (weight.shape[1] + block_k - 1) // block_k,
+    )
+    if tuple(weight_scale_inv.shape) != expected_scale_shape:
+        raise ValueError(
+            "weight_scale_inv has shape "
+            f"{tuple(weight_scale_inv.shape)}, expected {expected_scale_shape}"
+        )
+    if weight.shape[0] % block_n == 0 and weight.shape[1] % block_k == 0:
+        dequantized = weight.to(dtype).view(
+            weight.shape[0] // block_n,
+            block_n,
+            weight.shape[1] // block_k,
+            block_k,
+        )
+        dequantized.mul_(weight_scale_inv.to(dtype)[:, None, :, None])
+        return dequantized.view_as(weight)
+
+    # Tail blocks are uncommon in Qwen's quantized linears, but supporting
+    # them keeps the loader usable for small test and fine-tuned checkpoints.
+    expanded_scale = weight_scale_inv.to(dtype).repeat_interleave(
+        block_n, dim=0
+    ).repeat_interleave(block_k, dim=1)
+    expanded_scale = expanded_scale[: weight.shape[0], : weight.shape[1]]
+    dequantized = weight.to(dtype)
+    return dequantized.mul_(expanded_scale)
+
+
+def _linear_weight(module: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+    if not hasattr(module, "weight_scale_inv"):
+        return module.weight
+    return dequantize_fp8_block_weight(
+        module.weight,
+        module.weight_scale_inv,
+        module.weight_block_size,
+        input_.dtype,
+    )
+
+
 def set_tensor_model_parallel_attributes(
     tensor: torch.Tensor,
     is_parallel: bool,
@@ -180,6 +259,7 @@ class ColumnParallelLinear(nn.Module):
         params_dtype: torch.dtype = None,
         use_cpu_initialization: bool = False,
         perform_initialization: bool = False,
+        quant_config=None,
     ) -> None:
         super().__init__()
 
@@ -198,27 +278,42 @@ class ColumnParallelLinear(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        # Parameters.
-        # Note: torch.nn.functional.linear performs XA^T + b and as a result
-        # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
-            self.weight = Parameter(torch.empty(
+        # FP8 checkpoints keep the compressed matrix resident. The small scale
+        # matrix is partitioned in the same direction as the weight.
+        self.weight_block_size = get_fp8_block_size(quant_config)
+        weight_dtype = params_dtype
+        requires_grad = True
+        if self.weight_block_size is not None:
+            weight_dtype = getattr(torch, "float8_e4m3fn", None)
+            if weight_dtype is None:
+                raise RuntimeError("This PyTorch build does not support FP8")
+            requires_grad = False
+        weight_device = (
+            None if use_cpu_initialization else torch.cuda.current_device()
+        )
+        self.weight = Parameter(
+            torch.empty(
                 self.output_size_per_partition,
                 self.input_size,
-                dtype=params_dtype,
-            ))
-            # TODO
-            # if perform_initialization:
-        else:
-            self.weight = Parameter(torch.empty(
-                self.output_size_per_partition,
-                self.input_size,
-                device=torch.cuda.current_device(),
-                dtype=params_dtype,
-            ))
-            # TODO
-            # if perform_initialization:
+                device=weight_device,
+                dtype=weight_dtype,
+            ),
+            requires_grad=requires_grad,
+        )
+        if self.weight_block_size is not None:
+            block_n, block_k = self.weight_block_size
+            scale_shape = (
+                (self.output_size_per_partition + block_n - 1) // block_n,
+                (self.input_size + block_k - 1) // block_k,
+            )
+            self.weight_scale_inv = Parameter(
+                torch.ones(
+                    scale_shape,
+                    device=weight_device,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         
         if bias:
             if use_cpu_initialization:
@@ -252,7 +347,11 @@ class ColumnParallelLinear(nn.Module):
 
         input_parallel = input_
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight, bias)
+        output_parallel = F.linear(
+            input_parallel,
+            _linear_weight(self, input_parallel),
+            bias,
+        )
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
@@ -311,6 +410,7 @@ class RowParallelLinear(nn.Module):
         params_dtype: torch.dtype = None,
         use_cpu_initialization: bool = False,
         perform_initialization: bool = False,
+        quant_config=None,
     ) -> None:
         super().__init__()
 
@@ -326,27 +426,40 @@ class RowParallelLinear(nn.Module):
         self.input_size_per_partition = divide(input_size, world_size)
         self.skpi_bias_add = skip_bias_add
 
-        # Parameters.
-        # Note: torch.nn.functional.linear performs XA^T + b and as a result
-        # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
-            self.weight = Parameter(torch.empty(
+        self.weight_block_size = get_fp8_block_size(quant_config)
+        weight_dtype = params_dtype
+        requires_grad = True
+        if self.weight_block_size is not None:
+            weight_dtype = getattr(torch, "float8_e4m3fn", None)
+            if weight_dtype is None:
+                raise RuntimeError("This PyTorch build does not support FP8")
+            requires_grad = False
+        weight_device = (
+            None if use_cpu_initialization else torch.cuda.current_device()
+        )
+        self.weight = Parameter(
+            torch.empty(
                 self.output_size,
                 self.input_size_per_partition,
-                dtype=params_dtype,
-            ))
-            # TODO
-            # if perform_initialization:
-        else:
-            self.weight = Parameter(torch.empty(
-                self.output_size,
-                self.input_size_per_partition,
-                device=torch.cuda.current_device(),
-                dtype=params_dtype,
-            ))
-            # TODO
-            # if perform_initialization:
+                device=weight_device,
+                dtype=weight_dtype,
+            ),
+            requires_grad=requires_grad,
+        )
+        if self.weight_block_size is not None:
+            block_n, block_k = self.weight_block_size
+            scale_shape = (
+                (self.output_size + block_n - 1) // block_n,
+                (self.input_size_per_partition + block_k - 1) // block_k,
+            )
+            self.weight_scale_inv = Parameter(
+                torch.ones(
+                    scale_shape,
+                    device=weight_device,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         
         if bias:
             if use_cpu_initialization:
@@ -382,14 +495,15 @@ class RowParallelLinear(nn.Module):
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
+        weight = _linear_weight(self, input_parallel)
         if get_tensor_model_parallel_world_size() == 1:
-            output_ = F.linear(input_parallel, self.weight)
+            output_ = F.linear(input_parallel, weight)
         else:
             all_reduce_launcher = get_all_reduce_launcher()
             num_tokens = input_parallel.shape[0]
             # 取cuda graph要用的固定显存位置
             output_buffer = all_reduce_launcher.buffer[:num_tokens]
-            torch.matmul(input_parallel, self.weight_t, out=output_buffer)
+            torch.matmul(input_parallel, weight.t(), out=output_buffer)
             # All-reduce across all the partitions.
             output_ = all_reduce_launcher.launch(output_buffer)
 

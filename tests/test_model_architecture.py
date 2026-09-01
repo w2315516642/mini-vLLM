@@ -177,6 +177,31 @@ class ModelArchitectureTest(unittest.TestCase):
 class ModelConfigIntegrationTest(unittest.TestCase):
 
     @patch.object(config_module.AutoConfig, "from_pretrained")
+    def test_root_quantization_config_is_forwarded_to_text_config(
+        self, from_pretrained
+    ):
+        config = qwen_config()
+        config.quantization_config = {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        }
+        from_pretrained.return_value = config
+        with patch("torch.cuda.get_device_capability", return_value=(8, 9)):
+            model_config = ModelConfig(
+                "Qwen/Qwen3.8-27B-FP8",
+                download_dir=None,
+                use_np_weights=False,
+                use_dummy_weights=False,
+                dtype="auto",
+                seed=42,
+            )
+
+        self.assertIs(
+            model_config.architecture.text_config.quantization_config,
+            config.quantization_config,
+        )
+
+    @patch.object(config_module.AutoConfig, "from_pretrained")
     def test_model_config_exposes_normalized_architecture(self, from_pretrained):
         from_pretrained.return_value = qwen_config()
         with patch("torch.cuda.get_device_capability", return_value=(8, 9)):

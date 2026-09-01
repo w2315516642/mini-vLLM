@@ -26,6 +26,23 @@ class ModelConfig:
 
         self.hf_config: PretrainedConfig = AutoConfig.from_pretrained(model)
         self.architecture = ModelArchitecture.from_hf_config(self.hf_config)
+        quantization_config = getattr(
+            self.hf_config, "quantization_config", None
+        )
+        if (
+            quantization_config is not None
+            and getattr(
+                self.architecture.text_config,
+                "quantization_config",
+                None,
+            )
+            is None
+        ):
+            # The multimodal root owns quantization metadata, but the model
+            # loader constructs the language backbone from text_config.
+            self.architecture.text_config.quantization_config = (
+                quantization_config
+            )
         self.dtype = _get_and_verify_dtype(self.architecture.text_config, dtype)
 
     def verify_with_parallel_config(

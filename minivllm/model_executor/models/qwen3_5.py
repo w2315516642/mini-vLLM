@@ -35,12 +35,17 @@ from minivllm.model_executor.layers.gated_delta_net_cuda import (
 from minivllm.model_executor.layers.layer_norm import Qwen3_5RMSNorm
 from minivllm.model_executor.layers.sampler import Sampler
 from minivllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from minivllm.model_executor.parallel_utils.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+)
+from minivllm.model_executor.weight_utils import (
+    hf_model_weights_iterator,
+    load_tensor_parallel_weights,
 )
 from minivllm.sequence import SequenceOutputs
 from minivllm.worker.hybrid_cache import HybridCache
@@ -98,6 +103,68 @@ def _load_qkv_gate_weight(
     param_slice.copy_(cur_tp_weight)
 
 
+def _load_qkv_gate_scale(
+    param: torch.Tensor,
+    loaded_scale: torch.Tensor,
+    shard_id: str,
+    tensor_model_parallel_rank: int,
+    q_size: int,
+    kv_size: int,
+    block_n: int,
+) -> None:
+    """Load block-row scales for one Q/K/V source into packed local scales."""
+    if shard_id not in ("q", "k", "v"):
+        raise ValueError(f"Unknown QKV checkpoint shard {shard_id!r}")
+    local_rows = {"q": 2 * q_size, "k": kv_size, "v": kv_size}
+    local_scale_rows = {
+        name: (rows + block_n - 1) // block_n
+        for name, rows in local_rows.items()
+    }
+    if sum(local_scale_rows.values()) != param.shape[0]:
+        raise ValueError(
+            "Packed QKV segments must align to FP8 output block boundaries"
+        )
+    shard_order = ("q", "k", "v")
+    shard_rows = local_scale_rows[shard_id]
+    offset = sum(
+        local_scale_rows[name]
+        for name in shard_order[:shard_order.index(shard_id)]
+    )
+    current = loaded_scale[
+        shard_rows * tensor_model_parallel_rank:
+        shard_rows * (tensor_model_parallel_rank + 1)
+    ]
+    target = param.data[offset : offset + shard_rows]
+    if target.shape != current.shape:
+        raise ValueError(
+            f"Scale slice shape {target.shape} does not match {current.shape}"
+        )
+    target.copy_(current)
+
+
+def _load_merged_column_shard(
+    param: torch.Tensor,
+    loaded_value: torch.Tensor,
+    shard_idx: int,
+    tensor_model_parallel_rank: int,
+) -> None:
+    """Load one of two equal global projections into a local packed tensor."""
+    if shard_idx not in (0, 1) or param.shape[0] % 2 != 0:
+        raise ValueError("merged column parameter must contain two equal shards")
+    shard_size = param.shape[0] // 2
+    current = loaded_value[
+        shard_size * tensor_model_parallel_rank:
+        shard_size * (tensor_model_parallel_rank + 1)
+    ]
+    target = param.data[shard_idx * shard_size:(shard_idx + 1) * shard_size]
+    if target.shape != current.shape:
+        raise ValueError(
+            f"Merged parameter slice shape {target.shape} does not match "
+            f"checkpoint shard shape {current.shape}"
+        )
+    target.copy_(current)
+
+
 class Qwen3_5Attention(nn.Module):
     """Gated full-attention layer shared by Qwen3.5 and Qwen3.8."""
 
@@ -121,6 +188,7 @@ class Qwen3_5Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
+        quant_config = getattr(config, "quantization_config", None)
 
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
@@ -136,6 +204,7 @@ class Qwen3_5Attention(nn.Module):
             bias=False,
             gather_output=False,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -143,6 +212,7 @@ class Qwen3_5Attention(nn.Module):
             bias=False,
             input_is_parallel=True,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.q_norm = Qwen3_5RMSNorm(
             self.head_dim,
@@ -257,12 +327,14 @@ class Qwen3_5MLP(nn.Module):
         super().__init__()
         if config.hidden_act not in ("silu", "swish"):
             raise ValueError("Qwen MLP requires the SiLU activation")
+        quant_config = getattr(config, "quantization_config", None)
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
             2 * config.intermediate_size,
             bias=False,
             gather_output=False,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -270,6 +342,7 @@ class Qwen3_5MLP(nn.Module):
             bias=False,
             input_is_parallel=True,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.act_fn = SiluAndMul()
 
@@ -303,6 +376,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
+        quant_config = getattr(config, "quantization_config", None)
 
         self.in_proj_qkv = ColumnParallelLinear(
             self.hidden_size,
@@ -310,6 +384,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
             gather_output=False,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.in_proj_z = ColumnParallelLinear(
             self.hidden_size,
@@ -317,6 +392,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
             gather_output=False,
             perform_initialization=False,
+            quant_config=quant_config,
         )
         self.in_proj_b = ColumnParallelLinear(
             self.hidden_size,
@@ -349,6 +425,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
             input_is_parallel=True,
             perform_initialization=False,
+            quant_config=quant_config,
         )
 
     def _empty_state(
@@ -680,9 +757,157 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         cache_dir: Optional[str] = None,
         use_np_cache: bool = False,
     ) -> None:
-        raise NotImplementedError(
-            "Qwen checkpoint loading is implemented in the safetensors/FP8 stage"
+        tensor_model_parallel_rank = get_tensor_model_parallel_rank()
+        tensor_model_parallel_world_size = (
+            get_tensor_model_parallel_world_size()
         )
+        q_size = (
+            self.config.num_attention_heads
+            // tensor_model_parallel_world_size
+            * self.config.head_dim
+        )
+        kv_size = (
+            self.config.num_key_value_heads
+            // tensor_model_parallel_world_size
+            * self.config.head_dim
+        )
+        quant_config = getattr(self.config, "quantization_config", None)
+        if isinstance(quant_config, dict):
+            weight_block_size = quant_config.get("weight_block_size")
+        else:
+            weight_block_size = getattr(
+                quant_config, "weight_block_size", None
+            )
+        block_n = weight_block_size[0] if weight_block_size else None
+
+        state_dict = self.state_dict()
+        column_parallel_weights = [
+            "embed_tokens.weight",
+            "lm_head.weight",
+            "qkv_gate_proj.weight",
+            "gate_up_proj.weight",
+            "in_proj_qkv.weight",
+            "in_proj_z.weight",
+            "in_proj_a.weight",
+            "in_proj_b.weight",
+        ]
+        row_parallel_weights = [
+            "self_attn.o_proj.weight",
+            "linear_attn.out_proj.weight",
+            "mlp.down_proj.weight",
+        ]
+
+        for checkpoint_name, loaded_value in hf_model_weights_iterator(
+            model_name_or_path,
+            cache_dir,
+            use_np_cache,
+        ):
+            if checkpoint_name.startswith("model.language_model."):
+                name = "model." + checkpoint_name.removeprefix(
+                    "model.language_model."
+                )
+            elif checkpoint_name.startswith("language_model."):
+                name = "model." + checkpoint_name.removeprefix(
+                    "language_model."
+                )
+            else:
+                name = checkpoint_name
+
+            # Vision and MTP modules are loaded by their own stages. Keeping
+            # these prefixes explicit prevents a changed text key from being
+            # silently ignored.
+            if name.startswith(("model.visual.", "model.vision_tower.", "mtp.")):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            attention_shards = (
+                (".q_proj.", "q"),
+                (".k_proj.", "k"),
+                (".v_proj.", "v"),
+            )
+            attention_match = next(
+                (
+                    (source, shard_id)
+                    for source, shard_id in attention_shards
+                    if source in name
+                ),
+                None,
+            )
+            if attention_match is not None:
+                source, shard_id = attention_match
+                target_name = name.replace(source, ".qkv_gate_proj.")
+                try:
+                    param = state_dict[target_name]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"No target parameter for checkpoint weight {name}"
+                    ) from exc
+                if name.endswith("weight_scale_inv"):
+                    if block_n is None:
+                        raise ValueError(
+                            "FP8 QKV scales require weight_block_size"
+                        )
+                    _load_qkv_gate_scale(
+                        param,
+                        loaded_value,
+                        shard_id,
+                        tensor_model_parallel_rank,
+                        q_size,
+                        kv_size,
+                        block_n,
+                    )
+                else:
+                    _load_qkv_gate_weight(
+                        param,
+                        loaded_value,
+                        shard_id,
+                        tensor_model_parallel_rank,
+                        q_size,
+                        kv_size,
+                    )
+                continue
+
+            mlp_shards = ((".gate_proj.", 0), (".up_proj.", 1))
+            mlp_match = next(
+                (
+                    (source, shard_idx)
+                    for source, shard_idx in mlp_shards
+                    if source in name
+                ),
+                None,
+            )
+            if mlp_match is not None:
+                source, shard_idx = mlp_match
+                target_name = name.replace(source, ".gate_up_proj.")
+                try:
+                    param = state_dict[target_name]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"No target parameter for checkpoint weight {name}"
+                    ) from exc
+                _load_merged_column_shard(
+                    param,
+                    loaded_value,
+                    shard_idx,
+                    tensor_model_parallel_rank,
+                )
+                continue
+
+            try:
+                param = state_dict[name]
+            except KeyError as exc:
+                raise KeyError(
+                    f"Unexpected Qwen checkpoint weight {checkpoint_name}"
+                ) from exc
+            load_tensor_parallel_weights(
+                param=param,
+                loaded_weight=loaded_value,
+                param_name=name,
+                column_parallel_weight_name=column_parallel_weights,
+                row_parallel_weight_name=row_parallel_weights,
+                tensor_model_parallel_rank=tensor_model_parallel_rank,
+            )
 
 
 __all__ = [
@@ -694,5 +919,7 @@ __all__ = [
     "Qwen3_5Model",
     "_causal_conv1d_prefill",
     "_load_qkv_gate_weight",
+    "_load_qkv_gate_scale",
+    "_load_merged_column_shard",
     "_split_q_gate_kv",
 ]

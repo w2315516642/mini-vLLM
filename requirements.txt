@@ -2,6 +2,7 @@ ninja  # For faster builds.
 psutil
 ray
 sentencepiece  # Required for LLaMA tokenizer.
+safetensors  # Streaming loader for sharded Hugging Face checkpoints.
 numpy
 torch >= 2.0.0
 transformers >= 4.28.0  # Required for LLaMA.

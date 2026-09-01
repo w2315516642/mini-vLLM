@@ -13,6 +13,7 @@ from minivllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from minivllm.model_executor.parallel_utils import parallel_state
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData
+from minivllm.model_executor.weight_utils import initialize_dummy_weights
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
     HybridCache,
@@ -211,6 +212,43 @@ class QwenHybridModelCudaTest(unittest.TestCase):
             rtol=3e-2,
             atol=3e-2,
         )
+
+    def test_fp8_weights_remain_compressed_during_hybrid_forward(self):
+        config = _config()
+        config.quantization_config = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [16, 16],
+        }
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float16)
+            model = Qwen3_5Model(config).cuda().eval()
+        finally:
+            torch.set_default_dtype(old_dtype)
+        initialize_dummy_weights(model)
+        cache = _hybrid_cache(config, _kv_cache(torch.float16))
+        tokens = torch.tensor(
+            [3, 5, 7, 9, 0, 0, 0, 0], device="cuda"
+        )
+        positions = torch.tensor(
+            [0, 1, 2, 3, 0, 0, 0, 0], device="cuda"
+        )
+
+        with torch.inference_mode():
+            output = model(
+                tokens,
+                positions,
+                cache,
+                _metadata(4, 0, is_prompt=True, state_cache=cache),
+                None,
+            )
+
+        self.assertEqual(
+            model.layers[1].self_attn.qkv_gate_proj.weight.dtype,
+            torch.float8_e4m3fn,
+        )
+        self.assertTrue(torch.isfinite(output[:4]).all())
 
 
 if __name__ == "__main__":

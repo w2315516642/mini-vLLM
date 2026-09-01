@@ -6,6 +6,7 @@ from typing import Iterable, List, Optional, Tuple
 
 from huggingface_hub import snapshot_download
 import numpy as np
+from safetensors import safe_open
 import torch
 from tqdm.auto import tqdm
 
@@ -23,6 +24,7 @@ def hf_model_weights_iterator(
     # Prepare file lock directory to prevent multiple processes from
     # downloading the same model weights at the same time.
     lock_dir = cache_dir if cache_dir is not None else "/tmp"
+    os.makedirs(lock_dir, exist_ok=True)
     lock_file_name = model_name_or_path.replace("/", "-") + ".lock"
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name))
 
@@ -31,18 +33,40 @@ def hf_model_weights_iterator(
         with lock:
             hf_loader = snapshot_download(
                 model_name_or_path,
-                allow_patterns="*.bin",
+                allow_patterns=["*.safetensors", "*.json", "*.bin"],
                 cache_dir=cache_dir,
                 tqdm_class=Disabledtqdm)
     else:
         hf_loader = model_name_or_path
     
-    hf_bin_files = glob.glob(os.path.join(hf_loader, "*.bin"))
+    hf_safetensor_files = sorted(
+        glob.glob(os.path.join(hf_loader, "*.safetensors"))
+    )
+    hf_bin_files = sorted(glob.glob(os.path.join(hf_loader, "*.bin")))
+
+    # Prefer safetensors when a repository publishes both formats. Opening one
+    # shard at a time avoids materializing a second copy of a large checkpoint.
+    if hf_safetensor_files:
+        if use_np_cache:
+            raise ValueError(
+                "NumPy weight caching is not supported for safetensors "
+                "checkpoints"
+            )
+        for safetensor_file in hf_safetensor_files:
+            with safe_open(safetensor_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
+        return
+
+    if not hf_bin_files:
+        raise RuntimeError(
+            f"No .safetensors or .bin weights found in {hf_loader}"
+        )
 
     if use_np_cache:
         # Convert the model weights from torch tensors to numpy arrays for
         # faster loading.
-        np_folder = os.path.join(hf_folder, "np")
+        np_folder = os.path.join(hf_loader, "np")
         os.makedirs(np_folder, exist_ok=True)
         weight_names_file = os.path.join(np_folder, "weight_names.json")
         with lock:
@@ -114,5 +138,20 @@ def initialize_dummy_weights(
     forward pass. We empirically found that initializing the weights with
     values between -1e-3 and 1e-3 works well for most models. (by original author)
     """
-    for param in model.state_dict().values():
-        param.data.uniform_(low, high)
+    float8_dtypes = {
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e5m2", None),
+        )
+        if dtype is not None
+    }
+    for name, param in model.state_dict().items():
+        if name.endswith("weight_scale_inv"):
+            param.data.fill_(1.0)
+        elif param.dtype in float8_dtypes:
+            initialized = torch.empty_like(param, dtype=torch.float32)
+            initialized.uniform_(low, high)
+            param.data.copy_(initialized.to(param.dtype))
+        elif param.is_floating_point():
+            param.data.uniform_(low, high)
