@@ -1,10 +1,11 @@
-from typing import List, Optional, Union
+from typing import Any, List, Mapping, Optional, Sequence, Union
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from minivllm.engine.arg_utils import EngineArgs
 from minivllm.engine.llm_engine import LLMEngine
+from minivllm.multimodal import MultiModalInputs
 from minivllm.outputs import RequestOutput
 from minivllm.sampling_params import SamplingParams
 from minivllm.utils import Counter
@@ -54,11 +55,25 @@ class LLM:
         )
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_conuter = Counter()
+        self._processor = None
 
     def get_tokenizer(
         self,
     ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
         return self.llm_engine.tokenizer
+
+    def get_processor(self):
+        """Lazily load the model processor used by image/video requests."""
+        if not self.llm_engine.model_config.is_multimodal:
+            raise ValueError("The selected model does not support vision inputs")
+        if self._processor is None:
+            from transformers import AutoProcessor
+
+            self._processor = AutoProcessor.from_pretrained(
+                self.llm_engine.model_config.model,
+                cache_dir=self.llm_engine.model_config.download_dir,
+            )
+        return self._processor
     
     def generate(
         self,
@@ -66,6 +81,9 @@ class LLM:
         sampling_params: Optional[SamplingParams] = None,
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
+        multi_modal_inputs: Optional[
+            List[Union[MultiModalInputs, Mapping[str, Any]]]
+        ] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -85,7 +103,11 @@ class LLM:
             A list of `RequestOutput` objects containing the generated
             completions in the same order as the input prompts.
         """
-        if prompts is None and prompt_token_ids is None:
+        if (
+            prompts is None
+            and prompt_token_ids is None
+            and multi_modal_inputs is None
+        ):
             raise ValueError(
                 "Either prompts or prompt_token_ids must be provided."
             )
@@ -98,31 +120,103 @@ class LLM:
                 )
         if sampling_params is None:
             # Use default samping params.
-            sampling_params = SamplingParams
+            sampling_params = SamplingParams()
+
+        if multi_modal_inputs is not None:
+            expected = (
+                len(prompts)
+                if prompts is not None
+                else len(prompt_token_ids)
+                if prompt_token_ids is not None
+                else len(multi_modal_inputs)
+            )
+            if len(multi_modal_inputs) != expected:
+                raise ValueError(
+                    "multi_modal_inputs must contain one item per prompt"
+                )
 
         # Add requests to the engine.
         if prompts is not None:
             num_requests = len(prompts)
-        else:
+        elif prompt_token_ids is not None:
             num_requests = len(prompt_token_ids)
+        else:
+            num_requests = len(multi_modal_inputs)
         for i in range(num_requests):
             prompt = prompts[i] if prompts is not None else None
             if prompt_token_ids is None:
                 token_ids = None
             else:
                 token_ids = prompt_token_ids[i]
-            self._add_request(prompt, sampling_params, token_ids)
+            request_inputs = None
+            if multi_modal_inputs is not None:
+                request_inputs = multi_modal_inputs[i]
+                if isinstance(request_inputs, Mapping):
+                    processed_ids, request_inputs = (
+                        MultiModalInputs.from_processor_output(request_inputs)
+                    )
+                    if token_ids is not None and tuple(token_ids) != processed_ids:
+                        raise ValueError(
+                            "prompt_token_ids do not match processor input_ids"
+                        )
+                    token_ids = list(processed_ids)
+            self._add_request(
+                prompt,
+                sampling_params,
+                token_ids,
+                request_inputs,
+            )
         return self._run_engine(use_tqdm)
+
+    def chat(
+        self,
+        messages: Union[
+            Sequence[Mapping[str, Any]],
+            Sequence[Sequence[Mapping[str, Any]]],
+        ],
+        sampling_params: Optional[SamplingParams] = None,
+        enable_thinking: bool = True,
+        use_tqdm: bool = True,
+    ) -> List[RequestOutput]:
+        """Run Qwen processor chat templates for image and video messages."""
+        conversations = list(messages)
+        if not conversations:
+            return []
+        if isinstance(conversations[0], Mapping):
+            conversations = [conversations]
+        processor = self.get_processor()
+        processed = [
+            processor.apply_chat_template(
+                conversation,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                enable_thinking=enable_thinking,
+            )
+            for conversation in conversations
+        ]
+        return self.generate(
+            sampling_params=sampling_params,
+            multi_modal_inputs=processed,
+            use_tqdm=use_tqdm,
+        )
 
     def _add_request(
         self,
         prompt: Optional[str],
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
+        multi_modal_inputs: Optional[MultiModalInputs] = None,
     ) -> None:
         request_id = str(next(self.request_conuter))
         self.llm_engine.add_request(
-            request_id, prompt, sampling_params, prompt_token_ids)
+            request_id,
+            prompt,
+            sampling_params,
+            prompt_token_ids,
+            multi_modal_inputs=multi_modal_inputs,
+        )
         
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.

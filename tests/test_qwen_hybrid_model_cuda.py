@@ -8,6 +8,7 @@ from minivllm.configs.model_architecture import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
+from minivllm.multimodal import MultiModalInputs
 from minivllm.model_executor.input_metadata import InputMetadata
 from minivllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
@@ -16,11 +17,13 @@ from minivllm.model_executor.models.qwen3_5 import (
 from minivllm.model_executor.parallel_utils import parallel_state
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData
+from minivllm.sequence import SequenceGroupMetadata
 from minivllm.model_executor.weight_utils import initialize_dummy_weights
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
     HybridCache,
 )
+from minivllm.worker.worker import Worker
 
 
 RUN_CUDA_TESTS = (
@@ -53,6 +56,29 @@ def _config():
         mtp_use_dedicated_embeddings=False,
         eos_token_id=127,
     )
+
+
+def _multimodal_config():
+    config = _config()
+    config.rope_parameters = {
+        "rope_theta": 10_000.0,
+        "mrope_section": [6, 5, 5],
+    }
+    config.vision_config = SimpleNamespace(
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        in_channels=3,
+        patch_size=2,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=128,
+        num_position_embeddings=16,
+        depth=2,
+    )
+    config.image_token_id = 120
+    config.video_token_id = 121
+    return config
 
 
 def _kv_cache(dtype):
@@ -412,6 +438,118 @@ class QwenHybridModelCudaTest(unittest.TestCase):
         self.assertIn(verified.num_computed_tokens, (1, 2))
         self.assertIn(len(verified.output_token_ids), (1, 2))
         self.assertIsNotNone(verified.draft_token_id)
+
+    def test_image_and_video_features_flow_through_hybrid_prefill(self):
+        torch.manual_seed(127)
+        config = _multimodal_config()
+        model = Qwen3_5ForConditionalGeneration(
+            config
+        ).cuda().half().eval()
+        for parameter in model.parameters():
+            if parameter.numel():
+                torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+        cache = _hybrid_cache(config, _kv_cache(torch.float16))
+        prompt = [3, 120, 4, 121, 5, 121, 6]
+        multimodal = MultiModalInputs(
+            token_type_ids=(0, 1, 0, 2, 0, 2, 0),
+            pixel_values=torch.randn(4, 24),
+            image_grid_thw=((1, 2, 2),),
+            pixel_values_videos=torch.randn(8, 24),
+            video_grid_thw=((2, 2, 2),),
+        ).with_positions(prompt, spatial_merge_size=2)
+        positions = torch.zeros(3, 8, dtype=torch.long, device="cuda")
+        positions[:, :7] = torch.tensor(
+            multimodal.position_ids, dtype=torch.long, device="cuda"
+        )
+        metadata = InputMetadata(
+            seq_groups=[([10], SamplingParams(temperature=0.0))],
+            seq_data={10: SequenceData(prompt)},
+            prompt_lens=[7],
+            slot_mapping=torch.arange(7, dtype=torch.int32, device="cuda"),
+            context_lens=torch.empty(0, dtype=torch.int32, device="cuda"),
+            max_context_len=0,
+            block_tables=torch.empty((0, 0), dtype=torch.int32, device="cuda"),
+            fresh_prompt_lens=[7],
+            prompt_seq_ids=[10],
+            multimodal_inputs={10: multimodal},
+            multimodal_token_maps=[
+                (1, 10, 1, 0),
+                (3, 10, 2, 0),
+                (5, 10, 2, 1),
+            ],
+        )
+        metadata.state_slot_mapping = cache.acquire([10])
+
+        with torch.inference_mode():
+            output = model(
+                torch.tensor(prompt + [0], device="cuda"),
+                positions,
+                cache,
+                metadata,
+                None,
+            )
+
+        self.assertIn(10, output)
+        self.assertIn(10, model._multimodal_feature_cache)
+        cached = model._multimodal_feature_cache[10]
+        self.assertEqual(cached[1].shape, (1, 128))
+        self.assertEqual(cached[2].shape, (2, 128))
+
+    def test_chunked_visual_feature_offsets_and_decode_positions(self):
+        prompt = [3, 120, 120, 120, 120, 4]
+        multimodal = MultiModalInputs(
+            token_type_ids=(0, 1, 1, 1, 1, 0),
+            pixel_values=torch.randn(16, 24),
+            image_grid_thw=((1, 4, 4),),
+        ).with_positions(prompt, spatial_merge_size=2)
+        worker = object.__new__(Worker)
+        worker.block_size = 8
+        worker.scheduler_config = SimpleNamespace(num_speculative_tokens=0)
+
+        second_chunk = SequenceGroupMetadata(
+            request_id="image",
+            is_prompt=True,
+            seq_data={10: SequenceData(prompt)},
+            sampling_params=SamplingParams(temperature=0.0),
+            block_tables={10: [0]},
+            num_computed_tokens={10: 3},
+            num_scheduled_tokens={10: 3},
+            multi_modal_inputs=multimodal,
+        )
+        _, positions, metadata = worker._prepare_inputs([second_chunk])
+
+        self.assertEqual(positions.shape, (3, 8))
+        self.assertEqual(
+            metadata.multimodal_token_maps,
+            [(0, 10, 1, 2), (1, 10, 1, 3)],
+        )
+        self.assertEqual(
+            positions[:, :3].cpu().tolist(),
+            [
+                [1, 1, 3],
+                [2, 2, 3],
+                [1, 2, 3],
+            ],
+        )
+
+        seq_data = SequenceData(prompt)
+        seq_data.append_token_id(7, 0.0)
+        decode = SequenceGroupMetadata(
+            request_id="image",
+            is_prompt=False,
+            seq_data={10: seq_data},
+            sampling_params=SamplingParams(temperature=0.0),
+            block_tables={10: [0]},
+            num_computed_tokens={10: 6},
+            num_scheduled_tokens={10: 1},
+            multi_modal_inputs=multimodal,
+        )
+        _, decode_positions, _ = worker._prepare_inputs([decode])
+        expected_decode_position = 6 + multimodal.rope_delta
+        self.assertEqual(
+            decode_positions[:, 0].cpu().tolist(),
+            [expected_decode_position] * 3,
+        )
 
 
 if __name__ == "__main__":

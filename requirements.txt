@@ -5,7 +5,7 @@ sentencepiece  # Required for LLaMA tokenizer.
 safetensors  # Streaming loader for sharded Hugging Face checkpoints.
 numpy
 torch >= 2.0.0
-transformers >= 4.28.0  # Required for LLaMA.
+transformers >= 5.7.0  # Native Qwen3.5 text, image, and video processor support.
 xformers >= 0.0.19
 fastapi
 uvicorn

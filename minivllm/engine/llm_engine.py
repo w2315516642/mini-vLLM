@@ -7,6 +7,7 @@ from loguru import logger
 from minivllm.configs import (
     ModelConfig, ParallelConfig, CacheConfig, SchedulerConfig)
 from minivllm.kv_cache.scheduler import Scheduler
+from minivllm.multimodal import MultiModalInputs
 from minivllm.engine.arg_utils import EngineArgs
 from minivllm.engine.ray_utils import DeviceID, ray, initialize_cluster
 from minivllm.engine.tokenizer_utils import detokenize_incrementally, get_tokenizer
@@ -170,7 +171,8 @@ class LLMEngine:
         prompt: Optional[str],
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]] = None,
-        arrival_time: Optional[float] = None 
+        arrival_time: Optional[float] = None,
+        multi_modal_inputs: Optional[MultiModalInputs] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -193,6 +195,15 @@ class LLMEngine:
         if prompt_token_ids is None:
             assert prompt is not None
             prompt_token_ids = self.tokenizer.encode(prompt)
+        if multi_modal_inputs is not None:
+            if not self.model_config.is_multimodal:
+                raise ValueError(
+                    "Multimodal inputs require a model with vision_config"
+                )
+            multi_modal_inputs = multi_modal_inputs.with_positions(
+                prompt_token_ids,
+                self.model_config.spatial_merge_size,
+            )
 
         # Create the sequences.
         block_size = self.cache_config.block_size
@@ -211,7 +222,12 @@ class LLMEngine:
         
         # Create the sequence group.
         seq_group = SequenceGroup(
-            request_id, seqs, sampling_params, arrival_time)
+            request_id,
+            seqs,
+            sampling_params,
+            arrival_time,
+            multi_modal_inputs=multi_modal_inputs,
+        )
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)

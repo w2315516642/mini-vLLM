@@ -3,6 +3,7 @@ from enum import Enum, auto
 from typing import Optional, List, Dict, Union
 
 from minivllm.kv_cache.block import LogicalTokenBlock
+from minivllm.multimodal import MultiModalInputs
 from minivllm.sampling_params import SamplingParams
 from minivllm.utils import BlockHash, BlockHasher
 
@@ -193,11 +194,13 @@ class SequenceGroup:
         seqs: List[Sequence],
         sampling_params: SamplingParams,
         arrival_time: float,
+        multi_modal_inputs: Optional[MultiModalInputs] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
+        self.multi_modal_inputs = multi_modal_inputs
 
 
     def get_seqs(
@@ -238,6 +241,7 @@ class SequenceGroupMetadata:
         do_sample: bool = True,
         is_speculative: bool = False,
         speculative_token_ids: Optional[Dict[int, int]] = None,
+        multi_modal_inputs: Optional[MultiModalInputs] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
@@ -256,6 +260,7 @@ class SequenceGroupMetadata:
         self.do_sample = do_sample
         self.is_speculative = is_speculative
         self.speculative_token_ids = speculative_token_ids or {}
+        self.multi_modal_inputs = multi_modal_inputs
         
 
 class SequenceOutputs:

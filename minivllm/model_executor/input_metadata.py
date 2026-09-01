@@ -5,6 +5,7 @@ import torch
 from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 
 from minivllm.sampling_params import SamplingParams
+from minivllm.multimodal import MultiModalInputs
 from minivllm.sequence import SequenceData
 
 class InputMetadata:
@@ -40,6 +41,10 @@ class InputMetadata:
         speculative_hidden_indices: Optional[List[Tuple[int, int]]] = None,
         enable_mtp: bool = False,
         speculative_sampling_params: Optional[List[SamplingParams]] = None,
+        multimodal_inputs: Optional[Dict[int, MultiModalInputs]] = None,
+        multimodal_token_maps: Optional[
+            List[Tuple[int, int, int, int]]
+        ] = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -80,6 +85,10 @@ class InputMetadata:
         self.speculative_hidden_indices = speculative_hidden_indices or []
         self.enable_mtp = enable_mtp
         self.speculative_sampling_params = speculative_sampling_params or []
+        self.multimodal_inputs = multimodal_inputs or {}
+        # packed token index, sequence id, modality (1=image/2=video),
+        # modality-local feature index.
+        self.multimodal_token_maps = multimodal_token_maps or []
         if not (
             len(self.speculative_seq_ids)
             == len(self.speculative_token_ids)

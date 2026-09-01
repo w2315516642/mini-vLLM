@@ -384,6 +384,12 @@ class Scheduler:
                 num_scheduled_tokens[seq_id] = (
                     scheduler_outputs.num_scheduled_tokens[seq_id])
             
+            multi_modal_inputs = seq_group.multi_modal_inputs
+            if (
+                multi_modal_inputs is not None
+                and min(num_computed_tokens.values()) > 0
+            ):
+                multi_modal_inputs = multi_modal_inputs.positions_only()
             seq_group_metadata = SequenceGroupMetadata(
                 request_id=seq_group.request_id,
                 is_prompt=is_prompt,
@@ -402,6 +408,7 @@ class Scheduler:
                     for seq in scheduled_seqs
                     if seq.speculative_token_id is not None
                 },
+                multi_modal_inputs=multi_modal_inputs,
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs

@@ -195,6 +195,41 @@ class Worker:
         speculative_token_ids: List[int] = []
         speculative_hidden_indices: List[Tuple[int, int]] = []
         speculative_sampling_params: List[SamplingParams] = []
+        multimodal_inputs = {}
+        multimodal_token_maps: List[Tuple[int, int, int, int]] = []
+        has_multimodal_positions = any(
+            metadata.multi_modal_inputs is not None
+            for metadata in seq_group_metadata_list
+        )
+        input_positions_3d: List[List[int]] = [[], [], []]
+
+        def append_positions(
+            metadata: SequenceGroupMetadata,
+            positions: range,
+        ) -> None:
+            multimodal = metadata.multi_modal_inputs
+            for position in positions:
+                if multimodal is None:
+                    position_values = (position, position, position)
+                elif position < len(multimodal.token_type_ids):
+                    assert multimodal.position_ids is not None
+                    position_values = tuple(
+                        row[position] for row in multimodal.position_ids
+                    )
+                else:
+                    decode_position = position + multimodal.rope_delta
+                    position_values = (
+                        decode_position,
+                        decode_position,
+                        decode_position,
+                    )
+                if has_multimodal_positions:
+                    for row, value in zip(
+                        input_positions_3d, position_values
+                    ):
+                        row.append(value)
+                else:
+                    input_positions.append(position)
 
         prompt_metadata = [
             metadata for metadata in seq_group_metadata_list
@@ -244,8 +279,35 @@ class Worker:
                 )
             prompt_seq_ids.append(seq_id)
             prompt_lens.append(query_len)
+            packed_start = len(input_token_ids)
             input_token_ids.extend(query_token_ids)
-            input_positions.extend(range(start, end))
+            append_positions(metadata, range(start, end))
+
+            multimodal = metadata.multi_modal_inputs
+            if multimodal is not None:
+                multimodal_inputs[seq_id] = multimodal
+                image_index = sum(
+                    token_type == 1
+                    for token_type in multimodal.token_type_ids[:start]
+                )
+                video_index = sum(
+                    token_type == 2
+                    for token_type in multimodal.token_type_ids[:start]
+                )
+                for offset, position in enumerate(range(start, end)):
+                    if position >= len(multimodal.token_type_ids):
+                        continue
+                    token_type = multimodal.token_type_ids[position]
+                    if token_type == 1:
+                        multimodal_token_maps.append(
+                            (packed_start + offset, seq_id, 1, image_index)
+                        )
+                        image_index += 1
+                    elif token_type == 2:
+                        multimodal_token_maps.append(
+                            (packed_start + offset, seq_id, 2, video_index)
+                        )
+                        video_index += 1
 
             if metadata.block_tables is None:
                 # Cache profiling does not allocate physical blocks.
@@ -286,7 +348,9 @@ class Worker:
                 query_len = metadata.num_scheduled_tokens[seq_id]
                 assert query_len == 1 and position + 1 == seq_data.get_len()
                 input_token_ids.append(seq_data.get_token_ids()[position])
-                input_positions.append(position)
+                append_positions(metadata, range(position, position + 1))
+                if metadata.multi_modal_inputs is not None:
+                    multimodal_inputs[seq_id] = metadata.multi_modal_inputs
 
                 block_table = metadata.block_tables[seq_id]
                 generation_block_tables.append(block_table)
@@ -296,11 +360,23 @@ class Worker:
         
         # Padding to multiple of 8, used for Tensor Cores
         input_token_ids = _pad_to_alignment(input_token_ids, multiple_of=8)
-        input_positions = _pad_to_alignment(input_positions, multiple_of=8)
+        if has_multimodal_positions:
+            input_positions_3d = [
+                _pad_to_alignment(row, multiple_of=8)
+                for row in input_positions_3d
+            ]
+        else:
+            input_positions = _pad_to_alignment(
+                input_positions, multiple_of=8
+            )
 
         # Convert to tensor
         tokens_tensor = torch.as_tensor(input_token_ids, dtype=torch.long, device="cuda")
-        positions_tensor = torch.as_tensor(input_positions, dtype=torch.long, device="cuda")
+        positions_tensor = torch.as_tensor(
+            input_positions_3d if has_multimodal_positions else input_positions,
+            dtype=torch.long,
+            device="cuda",
+        )
         slot_mapping_tensor = torch.as_tensor(slot_mapping, dtype=torch.int, device="cuda")
         context_lens_tensor = torch.as_tensor(context_lens, dtype=torch.int, device="cuda")
         block_tables_tensor = _make_block_table_tensor(generation_block_tables)
@@ -350,6 +426,8 @@ class Worker:
                 == 1
             ),
             speculative_sampling_params=speculative_sampling_params,
+            multimodal_inputs=multimodal_inputs,
+            multimodal_token_maps=multimodal_token_maps,
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -434,6 +512,8 @@ class Worker:
         rejected = set(rejected_seq_ids)
         token_ids: List[int] = []
         positions: List[int] = []
+        positions_3d: List[List[int]] = [[], [], []]
+        has_multimodal_positions = False
         slot_mapping: List[int] = []
         block_tables: List[List[int]] = []
         seq_data: Dict[int, SequenceData] = {}
@@ -448,7 +528,20 @@ class Worker:
             position = metadata.num_computed_tokens[seq_id]
             block_table = metadata.block_tables[seq_id]
             token_ids.append(data.get_token_ids()[position])
+            multimodal = metadata.multi_modal_inputs
+            if multimodal is None:
+                position_values = (position, position, position)
+            else:
+                has_multimodal_positions = True
+                decode_position = position + multimodal.rope_delta
+                position_values = (
+                    decode_position,
+                    decode_position,
+                    decode_position,
+                )
             positions.append(position)
+            for row, value in zip(positions_3d, position_values):
+                row.append(value)
             slot_mapping.append(
                 _get_slot_id(block_table, position, self.block_size)
             )
@@ -458,7 +551,13 @@ class Worker:
 
         num_tokens = len(token_ids)
         padded_tokens = _pad_to_alignment(token_ids, multiple_of=8)
-        padded_positions = _pad_to_alignment(positions, multiple_of=8)
+        if has_multimodal_positions:
+            padded_positions = [
+                _pad_to_alignment(row, multiple_of=8)
+                for row in positions_3d
+            ]
+        else:
+            padded_positions = _pad_to_alignment(positions, multiple_of=8)
         device = torch.device("cuda")
         cu_seqlens = torch.arange(
             num_tokens + 1, dtype=torch.int32, device=device
@@ -511,6 +610,15 @@ class Worker:
         state_copies: Dict[int, int],
     ) -> None:
         """Apply scheduler lifecycle changes to persistent GDN states."""
+        copy_multimodal = getattr(self.model, "copy_multimodal_cache", None)
+        release_multimodal = getattr(
+            self.model, "release_multimodal_cache", None
+        )
+        if copy_multimodal is not None:
+            for child_seq_id, parent_seq_id in state_copies.items():
+                copy_multimodal(parent_seq_id, child_seq_id)
+        if release_multimodal is not None:
+            release_multimodal(seq_ids_to_release)
         if self.hybrid_cache is None:
             return
         # Beam children need the parent's post-forward state before either

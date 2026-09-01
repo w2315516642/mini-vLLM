@@ -21,7 +21,10 @@ from minivllm.model_executor.layers.activation import (
     SigmoidAndMul,
     SiluAndMul,
 )
-from minivllm.model_executor.layers.attention import PagedAttentionWithRoPE
+from minivllm.model_executor.layers.attention import (
+    PagedAttention,
+    PagedAttentionWithRoPE,
+)
 from minivllm.model_executor.layers.gated_delta_net import (
     GatedDeltaNetState,
     RMSNormGated,
@@ -48,10 +51,49 @@ from minivllm.model_executor.weight_utils import (
     hf_model_weights_iterator,
     load_tensor_parallel_weights,
 )
+from minivllm.model_executor.models.qwen3_5_vision import Qwen3_5VisionModel
 from minivllm.sequence import SequenceOutputs
 from minivllm.worker.hybrid_cache import HybridCache
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _apply_interleaved_mrope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    positions: torch.Tensor,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    mrope_section: Sequence[int],
+) -> None:
+    """Apply Qwen temporal/height/width RoPE to flat Q/K in place."""
+    if positions.ndim != 2 or positions.shape[0] != 3:
+        raise ValueError("Qwen M-RoPE positions must have shape [3, tokens]")
+    rotary_dim = cos_sin_cache.shape[1]
+    frequency_dim = rotary_dim // 2
+    if sum(mrope_section) != frequency_dim:
+        raise ValueError(
+            "mrope_section must sum to half the rotary dimension"
+        )
+    selected = cos_sin_cache[positions]
+    cos = selected[0, :, :frequency_dim].clone()
+    sin = selected[0, :, frequency_dim:].clone()
+    for dimension, offset in enumerate((1, 2), start=1):
+        indices = slice(offset, mrope_section[dimension] * 3, 3)
+        cos[:, indices] = selected[dimension, :, :frequency_dim][:, indices]
+        sin[:, indices] = selected[dimension, :, frequency_dim:][:, indices]
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
+    def rotate(tensor: torch.Tensor) -> None:
+        heads = tensor.view(tensor.shape[0], -1, head_dim)
+        first = heads[..., :frequency_dim].clone()
+        second = heads[..., frequency_dim:rotary_dim].clone()
+        heads[..., :frequency_dim] = first * cos - second * sin
+        heads[..., frequency_dim:rotary_dim] = second * cos + first * sin
+
+    rotate(query)
+    rotate(key)
 
 
 def _split_q_gate_kv(
@@ -285,9 +327,14 @@ class Qwen3_5Attention(nn.Module):
             eps=config.rms_norm_eps,
         )
         rope_theta = getattr(config, "rope_theta", None)
+        rope_parameters = getattr(config, "rope_parameters", {}) or {}
         if rope_theta is None:
-            rope_parameters = getattr(config, "rope_parameters", {}) or {}
             rope_theta = rope_parameters.get("rope_theta", 10_000.0)
+        self.mrope_section = tuple(
+            rope_parameters.get(
+                "mrope_section", (self.rotary_dim // 2, 0, 0)
+            )
+        )
         self.attn = PagedAttentionWithRoPE(
             self.num_heads,
             self.head_dim,
@@ -336,9 +383,38 @@ class Qwen3_5Attention(nn.Module):
             k_cache = v_cache = None
         else:
             k_cache, v_cache = kv_cache
-        attn_out = self.attn(
-            positions, q, k, v, k_cache, v_cache, input_metadata, cache_event
-        )
+        if positions.ndim == 2:
+            _apply_interleaved_mrope(
+                q,
+                k,
+                positions,
+                self.head_dim,
+                self.attn.cos_sin_cache,
+                self.mrope_section,
+            )
+            # RoPE is already applied above; call the cache/attention base
+            # implementation directly to avoid applying one-dimensional RoPE.
+            attn_out = PagedAttention.forward(
+                self.attn,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                input_metadata,
+                cache_event,
+            )
+        else:
+            attn_out = self.attn(
+                positions,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                input_metadata,
+                cache_event,
+            )
         gate_out = self.gate_fn(attn_out, gate)
         output, _ = self.o_proj(gate_out)
         return output
@@ -853,8 +929,13 @@ class Qwen3_5Model(nn.Module):
         | HybridCache,
         input_metadata: InputMetadata,
         cache_events: Optional[Sequence[Optional[torch.cuda.Event]]],
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = (
+            self.embed_tokens(input_ids)
+            if inputs_embeds is None
+            else inputs_embeds
+        )
         state_cache = kv_caches if isinstance(kv_caches, HybridCache) else None
         for layer_idx, layer in enumerate(self.layers):
             cache_event = None if cache_events is None else cache_events[layer_idx]
@@ -878,25 +959,136 @@ class Qwen3_5Model(nn.Module):
 
 
 class Qwen3_5ForConditionalGeneration(nn.Module):
-    """Text generation entry point selected by the multimodal architecture."""
+    """Qwen text generation with optional shared image/video vision tower."""
 
     def __init__(self, config) -> None:
         super().__init__()
-        self.config = config
-        self.model = Qwen3_5Model(config)
+        self.root_config = config
+        text_config = getattr(config, "text_config", config)
+        vision_config = getattr(config, "vision_config", None)
+        self.config = text_config
+        self.model = Qwen3_5Model(text_config)
+        self.visual = (
+            Qwen3_5VisionModel(vision_config)
+            if vision_config is not None
+            else None
+        )
+        if (
+            vision_config is not None
+            and vision_config.out_hidden_size != text_config.hidden_size
+        ):
+            raise ValueError(
+                "Vision out_hidden_size must equal text hidden_size"
+            )
+        self.image_token_id = getattr(config, "image_token_id", None)
+        self.video_token_id = getattr(config, "video_token_id", None)
+        self._multimodal_feature_cache: Dict[
+            int, Dict[int, torch.Tensor]
+        ] = {}
         self.lm_head = ColumnParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
+            text_config.hidden_size,
+            text_config.vocab_size,
             bias=False,
             gather_output=False,
             perform_initialization=False,
         )
-        self.sampler = Sampler(config.vocab_size)
+        self.sampler = Sampler(text_config.vocab_size)
         self.mtp = (
-            Qwen3_5MultiTokenPredictor(config)
-            if getattr(config, "mtp_num_hidden_layers", 0)
+            Qwen3_5MultiTokenPredictor(text_config)
+            if getattr(text_config, "mtp_num_hidden_layers", 0)
             else None
         )
+
+    def _encode_multimodal_inputs(
+        self,
+        seq_id: int,
+        input_metadata: InputMetadata,
+    ) -> Dict[int, torch.Tensor]:
+        cached = self._multimodal_feature_cache.get(seq_id)
+        if cached is not None:
+            return cached
+        if self.visual is None:
+            raise ValueError("Multimodal inputs require a loaded vision tower")
+        multimodal = input_metadata.multimodal_inputs[seq_id]
+        device = self.model.embed_tokens.weight.device
+        features: Dict[int, torch.Tensor] = {}
+        if multimodal.pixel_values is not None:
+            image_grid = torch.tensor(
+                multimodal.image_grid_thw,
+                dtype=torch.long,
+                device=device,
+            )
+            features[1] = self.visual(
+                multimodal.pixel_values.to(device=device), image_grid
+            )
+        if multimodal.pixel_values_videos is not None:
+            video_grid = torch.tensor(
+                multimodal.video_grid_thw,
+                dtype=torch.long,
+                device=device,
+            )
+            features[2] = self.visual(
+                multimodal.pixel_values_videos.to(device=device), video_grid
+            )
+        expected_counts = {
+            modality: multimodal.token_type_ids.count(modality)
+            for modality in (1, 2)
+        }
+        for modality, expected in expected_counts.items():
+            actual = features[modality].shape[0] if modality in features else 0
+            if actual != expected:
+                name = "Image" if modality == 1 else "Video"
+                raise ValueError(
+                    f"{name} features and placeholder tokens do not match: "
+                    f"features={actual}, tokens={expected}"
+                )
+        self._multimodal_feature_cache[seq_id] = features
+        return features
+
+    def _embed_inputs(
+        self,
+        input_ids: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        # The first prompt chunk carries the full processor output. Encode it
+        # eagerly so later chunks and decode steps only need position metadata.
+        for seq_id, multimodal in input_metadata.multimodal_inputs.items():
+            if (
+                multimodal.pixel_values is not None
+                or multimodal.pixel_values_videos is not None
+            ):
+                self._encode_multimodal_inputs(seq_id, input_metadata)
+        for packed_index, seq_id, modality, feature_index in (
+            input_metadata.multimodal_token_maps
+        ):
+            expected_token_id = (
+                self.image_token_id if modality == 1 else self.video_token_id
+            )
+            if (
+                expected_token_id is not None
+                and int(input_ids[packed_index]) != expected_token_id
+            ):
+                raise ValueError(
+                    "Multimodal token type does not match the configured "
+                    "image/video placeholder token"
+                )
+            features = self._encode_multimodal_inputs(
+                seq_id, input_metadata
+            )
+            inputs_embeds[packed_index] = features[modality][
+                feature_index
+            ].to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def copy_multimodal_cache(self, parent_seq_id: int, child_seq_id: int) -> None:
+        cached = self._multimodal_feature_cache.get(parent_seq_id)
+        if cached is not None:
+            self._multimodal_feature_cache[child_seq_id] = cached
+
+    def release_multimodal_cache(self, seq_ids: Sequence[int]) -> None:
+        for seq_id in seq_ids:
+            self._multimodal_feature_cache.pop(seq_id, None)
 
     def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden_states, self.lm_head.weight)
@@ -934,6 +1126,17 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             and sampling_params.presence_penalty == 0.0
             and sampling_params.frequency_penalty == 0.0
             and not sampling_params.stop
+        )
+
+    @staticmethod
+    def _position_at(
+        positions: torch.Tensor,
+        token_index: int,
+    ) -> torch.Tensor:
+        return (
+            positions[token_index]
+            if positions.ndim == 1
+            else positions[:, token_index]
         )
 
     def _verify_speculative_tokens(
@@ -976,7 +1179,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                         sampling_params.logprobs,
                     ))
                 selected_hidden = hidden_states[second_idx]
-                selected_position = positions[second_idx]
+                selected_position = self._position_at(positions, second_idx)
                 consumed_tokens = 2
             else:
                 token_ids = [target_token_id]
@@ -986,7 +1189,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                     sampling_params.logprobs,
                 )]
                 selected_hidden = hidden_states[first_idx]
-                selected_position = positions[first_idx]
+                selected_position = self._position_at(positions, first_idx)
                 consumed_tokens = 1
 
             output = SequenceOutputs(
@@ -1044,7 +1247,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                 contexts.append((
                     output,
                     hidden_states[hidden_idx],
-                    positions[hidden_idx],
+                    self._position_at(positions, hidden_idx),
                     sampling_params,
                 ))
         return contexts
@@ -1062,6 +1265,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         )
         target_hidden = torch.stack([context[1] for context in contexts])
         next_positions = torch.stack([context[2] for context in contexts]) + 1
+        if next_positions.ndim == 2:
+            next_positions = next_positions.transpose(0, 1).contiguous()
         mtp_hidden = self.mtp(
             self.model.embed_tokens(token_ids),
             next_positions,
@@ -1081,12 +1286,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[Sequence[Optional[torch.cuda.Event]]],
     ) -> Dict[int, SequenceOutputs]:
+        inputs_embeds = self._embed_inputs(input_ids, input_metadata)
         hidden_states = self.model(
             input_ids,
             positions,
             kv_caches,
             input_metadata,
             cache_events,
+            inputs_embeds=inputs_embeds,
         )
         outputs: Dict[int, SequenceOutputs] = {}
         proposal_contexts = []
@@ -1165,7 +1372,11 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             cache_dir,
             use_np_cache,
         ):
-            if checkpoint_name.startswith("model.language_model."):
+            if checkpoint_name.startswith("model.visual."):
+                name = "visual." + checkpoint_name.removeprefix(
+                    "model.visual."
+                )
+            elif checkpoint_name.startswith("model.language_model."):
                 name = "model." + checkpoint_name.removeprefix(
                     "model.language_model."
                 )
@@ -1176,10 +1387,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             else:
                 name = checkpoint_name
 
-            # Vision weights are loaded by the multimodal stage. MTP weights
-            # below intentionally share the text loader's packed TP rules.
-            if name.startswith(("model.visual.", "model.vision_tower.")):
-                continue
             if "rotary_emb.inv_freq" in name:
                 continue
 

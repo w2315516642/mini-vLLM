@@ -1,5 +1,19 @@
 # Qwen3.8 学习式适配记录
 
+## 参考分支完成记录
+
+> 本节只记录 `codex/qwen38-reference` 的完整参考实现，不改变下方学习分支的阶段状态。
+
+- `7ded811 实现混合注意力请求状态缓存`：为 Full Attention 与 Gated DeltaNet 建立统一的请求级状态缓存。
+- `79ed0cc 接通Qwen混合文本骨干推理链路`：接通 Qwen3.5-27B 对应的混合文本模型、门控全注意力与 DeltaNet 层。
+- `a57e32e 支持Qwen Safetensors与FP8块权重`：支持官方分片索引、packed 权重映射与 FP8 block scale。
+- `69a47bd 支持Qwen混合模型双卡张量并行`：补齐 Full Attention、DeltaNet、LM Head 和权重加载的 TP=2 路径。
+- `5d01222 实现Chunked Prefill与混合状态生命周期`：让 KV Cache、卷积状态和 recurrent state 能随分块预填充、抢占及复制正确推进。
+- `8de5d96 实现Qwen原生MTP-1推测解码`：加载官方 MTP 层，完成 draft、验证、拒绝回滚与状态重放。
+- 图像与视频阶段：实现共享视觉塔、图像/视频 patch 编码、视觉特征注入、M-RoPE、分块视觉特征缓存和 `chat(..., enable_thinking=...)` 接口。
+
+参考分支最终验证使用 WSL2 的 `mini-vllm` conda 环境：默认测试共 134 项，117 项执行通过、17 项按开关跳过；显式开启的 Qwen、GQA、GDN、MTP、图像和视频 CUDA 测试 17 项全部通过。当前机器没有下载完整 Qwen3.5-27B/FP8 checkpoint，因此最终验收覆盖 tiny model、官方实现数值对照和权重结构，但不包含真实 27B 长文本吞吐基准。
+
 ## 协作规则
 
 - 每个阶段由 Codex 完成外围脚手架、测试和接口说明。

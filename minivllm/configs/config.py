@@ -43,6 +43,19 @@ class ModelConfig:
             self.architecture.text_config.quantization_config = (
                 quantization_config
             )
+        # Keep the model-loader contract centered on normalized text_config,
+        # while carrying the small amount of root metadata required by Qwen's
+        # multimodal top-level module.
+        for field_name in (
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        ):
+            value = getattr(self.hf_config, field_name, None)
+            if value is not None:
+                setattr(self.architecture.text_config, field_name, value)
         self.dtype = _get_and_verify_dtype(self.architecture.text_config, dtype)
 
     def verify_with_parallel_config(
@@ -75,6 +88,17 @@ class ModelConfig:
         return self.architecture.get_num_layers(
             parallel_config.pipeline_parallel_size
         )
+
+    @property
+    def is_multimodal(self) -> bool:
+        return getattr(self.hf_config, "vision_config", None) is not None
+
+    @property
+    def spatial_merge_size(self) -> int:
+        vision_config = getattr(self.hf_config, "vision_config", None)
+        if vision_config is None:
+            raise ValueError("The selected model has no vision configuration")
+        return int(vision_config.spatial_merge_size)
 
 
 class CacheConfig:

@@ -330,6 +330,37 @@ class QwenSafetensorsLoaderTest(unittest.TestCase):
             targets["mtp.norm.weight"], torch.arange(4, dtype=torch.float32)
         )
 
+    def test_visual_weights_are_mapped_without_tensor_parallel_sharding(self):
+        qkv_weight = torch.arange(48, dtype=torch.float32).reshape(12, 4)
+        qkv_bias = torch.arange(12, dtype=torch.float32)
+        merger_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        checkpoint = {
+            "model.visual.blocks.0.attn.qkv.weight": qkv_weight,
+            "model.visual.blocks.0.attn.qkv.bias": qkv_bias,
+            "model.visual.merger.linear_fc2.weight": merger_weight,
+        }
+        targets = {
+            "visual.blocks.0.attn.qkv.weight": torch.zeros_like(qkv_weight),
+            "visual.blocks.0.attn.qkv.bias": torch.zeros_like(qkv_bias),
+            "visual.merger.linear_fc2.weight": torch.zeros_like(
+                merger_weight
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_file(checkpoint, Path(tmpdir) / "model.safetensors")
+            _QwenLoaderHarness(targets).load_weights(tmpdir)
+
+        torch.testing.assert_close(
+            targets["visual.blocks.0.attn.qkv.weight"], qkv_weight
+        )
+        torch.testing.assert_close(
+            targets["visual.blocks.0.attn.qkv.bias"], qkv_bias
+        )
+        torch.testing.assert_close(
+            targets["visual.merger.linear_fc2.weight"], merger_weight
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
