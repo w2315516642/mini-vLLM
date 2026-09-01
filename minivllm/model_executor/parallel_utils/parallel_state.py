@@ -199,7 +199,7 @@ class GraphAllReduce:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             torch.distributed.all_reduce(
-                self.buffer[num_tokens], group=self.group
+                self.buffer[:num_tokens], group=self.group
             )
         torch.cuda.synchronize()
         return graph

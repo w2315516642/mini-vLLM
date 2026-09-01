@@ -46,13 +46,35 @@ class GatedDeltaNetStateSpec:
     conv_kernel_size: int
 
     @classmethod
-    def from_text_config(cls, text_config) -> "GatedDeltaNetStateSpec":
-        num_key_heads = _positive_config_int(
+    def from_text_config(
+        cls,
+        text_config,
+        tensor_parallel_size: int = 1,
+    ) -> "GatedDeltaNetStateSpec":
+        if (
+            not isinstance(tensor_parallel_size, int)
+            or isinstance(tensor_parallel_size, bool)
+            or tensor_parallel_size <= 0
+        ):
+            raise ValueError("tensor_parallel_size must be a positive integer")
+        total_num_key_heads = _positive_config_int(
             text_config, "linear_num_key_heads"
         )
-        num_value_heads = _positive_config_int(
+        total_num_value_heads = _positive_config_int(
             text_config, "linear_num_value_heads"
         )
+        if total_num_key_heads % tensor_parallel_size != 0:
+            raise ValueError(
+                "linear_num_key_heads must be divisible by "
+                "tensor_parallel_size"
+            )
+        if total_num_value_heads % tensor_parallel_size != 0:
+            raise ValueError(
+                "linear_num_value_heads must be divisible by "
+                "tensor_parallel_size"
+            )
+        num_key_heads = total_num_key_heads // tensor_parallel_size
+        num_value_heads = total_num_value_heads // tensor_parallel_size
         if num_value_heads % num_key_heads != 0:
             raise ValueError(
                 "linear_num_value_heads must be divisible by "

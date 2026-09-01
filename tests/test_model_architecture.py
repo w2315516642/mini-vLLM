@@ -37,6 +37,8 @@ def qwen_config(**text_overrides):
         "num_attention_heads": 24,
         "num_key_value_heads": 4,
         "head_dim": 256,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
         "layer_types": layer_types,
         "dtype": torch.bfloat16,
     }
@@ -138,6 +140,13 @@ class ModelArchitectureTest(unittest.TestCase):
         architecture = ModelArchitecture.from_hf_config(qwen_config())
         with self.assertRaisesRegex(ValueError, "KV heads"):
             architecture.verify_parallelism(3, 1)
+
+    def test_parallelism_rejects_indivisible_linear_heads(self):
+        architecture = ModelArchitecture.from_hf_config(
+            qwen_config(linear_num_value_heads=47)
+        )
+        with self.assertRaisesRegex(ValueError, "linear_num_value_heads"):
+            architecture.verify_parallelism(2, 1)
 
     def test_parallelism_rejects_indivisible_layers(self):
         architecture = ModelArchitecture.from_hf_config(qwen_config())

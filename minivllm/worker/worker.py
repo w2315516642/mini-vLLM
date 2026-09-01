@@ -119,9 +119,21 @@ class Worker:
             self.parallel_config,
             self.scheduler_config.max_num_seqs,
         )
-        num_gpu_blocks = int((total_gpu_memory * gpu_memory_utilization
-                              - peak_memory - state_cache_size)
-                             // cache_block_size)
+        usable_cache_memory = (
+            total_gpu_memory * gpu_memory_utilization
+            - peak_memory
+            - state_cache_size
+        )
+        if usable_cache_memory <= 0:
+            state_gib = state_cache_size / (1024 ** 3)
+            raise ValueError(
+                "The persistent recurrent-state cache does not fit in the "
+                "configured GPU memory budget: "
+                f"{state_gib:.2f} GiB for max_num_seqs="
+                f"{self.scheduler_config.max_num_seqs}. Reduce "
+                "--max-num-seqs for hybrid Qwen models."
+            )
+        num_gpu_blocks = int(usable_cache_memory // cache_block_size)
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
         torch.cuda.empty_cache()
 
@@ -153,7 +165,8 @@ class Worker:
                 layer_types=self.model_config.architecture.layer_types,
                 full_attention_caches=full_attention_caches,
                 state_spec=GatedDeltaNetStateSpec.from_text_config(
-                    self.model_config.architecture.text_config
+                    self.model_config.architecture.text_config,
+                    self.parallel_config.tensor_parallel_size,
                 ),
                 max_num_seqs=self.scheduler_config.max_num_seqs,
                 device="cuda",

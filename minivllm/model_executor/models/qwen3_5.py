@@ -165,6 +165,67 @@ def _load_merged_column_shard(
     target.copy_(current)
 
 
+def _load_gdn_qkv_shard(
+    param: torch.Tensor,
+    loaded_value: torch.Tensor,
+    tensor_model_parallel_rank: int,
+    tensor_model_parallel_world_size: int,
+    global_key_dim: int,
+    global_value_dim: int,
+    block_n: Optional[int] = None,
+) -> None:
+    """Shard a checkpoint-level ``[Q | K | V]`` GDN tensor by segment."""
+    global_rows = (global_key_dim, global_key_dim, global_value_dim)
+    if any(rows % tensor_model_parallel_world_size != 0 for rows in global_rows):
+        raise ValueError("GDN Q/K/V dimensions must be divisible by TP size")
+
+    if block_n is None:
+        global_segment_sizes = global_rows
+        local_segment_sizes = tuple(
+            rows // tensor_model_parallel_world_size for rows in global_rows
+        )
+    else:
+        if any(rows % block_n != 0 for rows in global_rows):
+            raise ValueError("GDN segments must align to FP8 output blocks")
+        global_segment_sizes = tuple(rows // block_n for rows in global_rows)
+        if any(
+            rows % tensor_model_parallel_world_size != 0
+            for rows in global_segment_sizes
+        ):
+            raise ValueError(
+                "GDN FP8 scale blocks must be divisible by TP size"
+            )
+        local_segment_sizes = tuple(
+            rows // tensor_model_parallel_world_size
+            for rows in global_segment_sizes
+        )
+
+    if sum(local_segment_sizes) != param.shape[0]:
+        raise ValueError(
+            f"Local GDN packed rows {param.shape[0]} do not match expected "
+            f"{sum(local_segment_sizes)}"
+        )
+    global_offset = 0
+    local_offset = 0
+    for global_size, local_size in zip(
+        global_segment_sizes, local_segment_sizes
+    ):
+        source_start = (
+            global_offset
+            + tensor_model_parallel_rank * local_size
+        )
+        source = loaded_value[source_start:source_start + local_size]
+        target = param.data[local_offset:local_offset + local_size]
+        if target.shape != source.shape:
+            raise ValueError(
+                f"GDN target shape {target.shape} does not match "
+                f"checkpoint shard shape {source.shape}"
+            )
+        target.copy_(source)
+        global_offset += global_size
+        local_offset += local_size
+
+
 class Qwen3_5Attention(nn.Module):
     """Gated full-attention layer shared by Qwen3.5 and Qwen3.8."""
 
@@ -360,8 +421,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.num_k_heads = config.linear_num_key_heads
-        self.num_v_heads = config.linear_num_value_heads
+        tp_world_size = get_tensor_model_parallel_world_size()
+        self.total_num_k_heads = config.linear_num_key_heads
+        self.total_num_v_heads = config.linear_num_value_heads
+        if self.total_num_k_heads % tp_world_size != 0:
+            raise ValueError("Linear key heads must be divisible by TP size")
+        if self.total_num_v_heads % tp_world_size != 0:
+            raise ValueError("Linear value heads must be divisible by TP size")
+        self.num_k_heads = self.total_num_k_heads // tp_world_size
+        self.num_v_heads = self.total_num_v_heads // tp_world_size
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -373,14 +441,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if config.hidden_act not in ("silu", "swish"):
             raise ValueError("Qwen Gated DeltaNet requires SiLU")
 
+        self.total_key_dim = self.total_num_k_heads * self.head_k_dim
+        self.total_value_dim = self.total_num_v_heads * self.head_v_dim
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
+        self.total_conv_dim = 2 * self.total_key_dim + self.total_value_dim
         quant_config = getattr(config, "quantization_config", None)
 
         self.in_proj_qkv = ColumnParallelLinear(
             self.hidden_size,
-            self.conv_dim,
+            self.total_conv_dim,
             bias=False,
             gather_output=False,
             perform_initialization=False,
@@ -388,7 +459,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.in_proj_z = ColumnParallelLinear(
             self.hidden_size,
-            self.value_dim,
+            self.total_value_dim,
             bias=False,
             gather_output=False,
             perform_initialization=False,
@@ -396,14 +467,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.in_proj_b = ColumnParallelLinear(
             self.hidden_size,
-            self.num_v_heads,
+            self.total_num_v_heads,
             bias=False,
             gather_output=False,
             perform_initialization=False,
         )
         self.in_proj_a = ColumnParallelLinear(
             self.hidden_size,
-            self.num_v_heads,
+            self.total_num_v_heads,
             bias=False,
             gather_output=False,
             perform_initialization=False,
@@ -420,7 +491,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(initial_a.log())
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.out_proj = RowParallelLinear(
-            self.value_dim,
+            self.total_value_dim,
             self.hidden_size,
             bias=False,
             input_is_parallel=True,
@@ -790,6 +861,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             "in_proj_z.weight",
             "in_proj_a.weight",
             "in_proj_b.weight",
+            "linear_attn.dt_bias",
+            "linear_attn.A_log",
         ]
         row_parallel_weights = [
             "self_attn.o_proj.weight",
@@ -819,6 +892,29 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             if name.startswith(("model.visual.", "model.vision_tower.", "mtp.")):
                 continue
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            is_gdn_qkv = ".linear_attn.in_proj_qkv." in name
+            is_gdn_conv = name.endswith(".linear_attn.conv1d.weight")
+            if is_gdn_qkv or is_gdn_conv:
+                try:
+                    param = state_dict[name]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"No target parameter for checkpoint weight {name}"
+                    ) from exc
+                is_scale = name.endswith("weight_scale_inv")
+                _load_gdn_qkv_shard(
+                    param,
+                    loaded_value,
+                    tensor_model_parallel_rank,
+                    tensor_model_parallel_world_size,
+                    self.config.linear_num_key_heads
+                    * self.config.linear_key_head_dim,
+                    self.config.linear_num_value_heads
+                    * self.config.linear_value_head_dim,
+                    block_n=block_n if is_scale else None,
+                )
                 continue
 
             attention_shards = (
@@ -921,5 +1017,6 @@ __all__ = [
     "_load_qkv_gate_weight",
     "_load_qkv_gate_scale",
     "_load_merged_column_shard",
+    "_load_gdn_qkv_shard",
     "_split_q_gate_kv",
 ]

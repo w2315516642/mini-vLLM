@@ -183,7 +183,8 @@ class CacheEngine:
         if num_linear_layers == 0:
             return 0
         spec = GatedDeltaNetStateSpec.from_text_config(
-            model_config.architecture.text_config
+            model_config.architecture.text_config,
+            parallel_config.tensor_parallel_size,
         )
         conv_elements = max_num_seqs * torch.tensor(
             spec.conv_state_shape

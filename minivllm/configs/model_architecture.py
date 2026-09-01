@@ -206,6 +206,25 @@ class ModelArchitecture:
         self.get_num_attention_heads(tensor_parallel_size)
         self.get_num_kv_heads(tensor_parallel_size)
         self.get_num_layers(pipeline_parallel_size)
+        if self.num_linear_attention_layers:
+            for field_name in (
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+            ):
+                num_heads = _get_config_value(self.text_config, field_name)
+                if (
+                    not isinstance(num_heads, int)
+                    or isinstance(num_heads, bool)
+                    or num_heads <= 0
+                ):
+                    raise ValueError(
+                        f"{field_name} must be a positive integer"
+                    )
+                if num_heads % tensor_parallel_size != 0:
+                    raise ValueError(
+                        f"{field_name} ({num_heads}) must be divisible by "
+                        f"tensor parallel size ({tensor_parallel_size})"
+                    )
 
 
 def _get_default_config_value(config: Any, field_name: str, default: Any) -> Any:
