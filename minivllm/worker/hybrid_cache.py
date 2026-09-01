@@ -196,6 +196,8 @@ class HybridCache:
                 )
 
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.state_spec = state_spec
         self._slots = RequestStateSlotAllocator(max_num_seqs)
         self._full_attention_caches = dict(full_attention_caches)

@@ -31,6 +31,9 @@ class InputMetadata:
         cached_prompt_context_lens: Optional[torch.Tensor] = None,
         cached_prompt_block_tables: Optional[torch.Tensor] = None,
         max_cached_prompt_context_len: int = 0,
+        prompt_seq_ids: Optional[List[int]] = None,
+        generation_seq_ids: Optional[List[int]] = None,
+        state_slot_mapping: Optional[torch.Tensor] = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -47,6 +50,9 @@ class InputMetadata:
         self.cached_prompt_context_lens = cached_prompt_context_lens
         self.cached_prompt_block_tables = cached_prompt_block_tables
         self.max_cached_prompt_context_len = max_cached_prompt_context_len
+        self.prompt_seq_ids = prompt_seq_ids or []
+        self.generation_seq_ids = generation_seq_ids or []
+        self.state_slot_mapping = state_slot_mapping
 
         # xFormers only sees prompts whose query contains the whole context.
         # Cached suffixes need the separate paged-attention metadata below.
@@ -62,6 +68,10 @@ class InputMetadata:
                 + self.num_cached_prompt_tokens == self.num_prompt_tokens)
         self.num_generation_tokens = context_lens.shape[0]
         self.num_valid_tokens = slot_mapping.shape[0]
+        if self.prompt_seq_ids:
+            assert len(self.prompt_seq_ids) == self.num_prompts
+        if self.generation_seq_ids:
+            assert len(self.generation_seq_ids) == self.num_generation_tokens
         if block_tables.numel() > 0:
             # Every row is padded to the same block-table length.
             self.max_num_blocks_per_seq = block_tables.shape[1]
@@ -90,6 +100,8 @@ class InputMetadata:
                 f'num_prompts={self.num_prompts}, '
                 f'prompt_lens={self.prompt_lens}, '
                 f'num_generation_tokens={self.num_generation_tokens}, '
+                f'prompt_seq_ids={self.prompt_seq_ids}, '
+                f'generation_seq_ids={self.generation_seq_ids}, '
                 f'context_lens={self.context_lens}, '
                 f'max_context_len={self.max_context_len}, '
                 f'max_num_blocks_per_seq={self.max_num_blocks_per_seq}, '

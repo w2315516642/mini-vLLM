@@ -17,6 +17,10 @@ from minivllm.model_executor.parallel_utils.parallel_state import (
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from minivllm.worker.cache_engine import CacheEngine
+from minivllm.worker.hybrid_cache import (
+    GatedDeltaNetStateSpec,
+    HybridCache,
+)
 from minivllm.utils.device import get_gpu_memory
 
 class Worker:
@@ -58,6 +62,7 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+        self.hybrid_cache = None
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -109,8 +114,14 @@ class Worker:
             f"max gpu memory usage {peak_memory}")
         cache_block_size = CacheEngine.get_cache_block_size(
             block_size, self.model_config, self.parallel_config)
+        state_cache_size = CacheEngine.get_state_cache_size(
+            self.model_config,
+            self.parallel_config,
+            self.scheduler_config.max_num_seqs,
+        )
         num_gpu_blocks = int((total_gpu_memory * gpu_memory_utilization
-                              - peak_memory) // cache_block_size)
+                              - peak_memory - state_cache_size)
+                             // cache_block_size)
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
         torch.cuda.empty_cache()
 
@@ -118,13 +129,38 @@ class Worker:
         return num_gpu_blocks, num_cpu_blocks
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
+        if (
+            cache_config.enable_prefix_caching
+            and self.model_config.architecture.num_linear_attention_layers
+        ):
+            raise ValueError(
+                "Prefix caching for hybrid models requires recurrent-state "
+                "snapshots and is not supported yet"
+            )
         self.cache_config = cache_config
         self.block_size = cache_config.block_size
         self.cache_engine = CacheEngine(
             self.cache_config, self.model_config, self.parallel_config
         )
         self.cache_events = self.cache_engine.events
-        self.gpu_cache = self.cache_engine.gpu_cache
+        if self.model_config.architecture.num_linear_attention_layers:
+            full_attention_caches = {
+                layer_idx: cache
+                for layer_idx, cache in enumerate(self.cache_engine.gpu_cache)
+                if cache is not None
+            }
+            self.hybrid_cache = HybridCache(
+                layer_types=self.model_config.architecture.layer_types,
+                full_attention_caches=full_attention_caches,
+                state_spec=GatedDeltaNetStateSpec.from_text_config(
+                    self.model_config.architecture.text_config
+                ),
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+                device="cuda",
+            )
+            self.gpu_cache = self.hybrid_cache
+        else:
+            self.gpu_cache = self.cache_engine.gpu_cache
 
     def _prepare_inputs(
         self,
@@ -139,6 +175,8 @@ class Worker:
         cached_prompt_query_lens: List[int] = []
         cached_prompt_context_lens: List[int] = []
         cached_prompt_block_tables: List[List[int]] = []
+        prompt_seq_ids: List[int] = []
+        generation_seq_ids: List[int] = []
 
         prompt_metadata = [
             metadata for metadata in seq_group_metadata_list
@@ -168,6 +206,7 @@ class Worker:
             assert end == seq_data.get_len()
 
             seq_groups.append((seq_ids, metadata.sampling_params))
+            prompt_seq_ids.append(seq_id)
             prompt_lens.append(query_len)
             input_token_ids.extend(seq_data.get_token_ids()[start:end])
             input_positions.extend(range(start, end))
@@ -205,6 +244,7 @@ class Worker:
             seq_groups.append((seq_ids, metadata.sampling_params))
 
             for seq_id in seq_ids:
+                generation_seq_ids.append(seq_id)
                 seq_data = metadata.seq_data[seq_id]
                 position = metadata.num_computed_tokens[seq_id]
                 query_len = metadata.num_scheduled_tokens[seq_id]
@@ -259,6 +299,8 @@ class Worker:
             cached_prompt_block_tables=cached_prompt_block_tables_tensor,
             max_cached_prompt_context_len=max(
                 cached_prompt_context_lens, default=0),
+            prompt_seq_ids=prompt_seq_ids,
+            generation_seq_ids=generation_seq_ids,
         )
         return tokens_tensor, positions_tensor, input_metadata
 
@@ -291,12 +333,18 @@ class Worker:
         if not seq_group_metadata_list:
             if cache_events is not None:
                 for event in cache_events:
-                    event.wait()
+                    if event is not None:
+                        event.wait()
             return {}
         
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list=seq_group_metadata_list)
+        if self.hybrid_cache is not None:
+            input_metadata.state_slot_mapping = self.hybrid_cache.acquire(
+                input_metadata.prompt_seq_ids
+                + input_metadata.generation_seq_ids
+            )
         
         # Execute the model.
         # output: List[int (seq_id), SequenceOutputs]
