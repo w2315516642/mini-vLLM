@@ -5,7 +5,11 @@ import time
 from loguru import logger
 
 from minivllm.configs import (
-    ModelConfig, ParallelConfig, CacheConfig, SchedulerConfig)
+    ModelConfig, ParallelConfig, CacheConfig, PDConfig, PDRole,
+    SchedulerConfig)
+from minivllm.distributed.kv_transfer import CacheLayout, TransferPlan
+from minivllm.engine.pd_coordinator import DecodeReservation
+from minivllm.engine.pd_handoff import RequestHandoff
 from minivllm.kv_cache.scheduler import Scheduler
 from minivllm.multimodal import MultiModalInputs
 from minivllm.engine.arg_utils import EngineArgs
@@ -31,6 +35,7 @@ class LLMEngine:
         cache_config: CacheConfig,
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
+        pd_config: PDConfig,
         distributed_init_method: str,
         stage_devices: List[List[DeviceID]],
         log_stats: bool,
@@ -39,11 +44,13 @@ class LLMEngine:
         self.cache_config = cache_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
+        self.pd_config = pd_config
         self.log_stats = log_stats
         self._verify_args()
 
         self.tokenizer = get_tokenizer(model_config.model)
         self.seq_counter = Counter()
+        self._sealed_handoffs: List[RequestHandoff] = []
 
         # Create the parallel GPU workers.
         self.workers: List[Worker] = []
@@ -64,7 +71,8 @@ class LLMEngine:
                 parallel_config,
                 scheduler_config,
                 rank,
-                distributed_init_method
+                distributed_init_method,
+                pd_config,
             )
             self.workers.append(worker)
         
@@ -82,6 +90,10 @@ class LLMEngine:
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
+        if self.pd_config.enabled and self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "prefix caching across P/D roles is not implemented yet"
+            )
 
     def _init_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
@@ -273,6 +285,15 @@ class LLMEngine:
             assert output == other_output
         return output
 
+    def _run_worker_at(self, worker_index: int, method: str, *args, **kwargs):
+        if worker_index < 0 or worker_index >= len(self.workers):
+            raise IndexError(f"worker index {worker_index} is out of range")
+        worker = self.workers[worker_index]
+        executor = getattr(worker, method)
+        if self.parallel_config.worker_use_ray:
+            return ray.get(executor.remote(*args, **kwargs))
+        return executor(*args, **kwargs)
+
 
     def step(self) -> List[RequestOutput]:
         """Performs one decoding iteration and returns newly generated results.
@@ -305,6 +326,8 @@ class LLMEngine:
         self._decode_sequences(seq_groups)
         # Stop the sequences that meet the stopping criteria.
         self._stop_sequences(seq_groups)
+        if self.pd_config.role == PDRole.PREFILL:
+            self._seal_prefilled_requests(seq_groups)
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
         self._flush_pending_state_operations()
@@ -315,6 +338,120 @@ class LLMEngine:
             request_output = RequestOutput.from_seq_group(seq_group)
             request_outputs.append(request_output)
         return request_outputs
+
+    def _seal_prefilled_requests(
+        self,
+        seq_groups: List[SequenceGroup],
+    ) -> None:
+        """Freeze completed prompts before the scheduler can decode them."""
+        for seq_group in seq_groups:
+            if seq_group not in self.scheduler.running:
+                continue
+            active = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+            if not active or any(
+                seq.num_computed_tokens != seq.get_prompt_len()
+                or seq.get_output_len() == 0
+                for seq in active
+            ):
+                continue
+            block_tables = {
+                seq.seq_id: tuple(
+                    self.scheduler.block_manager.get_block_table(seq)
+                )
+                for seq in active
+            }
+            seq_ids = [seq.seq_id for seq in active]
+            rank_state_slots = self._run_workers(
+                "get_source_state_slots",
+                get_all_outputs=True,
+                seq_ids=seq_ids,
+            )
+            state_slots = rank_state_slots[0]
+            if any(item != state_slots for item in rank_state_slots[1:]):
+                raise RuntimeError("P workers disagree on hybrid state slots")
+            handoff = RequestHandoff.from_sequence_group(
+                seq_group,
+                block_tables=block_tables,
+                state_slots=state_slots,
+            )
+            self.scheduler.seal_prefilled_seq_group(seq_group)
+            self._sealed_handoffs.append(handoff)
+
+    def pop_prefill_handoffs(self) -> List[RequestHandoff]:
+        """Return newly sealed requests to the external PD coordinator."""
+        if self.pd_config.role != PDRole.PREFILL:
+            raise RuntimeError("only a prefill engine produces handoffs")
+        handoffs = self._sealed_handoffs
+        self._sealed_handoffs = []
+        return handoffs
+
+    def get_transfer_layouts(self) -> List[CacheLayout]:
+        if not self.pd_config.enabled:
+            raise RuntimeError("unified engines have no transfer layouts")
+        return self._run_workers(
+            "get_transfer_layout", get_all_outputs=True
+        )
+
+    def prepare_decode_handoff(
+        self,
+        handoff: RequestHandoff,
+    ) -> DecodeReservation:
+        """Reserve D resources but keep the request invisible to scheduling."""
+        if self.pd_config.role != PDRole.DECODE:
+            raise RuntimeError("only a decode engine accepts handoffs")
+        seq_group = handoff.rebuild_sequence_group(self.cache_config.block_size)
+        if len(handoff.sequences) != 1:
+            raise ValueError("PD handoff currently supports one sequence")
+        progress = handoff.sequences[0].num_computed_tokens
+        try:
+            block_tables = self.scheduler.reserve_transferred_seq_group(
+                seq_group, progress
+            )
+            seq_ids = [sequence.seq_id for sequence in handoff.sequences]
+            rank_state_slots = self._run_workers(
+                "reserve_decode_state_slots",
+                get_all_outputs=True,
+                seq_ids=seq_ids,
+            )
+            state_slots = rank_state_slots[0]
+            if any(item != state_slots for item in rank_state_slots[1:]):
+                raise RuntimeError("D workers disagree on hybrid state slots")
+        except Exception:
+            self.scheduler.abort_seq_group(handoff.request_id)
+            self._flush_pending_state_operations()
+            raise
+        return DecodeReservation(
+            block_tables={
+                seq_id: tuple(block_ids)
+                for seq_id, block_ids in block_tables.items()
+            },
+            state_slots=state_slots,
+        )
+
+    def activate_decode_handoff(self, request_id: str) -> None:
+        if self.pd_config.role != PDRole.DECODE:
+            raise RuntimeError("only a decode engine activates handoffs")
+        self.scheduler.activate_transferred_seq_group(request_id)
+
+    def abort_decode_handoff(self, request_id: str) -> None:
+        self.scheduler.abort_seq_group(request_id)
+        self._flush_pending_state_operations()
+
+    def release_prefill_handoff(self, request_id: str) -> None:
+        """Drop P cache only after all rank transfers have completed."""
+        if self.pd_config.role != PDRole.PREFILL:
+            raise RuntimeError("only a prefill engine owns sealed handoffs")
+        self.scheduler.release_sealed_seq_group(request_id)
+        self._flush_pending_state_operations()
+
+    def execute_rank_cache_transfer(
+        self,
+        rank: int,
+        plan: TransferPlan,
+    ):
+        if self.pd_config.role != PDRole.PREFILL:
+            raise RuntimeError("only a prefill engine submits cache transfers")
+        return self._run_worker_at(rank, "execute_cache_transfer", plan)
 
     def _flush_pending_state_operations(self) -> None:
         releases, copies = self.scheduler.pop_pending_state_operations()

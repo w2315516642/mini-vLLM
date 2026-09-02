@@ -9,6 +9,13 @@ from minivllm.configs.config import (
     ParallelConfig,
     SchedulerConfig
 )
+from minivllm.configs.pd_config import KVTransferBackend, PDConfig, PDRole
+from minivllm.distributed.kv_transfer import (
+    CacheLayout,
+    P2PTransferBackend,
+    TransferPlan,
+    register_cache_layout,
+)
 
 from minivllm.model_executor import InputMetadata, set_random_seed, get_model
 
@@ -38,12 +45,14 @@ class Worker:
         scheduler_config: SchedulerConfig,
         rank: int,
         distributed_init_method: str,
+        pd_config: Optional[PDConfig] = None,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.rank = rank
         self.distributed_init_method = distributed_init_method
+        self.pd_config = pd_config or PDConfig()
 
         _init_distributed_environment(parallel_config, rank, 
                                       distributed_init_method)
@@ -63,6 +72,8 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
         self.hybrid_cache = None
+        self.transfer_backend = None
+        self.transfer_layout = None
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -174,6 +185,90 @@ class Worker:
             self.gpu_cache = self.hybrid_cache
         else:
             self.gpu_cache = self.cache_engine.gpu_cache
+        self._init_transfer_engine()
+
+    def _init_transfer_engine(self) -> None:
+        """Register rank-local persistent caches for P/D data movement."""
+        if not self.pd_config.enabled:
+            return
+        if self.pd_config.backend != KVTransferBackend.TCP:
+            raise ValueError(
+                "LLMEngine PD mode currently requires the tcp backend; "
+                "the memory backend is reserved for unit tests"
+            )
+        endpoint = self.pd_config.endpoint_for_rank(self.rank)
+        self.transfer_backend = P2PTransferBackend(
+            endpoint,
+            timeout_s=self.pd_config.transfer_timeout_s,
+        )
+        full_attention_caches = {
+            layer_idx: cache
+            for layer_idx, cache in enumerate(self.cache_engine.gpu_cache)
+            if cache is not None
+        }
+        state_pools = (
+            None
+            if self.hybrid_cache is None
+            else self.hybrid_cache.get_state_pools()
+        )
+        self.transfer_layout = register_cache_layout(
+            self.transfer_backend,
+            self.block_size,
+            full_attention_caches,
+            state_pools,
+        )
+
+    def get_transfer_layout(self) -> CacheLayout:
+        if self.transfer_layout is None:
+            raise RuntimeError("worker has no PD transfer layout")
+        return self.transfer_layout
+
+    def get_source_state_slots(self, seq_ids: List[int]) -> Dict[int, int]:
+        """Return P slots after prefill has created recurrent state."""
+        if self.pd_config.role != PDRole.PREFILL:
+            raise RuntimeError("source state slots are available only on P")
+        if self.hybrid_cache is None:
+            return {}
+        return {
+            seq_id: self.hybrid_cache.get_state_slot(seq_id)
+            for seq_id in seq_ids
+        }
+
+    def reserve_decode_state_slots(self, seq_ids: List[int]) -> Dict[int, int]:
+        """Allocate D recurrent-state destinations before transfer starts."""
+        if self.pd_config.role != PDRole.DECODE:
+            raise RuntimeError("decode state slots are available only on D")
+        if self.hybrid_cache is None:
+            return {}
+        self.hybrid_cache.acquire(seq_ids)
+        return {
+            seq_id: self.hybrid_cache.get_state_slot(seq_id)
+            for seq_id in seq_ids
+        }
+
+    def execute_cache_transfer(
+        self,
+        plan: TransferPlan,
+    ) -> Dict[str, object]:
+        """Run one rank-local P-push batch and wait for the remote ACK."""
+        if self.pd_config.role != PDRole.PREFILL:
+            raise RuntimeError("cache transfers must be submitted by P workers")
+        if self.transfer_backend is None:
+            raise RuntimeError("worker transfer backend is not initialized")
+        handle = self.transfer_backend.submit(plan)
+        status = self.transfer_backend.wait(
+            handle, self.pd_config.transfer_timeout_s
+        )
+        return {
+            "transfer_id": handle.transfer_id,
+            "status": status.value,
+            "error": handle.error,
+            "total_bytes": plan.total_bytes,
+        }
+
+    def close_transfer_engine(self) -> None:
+        if self.transfer_backend is not None:
+            self.transfer_backend.close()
 
     def _prepare_inputs(
         self,

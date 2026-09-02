@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from minivllm.distributed.kv_transfer.types import TransferEndpoint
+
 
 class PDRole(str, Enum):
     UNIFIED = "unified"
@@ -63,3 +65,28 @@ class PDConfig:
     @property
     def enabled(self) -> bool:
         return self.role != PDRole.UNIFIED
+
+    def endpoint_for_rank(
+        self,
+        rank: int,
+        peer: bool = False,
+    ) -> TransferEndpoint:
+        """Derive one endpoint per TP rank from the configured base port."""
+        if not self.enabled:
+            raise ValueError("unified mode has no transfer endpoint")
+        if rank < 0:
+            raise ValueError("rank must be non-negative")
+        endpoint_id = self.peer_endpoint_id if peer else self.endpoint_id
+        hostname = self.peer_hostname if peer else self.hostname
+        host, port_text = hostname.rsplit(":", 1)
+        try:
+            port = int(port_text) + rank
+        except ValueError as exc:
+            raise ValueError("PD hostname must use host:port form") from exc
+        if not host or not 0 < port < 65536:
+            raise ValueError("rank-adjusted PD endpoint is invalid")
+        return TransferEndpoint(
+            endpoint_id=f"{endpoint_id}/rank-{rank}",
+            hostname=f"{host}:{port}",
+            rank=rank,
+        )

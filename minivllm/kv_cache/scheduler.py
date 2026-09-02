@@ -90,6 +90,10 @@ class Scheduler:
         self.swapped: List[SequenceGroup] = []
         self._pending_state_releases: Set[int] = set()
         self._pending_state_copies: Dict[int, int] = {}
+        # P keeps sealed requests pinned until transfer ACK. D keeps reserved
+        # requests out of the runnable queue until all rank transfers finish.
+        self._sealed_transfers: Dict[str, SequenceGroup] = {}
+        self._reserved_transfers: Dict[str, SequenceGroup] = {}
 
         self.last_logging_time: float = 0.0
         # List[timestamp, num_tokens]
@@ -110,12 +114,82 @@ class Scheduler:
                             continue
                         self.free_seq(seq, SequenceStatus.FINISHED_ABORTED)
                     return
+        for state_map in (
+            self._sealed_transfers,
+            self._reserved_transfers,
+        ):
+            seq_group = state_map.pop(request_id, None)
+            if seq_group is None:
+                continue
+            for seq in seq_group.seqs:
+                if not seq.is_finished():
+                    self.free_seq(seq, SequenceStatus.FINISHED_ABORTED)
+            return
     
     def has_unfinished_seqs(self) -> bool:
-        return self.waiting or self.running or self.swapped
+        return bool(
+            self.waiting
+            or self.running
+            or self.swapped
+            or self._sealed_transfers
+            or self._reserved_transfers
+        )
     
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped)
+        return (
+            len(self.waiting)
+            + len(self.running)
+            + len(self.swapped)
+            + len(self._sealed_transfers)
+            + len(self._reserved_transfers)
+        )
+
+    def seal_prefilled_seq_group(self, seq_group: SequenceGroup) -> None:
+        """Remove a P request from scheduling while retaining cache ownership."""
+        if seq_group.request_id in self._sealed_transfers:
+            raise ValueError(f"request {seq_group.request_id} is already sealed")
+        try:
+            self.running.remove(seq_group)
+        except ValueError as exc:
+            raise ValueError("only a running request can be sealed") from exc
+        self._sealed_transfers[seq_group.request_id] = seq_group
+
+    def release_sealed_seq_group(self, request_id: str) -> None:
+        """Release P resources only after every destination rank acknowledges."""
+        try:
+            seq_group = self._sealed_transfers.pop(request_id)
+        except KeyError as exc:
+            raise ValueError(f"request {request_id} is not sealed") from exc
+        for seq in seq_group.seqs:
+            self.free_seq(seq, SequenceStatus.FINISHED_ABORTED)
+
+    def reserve_transferred_seq_group(
+        self,
+        seq_group: SequenceGroup,
+        num_computed_tokens: int,
+    ) -> Dict[int, List[int]]:
+        """Reserve D cache without making the request schedulable yet."""
+        request_id = seq_group.request_id
+        if request_id in self._reserved_transfers:
+            raise ValueError(f"request {request_id} is already reserved")
+        self.block_manager.allocate_transferred(
+            seq_group, num_computed_tokens
+        )
+        self._reserved_transfers[request_id] = seq_group
+        return {
+            seq.seq_id: self.block_manager.get_block_table(seq)
+            for seq in seq_group.seqs
+        }
+
+    def activate_transferred_seq_group(self, request_id: str) -> None:
+        """Publish a D request after the data plane reports completion."""
+        try:
+            seq_group = self._reserved_transfers.pop(request_id)
+        except KeyError as exc:
+            raise ValueError(f"request {request_id} is not reserved") from exc
+        for seq in seq_group.seqs:
+            seq.status = SequenceStatus.RUNNING
+        self.running.append(seq_group)
 
     def pop_pending_state_operations(self) -> Tuple[List[int], Dict[int, int]]:
         """Return worker-side recurrent-state operations accumulated so far."""
