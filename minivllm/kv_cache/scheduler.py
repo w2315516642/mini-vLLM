@@ -11,6 +11,10 @@ from minivllm.sequence import (
     SequenceStatus, SequenceData, SequenceGroup,
     Sequence, SequenceGroupMetadata, SequenceOutputs
 )
+from minivllm.spec_decode.adaptive_planner import (
+    AdaptiveVerificationPlanner,
+    VerificationCostProfile,
+)
 
 _LOGGING_INTERVAL_SEC = 5
 
@@ -39,6 +43,7 @@ class SchedulerOutputs:
         state_seq_ids_to_release: Optional[List[int]] = None,
         state_copies: Optional[Dict[int, int]] = None,
         speculative_seq_ids: Optional[Set[int]] = None,
+        speculative_token_counts: Optional[Dict[int, int]] = None,
     ) -> None:
         self.blocks_to_swap_in = blocks_to_swap_in
         self.blocks_to_swap_out = blocks_to_swap_out
@@ -49,6 +54,7 @@ class SchedulerOutputs:
         # child_seq_id -> parent_seq_id
         self.state_copies = state_copies or {}
         self.speculative_seq_ids = speculative_seq_ids or set()
+        self.speculative_token_counts = speculative_token_counts or {}
         # Swap in and swap out should never happen at the same time.
         assert not (blocks_to_swap_in and blocks_to_swap_out)
 
@@ -94,6 +100,38 @@ class Scheduler:
         self.last_logging_time: float = 0.0
         # List[timestamp, num_tokens]
         self.num_input_tokens: List[Tuple[float, int]] = []
+        self.adaptive_planner = self._create_adaptive_planner()
+
+    def _create_adaptive_planner(self) -> Optional[AdaptiveVerificationPlanner]:
+        if not getattr(self.scheduler_config, "speculative_adaptive", False):
+            return None
+        token_counts = getattr(
+            self.scheduler_config, "speculative_cost_token_counts", None
+        )
+        latency_ms = getattr(
+            self.scheduler_config, "speculative_cost_latency_ms", None
+        )
+        if token_counts is None:
+            profile = VerificationCostProfile.linear(
+                self.scheduler_config.max_num_batched_tokens,
+                draft_latency_ms=getattr(
+                    self.scheduler_config, "speculative_draft_latency_ms", 0.0
+                ),
+            )
+        else:
+            profile = VerificationCostProfile(
+                tuple(token_counts),
+                tuple(latency_ms),
+                getattr(
+                    self.scheduler_config, "speculative_draft_latency_ms", 0.0
+                ),
+            )
+        return AdaptiveVerificationPlanner(
+            profile,
+            min_survival_probability=getattr(
+                self.scheduler_config, "speculative_min_survival", 0.0
+            ),
+        )
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
@@ -125,21 +163,29 @@ class Scheduler:
         self._pending_state_copies.clear()
         return releases, copies
 
-    def _can_speculate(self, seq_group: SequenceGroup) -> bool:
+    def _can_speculate(
+        self,
+        seq_group: SequenceGroup,
+        draft_width: Optional[int] = None,
+    ) -> bool:
         max_draft_tokens = getattr(
             self.scheduler_config, "num_speculative_tokens", 0
         )
         if max_draft_tokens <= 0:
             return False
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        if draft_width is None and len(seqs) == 1:
+            draft_width = len(seqs[0].speculative_token_ids)
         if (
             len(seqs) != 1
-            or not seqs[0].speculative_token_ids
-            or len(seqs[0].speculative_token_ids) > max_draft_tokens
+            or draft_width is None
+            or draft_width <= 0
+            or draft_width > len(seqs[0].speculative_token_ids)
+            or draft_width > max_draft_tokens
         ):
             return False
         params = seq_group.sampling_params
-        output_budget = len(seqs[0].speculative_token_ids) + 1
+        output_budget = draft_width + 1
         common_supported = (
             params.best_of == 1
             and not params.use_beam_search
@@ -155,6 +201,37 @@ class Scheduler:
             and params.presence_penalty == 0.0
             and params.frequency_penalty == 0.0
         )
+
+    def _plan_speculative_widths(
+        self,
+        seq_groups: List[SequenceGroup],
+    ) -> Dict[int, int]:
+        widths: Dict[int, int] = {}
+        confidence_by_seq: Dict[int, List[float]] = {}
+        for seq_group in seq_groups:
+            seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+            if len(seqs) != 1:
+                continue
+            seq = seqs[0]
+            if not seq.speculative_token_ids:
+                continue
+            widths[seq.seq_id] = len(seq.speculative_token_ids)
+            if (
+                self.adaptive_planner is not None
+                and len(confidence_by_seq)
+                < self.scheduler_config.max_num_batched_tokens
+                and len(seq.speculative_confidence)
+                == len(seq.speculative_token_ids)
+            ):
+                confidence_by_seq[seq.seq_id] = seq.speculative_confidence
+        if not confidence_by_seq:
+            return widths
+        plan = self.adaptive_planner.plan(
+            confidence_by_seq,
+            max_total_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
+        widths.update(plan.draft_widths)
+        return widths
     
     def _schedule(self) -> Tuple[SchedulerOutputs, List[str]]:
         # Blocks that need to be swaped or copied before model execution.
@@ -164,6 +241,7 @@ class Scheduler:
         num_scheduled_tokens: Dict[int, int] = {}
         sampled_seq_ids: Set[int] = set()
         speculative_seq_ids: Set[int] = set()
+        speculative_token_counts: Dict[int, int] = {}
         num_batched_tokens = 0
         prompt_group_ids: List[str] = []
         
@@ -177,6 +255,9 @@ class Scheduler:
         # In this case, the policy is responsible for deciding which sequence
         # groups to preempt.
         pending_running = self.policy.sort_by_priority(now, self.running)
+        planned_speculative_widths = self._plan_speculative_widths(
+            pending_running
+        )
 
         # Schedule prompt continuations and reserve decode slots. Prompt chunks
         # consume the budget once per group because all best-of sequences share
@@ -222,11 +303,11 @@ class Scheduler:
                 running.append(seq_group)
                 continue
 
-            use_speculation = self._can_speculate(seq_group)
-            draft_width = (
-                len(running_seqs[0].speculative_token_ids)
-                if use_speculation else 0
-            )
+            planned_width = planned_speculative_widths.get(
+                running_seqs[0].seq_id, 0
+            ) if len(running_seqs) == 1 else 0
+            use_speculation = self._can_speculate(seq_group, planned_width)
+            draft_width = planned_width if use_speculation else 0
             tokens_per_seq = 1 + draft_width
             num_decode_tokens = len(running_seqs) * tokens_per_seq
             if (
@@ -261,6 +342,7 @@ class Scheduler:
                             seq, draft_width
                         )
                         speculative_seq_ids.add(seq.seq_id)
+                        speculative_token_counts[seq.seq_id] = draft_width
                 num_batched_tokens += num_decode_tokens
                 running.append(seq_group)
         self.running = running
@@ -361,6 +443,7 @@ class Scheduler:
             state_seq_ids_to_release=state_releases,
             state_copies=state_copies,
             speculative_seq_ids=speculative_seq_ids,
+            speculative_token_counts=speculative_token_counts,
         )
         if not self.log_stats:
             return scheduler_outputs, prompt_group_ids
@@ -429,9 +512,11 @@ class Scheduler:
                     if seq.speculative_token_id is not None
                 },
                 speculative_token_blocks={
-                    seq.seq_id: seq.speculative_token_ids.copy()
+                    seq.seq_id: seq.speculative_token_ids[:
+                        scheduler_outputs.speculative_token_counts[seq.seq_id]
+                    ]
                     for seq in scheduled_seqs
-                    if seq.speculative_token_ids
+                    if seq.seq_id in scheduler_outputs.speculative_seq_ids
                 },
                 multi_modal_inputs=multi_modal_inputs,
             )
@@ -466,7 +551,9 @@ class Scheduler:
                 seq.num_computed_tokens += num_scheduled_tokens
                 max_computed = seq.get_len()
                 if seq.seq_id in scheduler_outputs.speculative_seq_ids:
-                    max_computed += len(seq.speculative_token_ids)
+                    max_computed += scheduler_outputs.speculative_token_counts[
+                        seq.seq_id
+                    ]
                 assert seq.num_computed_tokens <= max_computed, (
                     f"Sequence {seq.seq_id} computed "
                     f"{seq.num_computed_tokens} tokens, but has "
@@ -515,7 +602,9 @@ class Scheduler:
                     output.output_token_ids, output.output_logprobs
                 ):
                     seq.append_token_id(token_id, logprobs)
-                seq.set_speculative_tokens(output.draft_token_ids)
+                seq.set_speculative_tokens(
+                    output.draft_token_ids, output.draft_confidence
+                )
                 self.block_manager.cache_blocks(seq)
             sampled_groups.append(seq_group)
         # Return a shallow copy of the running queue to prevent the queue

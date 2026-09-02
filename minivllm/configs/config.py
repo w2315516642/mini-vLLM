@@ -1,5 +1,5 @@
 import torch
-from typing import Optional
+from typing import Optional, Sequence
 from loguru import logger
 from transformers import AutoConfig, PretrainedConfig
 
@@ -188,12 +188,33 @@ class SchedulerConfig:
         max_num_batched_tokens: int,
         max_num_seqs: int,
         num_speculative_tokens: int = 0,
+        speculative_adaptive: bool = False,
+        speculative_cost_token_counts: Optional[Sequence[int]] = None,
+        speculative_cost_latency_ms: Optional[Sequence[float]] = None,
+        speculative_draft_latency_ms: float = 0.0,
+        speculative_min_survival: float = 0.0,
     ) -> None:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_seqs = max_num_seqs
         if num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
         self.num_speculative_tokens = num_speculative_tokens
+        self.speculative_adaptive = bool(speculative_adaptive)
+        self.speculative_cost_token_counts = (
+            tuple(speculative_cost_token_counts)
+            if speculative_cost_token_counts is not None else None
+        )
+        self.speculative_cost_latency_ms = (
+            tuple(speculative_cost_latency_ms)
+            if speculative_cost_latency_ms is not None else None
+        )
+        if (
+            (self.speculative_cost_token_counts is None)
+            != (self.speculative_cost_latency_ms is None)
+        ):
+            raise ValueError("Speculative cost profile requires both axes")
+        self.speculative_draft_latency_ms = float(speculative_draft_latency_ms)
+        self.speculative_min_survival = float(speculative_min_survival)
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

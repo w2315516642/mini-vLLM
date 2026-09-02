@@ -16,7 +16,7 @@
 | 3 | Draft KV cache 与块内双向 attention | 已完成 |
 | 4 | 静态贪心块验证、调度与 GDN 状态事务 | 已完成 |
 | 5 | 精确随机 rejection sampling | 已完成 |
-| 6 | confidence-scheduled 自适应验证 | 未开始 |
+| 6 | confidence-scheduled 自适应验证 | 已完成 |
 | 7 | TP2、显存核算、融合算子与真实模型入口 | 未开始 |
 | 8 | Mooncake 风格 PD 分离组合 | 未开始 |
 
@@ -78,3 +78,18 @@ temperature、top-k、top-p、presence/frequency penalty；每个草稿 token �
 
 验收结果：7 项变换、接受/拒绝、经验分布及 Qwen 分发测试全部通过；4000
 次固定随机种子的首 token 经验分布在 0.025 绝对误差内匹配 Target。
+
+## 阶段 6：置信度自适应验证
+
+本阶段把 confidence head 的逐位置概率转成“到达该位置”的 survival
+probability（前缀概率连乘），再把一个 batch 内所有候选位置按边际收益统一
+排序。规划器用实测 Target token 数到延迟的 cost profile 枚举停止点，选择
+期望输出 token/s 最大的前缀；所选位置天然满足每条序列的前缀闭包，不会
+验证第 5 个草稿却跳过第 4 个。
+
+调度器保存每条序列本轮实际验证宽度，只向 Worker 发送对应草稿前缀，并按
+该宽度计算 token budget、物理槽位和最大可提交进度。没有 confidence 或未
+开启 adaptive 时仍使用完整静态块。
+
+验收结果：4 项 cost profile、全局排序、预算限制和调度集成测试通过；同时
+重跑静态块与原有 MTP 调度测试，共 19 项全部通过。

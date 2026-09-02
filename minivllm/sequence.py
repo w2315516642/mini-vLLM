@@ -98,6 +98,7 @@ class Sequence:
         # The target verifies the previous known token followed by this draft
         # block. Native MTP uses a one-token block; DSpark may provide more.
         self.speculative_token_ids: List[int] = []
+        self.speculative_confidence: List[float] = []
 
         self.block_hashes: List[BlockHash] = []
         self.logical_token_blocks: List[LogicalTokenBlock] = []
@@ -180,6 +181,7 @@ class Sequence:
         child_seq.num_cached_blocks = self.num_cached_blocks
         child_seq.block_hashes = self.block_hashes.copy()
         child_seq.speculative_token_ids = self.speculative_token_ids.copy()
+        child_seq.speculative_confidence = self.speculative_confidence.copy()
         return None
 
     @property
@@ -191,10 +193,23 @@ class Sequence:
 
     @speculative_token_id.setter
     def speculative_token_id(self, token_id: Optional[int]) -> None:
-        self.speculative_token_ids = [] if token_id is None else [int(token_id)]
+        self.set_speculative_tokens(
+            [] if token_id is None else [int(token_id)]
+        )
 
-    def set_speculative_tokens(self, token_ids: List[int]) -> None:
+    def set_speculative_tokens(
+        self,
+        token_ids: List[int],
+        confidence: Optional[List[float]] = None,
+    ) -> None:
         self.speculative_token_ids = [int(token_id) for token_id in token_ids]
+        self.speculative_confidence = (
+            [] if confidence is None else [float(value) for value in confidence]
+        )
+        if self.speculative_confidence and (
+            len(self.speculative_confidence) != len(self.speculative_token_ids)
+        ):
+            raise ValueError("Draft confidence must match draft token count")
 
     def __repr__(self) -> str:
         return (f'Sequence(seq_id={self.seq_id}, '
@@ -295,6 +310,7 @@ class SequenceOutputs:
         num_computed_tokens: Optional[int] = None,
         draft_token_id: Optional[int] = None,
         draft_token_ids: Optional[List[int]] = None,
+        draft_confidence: Optional[List[float]] = None,
     ) -> None:
         self.seq_id = seq_id
         self.parent_seq_id = parent_seq_id
@@ -309,10 +325,21 @@ class SequenceOutputs:
         self.num_computed_tokens = num_computed_tokens
         if draft_token_ids is None:
             draft_token_ids = [] if draft_token_id is None else [draft_token_id]
-        self.set_draft_tokens(draft_token_ids)
+        self.set_draft_tokens(draft_token_ids, draft_confidence)
 
-    def set_draft_tokens(self, token_ids: List[int]) -> None:
+    def set_draft_tokens(
+        self,
+        token_ids: List[int],
+        confidence: Optional[List[float]] = None,
+    ) -> None:
         self.draft_token_ids = [int(token_id) for token_id in token_ids]
+        self.draft_confidence = (
+            [] if confidence is None else [float(value) for value in confidence]
+        )
+        if self.draft_confidence and (
+            len(self.draft_confidence) != len(self.draft_token_ids)
+        ):
+            raise ValueError("Draft confidence must match draft token count")
         self.draft_token_id = (
             self.draft_token_ids[0] if self.draft_token_ids else None
         )
@@ -332,4 +359,5 @@ class SequenceOutputs:
                 self.output_token_ids == other.output_token_ids and
                 self.output_logprobs == other.output_logprobs and
                 self.num_computed_tokens == other.num_computed_tokens and
-                self.draft_token_ids == other.draft_token_ids)
+                self.draft_token_ids == other.draft_token_ids and
+                self.draft_confidence == other.draft_confidence)
