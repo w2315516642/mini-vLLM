@@ -19,6 +19,10 @@ from minivllm.distributed.kv_transfer.manager import (
     TransferMetrics,
     TransferResourceLease,
 )
+from minivllm.distributed.kv_transfer.topology import (
+    PDTransferTopology,
+    RankTransferPair,
+)
 from minivllm.distributed.kv_transfer.types import (
     BufferSlice,
     RegisteredBuffer,
@@ -40,6 +44,8 @@ __all__ = [
     "KVTransferPlanner",
     "ManagedTransfer",
     "P2PTransferBackend",
+    "PDTransferTopology",
+    "RankTransferPair",
     "TransferBackend",
     "TransferEndpoint",
     "TransferHandle",

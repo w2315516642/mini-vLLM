@@ -7,6 +7,7 @@ from typing import List
 
 from minivllm.distributed.kv_transfer import (
     KVTransferPlanner,
+    PDTransferTopology,
     TransferStatus,
 )
 from minivllm.engine.pd_coordinator import (
@@ -37,25 +38,25 @@ class PDEngineBridge:
             self.coordinator.reserve_decode(request_id, reservation)
             source_layouts = self.prefill_engine.get_transfer_layouts()
             target_layouts = self.decode_engine.get_transfer_layouts()
-            if len(source_layouts) != len(target_layouts):
-                raise ValueError("P and D must use equal tensor parallel sizes")
+            topology = PDTransferTopology.build(
+                source_layouts, target_layouts
+            )
             self.coordinator.start_transfer(request_id, transfer_id)
             sequence = handoff.sequences[0]
             num_blocks = (
                 sequence.num_computed_tokens
-                + source_layouts[0].block_size
+                + topology.pairs[0].source.block_size
                 - 1
-            ) // source_layouts[0].block_size
+            ) // topology.pairs[0].source.block_size
             target_blocks = reservation.block_tables[sequence.seq_id]
             plans = []
-            for rank, (source_layout, target_layout) in enumerate(
-                zip(source_layouts, target_layouts)
-            ):
+            for pair in topology.pairs:
+                rank = pair.rank
                 plan = KVTransferPlanner.build_plan(
                     transfer_id=f"{transfer_id}/rank-{rank}",
                     request_id=request_id,
-                    source=source_layout,
-                    target=target_layout,
+                    source=pair.source,
+                    target=pair.target,
                     source_block_ids=sequence.source_block_ids[:num_blocks],
                     target_block_ids=target_blocks[:num_blocks],
                     num_tokens=sequence.num_computed_tokens,
