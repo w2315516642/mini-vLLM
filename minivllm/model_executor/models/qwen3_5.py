@@ -54,6 +54,10 @@ from minivllm.model_executor.weight_utils import (
 from minivllm.model_executor.models.qwen3_5_vision import Qwen3_5VisionModel
 from minivllm.sequence import SequenceOutputs
 from minivllm.spec_decode.greedy_verifier import verify_greedy_block
+from minivllm.spec_decode.rejection_sampler import (
+    rejection_sample_block,
+    target_block_probs,
+)
 from minivllm.worker.hybrid_cache import HybridCache
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -1156,22 +1160,59 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     ]:
         outputs: Dict[int, SequenceOutputs] = {}
         proposal_contexts = []
-        for seq_id, draft_token_ids, indices, sampling_params in zip(
+        draft_probability_blocks = input_metadata.speculative_draft_probs or (
+            [None] * len(input_metadata.speculative_seq_ids)
+        )
+        for seq_id, draft_token_ids, indices, sampling_params, draft_probs in zip(
             input_metadata.speculative_seq_ids,
             input_metadata.speculative_token_blocks,
             input_metadata.speculative_hidden_indices,
             input_metadata.speculative_sampling_params,
+            draft_probability_blocks,
         ):
             block_logits = self._compute_logits(
                 hidden_states[list(indices)]
             )
-            block_logprobs = F.log_softmax(block_logits, dim=-1)
-            verification = verify_greedy_block(
-                block_logits,
-                draft_token_ids,
-                is_eos=self._is_eos,
-                ignore_eos=sampling_params.ignore_eos,
-            )
+            if sampling_params.temperature == 0.0:
+                verification = verify_greedy_block(
+                    block_logits,
+                    draft_token_ids,
+                    is_eos=self._is_eos,
+                    ignore_eos=sampling_params.ignore_eos,
+                )
+                target_rows = verification.logit_indices
+                block_logprobs = F.log_softmax(block_logits, dim=-1)
+            else:
+                if draft_probs is None:
+                    raise ValueError(
+                        "Stochastic speculation requires saved draft probabilities"
+                    )
+                sampling_top_k = min(
+                    sampling_params.top_k, self.config.vocab_size
+                )
+                target_probs = target_block_probs(
+                    block_logits,
+                    output_history=input_metadata.seq_data[
+                        seq_id
+                    ].output_token_ids,
+                    draft_token_ids=draft_token_ids,
+                    temperature=sampling_params.temperature,
+                    top_p=sampling_params.top_p,
+                    top_k=sampling_top_k,
+                    presence_penalty=sampling_params.presence_penalty,
+                    frequency_penalty=sampling_params.frequency_penalty,
+                )
+                verification = rejection_sample_block(
+                    target_probs,
+                    draft_probs.to(target_probs.device, target_probs.dtype),
+                    draft_token_ids,
+                    is_eos=self._is_eos,
+                    ignore_eos=sampling_params.ignore_eos,
+                )
+                target_rows = verification.target_row_indices
+                block_logprobs = target_probs.clamp_min(
+                    torch.finfo(target_probs.dtype).tiny
+                ).log()
             token_ids = list(verification.token_ids)
             token_logprobs = [
                 self._token_logprobs(
@@ -1180,7 +1221,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                     sampling_params.logprobs,
                 )
                 for token_id, logit_index in zip(
-                    verification.token_ids, verification.logit_indices
+                    verification.token_ids, target_rows
                 )
             ]
             selected_index = indices[verification.last_committed_index]

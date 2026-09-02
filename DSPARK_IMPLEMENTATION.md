@@ -15,7 +15,7 @@
 | 2 | DFlash 草稿模型、权重加载与目标层特征 | 已完成 |
 | 3 | Draft KV cache 与块内双向 attention | 已完成 |
 | 4 | 静态贪心块验证、调度与 GDN 状态事务 | 已完成 |
-| 5 | 精确随机 rejection sampling | 未开始 |
+| 5 | 精确随机 rejection sampling | 已完成 |
 | 6 | confidence-scheduled 自适应验证 | 未开始 |
 | 7 | TP2、显存核算、融合算子与真实模型入口 | 未开始 |
 | 8 | Mooncake 风格 PD 分离组合 | 未开始 |
@@ -67,3 +67,14 @@ Worker 因此在验证前保存快照：若只接受草稿前缀，则恢复原�
 
 验收结果：新增 6 项 DSpark 块验证、变长调度和重放计划测试，与原有 9 项
 prefix/MTP 调度测试全部通过；原生 Qwen MTP CUDA 端到端测试继续通过。
+
+## 阶段 5：精确随机验证
+
+本阶段让 DSpark 支持非零 temperature。Draft 和 Target 都先应用相同的
+temperature、top-k、top-p、presence/frequency penalty；每个草稿 token 以
+`min(1, p(token) / q(token))` 的概率接受。首个拒绝位置从归一化的
+`max(p - q, 0)` 分布采样修正 token，全部接受后从 Target 最后一行采 bonus。
+该算法保持输出分布与直接从 Target 采样一致。
+
+验收结果：7 项变换、接受/拒绝、经验分布及 Qwen 分发测试全部通过；4000
+次固定随机种子的首 token 经验分布在 0.025 绝对误差内匹配 Target。

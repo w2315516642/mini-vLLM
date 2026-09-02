@@ -140,14 +140,20 @@ class Scheduler:
             return False
         params = seq_group.sampling_params
         output_budget = len(seqs[0].speculative_token_ids) + 1
-        return (
-            params.temperature == 0.0
-            and params.best_of == 1
+        common_supported = (
+            params.best_of == 1
             and not params.use_beam_search
-            and params.presence_penalty == 0.0
-            and params.frequency_penalty == 0.0
             and not params.stop
             and seqs[0].get_output_len() + output_budget <= params.max_tokens
+        )
+        if not common_supported:
+            return False
+        # Native MTP does not preserve its proposal distribution. DSpark does,
+        # so a multi-token drafter can also use exact stochastic verification.
+        return max_draft_tokens > 1 or (
+            params.temperature == 0.0
+            and params.presence_penalty == 0.0
+            and params.frequency_penalty == 0.0
         )
     
     def _schedule(self) -> Tuple[SchedulerOutputs, List[str]]:

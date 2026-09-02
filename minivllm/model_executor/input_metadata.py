@@ -42,6 +42,7 @@ class InputMetadata:
         speculative_hidden_indices: Optional[List[Tuple[int, ...]]] = None,
         enable_mtp: bool = False,
         speculative_sampling_params: Optional[List[SamplingParams]] = None,
+        speculative_draft_probs: Optional[List[torch.Tensor]] = None,
         multimodal_inputs: Optional[Dict[int, MultiModalInputs]] = None,
         multimodal_token_maps: Optional[
             List[Tuple[int, int, int, int]]
@@ -96,6 +97,7 @@ class InputMetadata:
         ]
         self.enable_mtp = enable_mtp
         self.speculative_sampling_params = speculative_sampling_params or []
+        self.speculative_draft_probs = speculative_draft_probs or []
         self.multimodal_inputs = multimodal_inputs or {}
         # packed token index, sequence id, modality (1=image/2=video),
         # modality-local feature index.
@@ -107,6 +109,12 @@ class InputMetadata:
             == len(self.speculative_sampling_params)
         ):
             raise ValueError("Speculative metadata lists must have equal length")
+        if self.speculative_draft_probs and (
+            len(self.speculative_draft_probs) != len(self.speculative_seq_ids)
+        ):
+            raise ValueError(
+                "Draft probability metadata must match speculative sequences"
+            )
         self.num_prompt_tokens = sum(prompt_lens)
         self.num_fresh_prompt_tokens = sum(self.fresh_prompt_lens)
         self.num_cached_prompt_tokens = sum(self.cached_prompt_query_lens)
