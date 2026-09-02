@@ -191,8 +191,8 @@ class SchedulerConfig:
     ) -> None:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_seqs = max_num_seqs
-        if num_speculative_tokens not in (0, 1):
-            raise ValueError("Only MTP-1 speculative decoding is supported")
+        if num_speculative_tokens < 0:
+            raise ValueError("num_speculative_tokens must be non-negative")
         self.num_speculative_tokens = num_speculative_tokens
 
 

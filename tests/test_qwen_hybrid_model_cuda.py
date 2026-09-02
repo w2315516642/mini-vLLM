@@ -382,6 +382,7 @@ class QwenHybridModelCudaTest(unittest.TestCase):
             )[10]
 
             self.assertIsNotNone(first.draft_token_id)
+            self.assertEqual(first.draft_token_ids, [first.draft_token_id])
             current_token = first.output_token
             draft_token = first.draft_token_id
             seq_data = {10: SequenceData(prompt + [current_token])}

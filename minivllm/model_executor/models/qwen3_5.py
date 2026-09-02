@@ -53,6 +53,7 @@ from minivllm.model_executor.weight_utils import (
 )
 from minivllm.model_executor.models.qwen3_5_vision import Qwen3_5VisionModel
 from minivllm.sequence import SequenceOutputs
+from minivllm.spec_decode.greedy_verifier import verify_greedy_block
 from minivllm.worker.hybrid_cache import HybridCache
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -1155,47 +1156,36 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     ]:
         outputs: Dict[int, SequenceOutputs] = {}
         proposal_contexts = []
-        for seq_id, draft_token_id, indices, sampling_params in zip(
+        for seq_id, draft_token_ids, indices, sampling_params in zip(
             input_metadata.speculative_seq_ids,
-            input_metadata.speculative_token_ids,
+            input_metadata.speculative_token_blocks,
             input_metadata.speculative_hidden_indices,
             input_metadata.speculative_sampling_params,
         ):
-            first_idx, second_idx = indices
-            pair_logits = self._compute_logits(
-                hidden_states[[first_idx, second_idx]]
+            block_logits = self._compute_logits(
+                hidden_states[list(indices)]
             )
-            pair_logprobs = F.log_softmax(pair_logits, dim=-1)
-            target_token_id = int(torch.argmax(pair_logits[0]).item())
-
-            if target_token_id == draft_token_id:
-                bonus_token_id = int(torch.argmax(pair_logits[1]).item())
-                token_ids = [draft_token_id]
-                token_logprobs = [self._token_logprobs(
-                    pair_logprobs[0],
-                    draft_token_id,
+            block_logprobs = F.log_softmax(block_logits, dim=-1)
+            verification = verify_greedy_block(
+                block_logits,
+                draft_token_ids,
+                is_eos=self._is_eos,
+                ignore_eos=sampling_params.ignore_eos,
+            )
+            token_ids = list(verification.token_ids)
+            token_logprobs = [
+                self._token_logprobs(
+                    block_logprobs[logit_index],
+                    token_id,
                     sampling_params.logprobs,
-                )]
-                if not self._is_eos(draft_token_id):
-                    token_ids.append(bonus_token_id)
-                    token_logprobs.append(self._token_logprobs(
-                        pair_logprobs[1],
-                        bonus_token_id,
-                        sampling_params.logprobs,
-                    ))
-                selected_hidden = hidden_states[second_idx]
-                selected_position = self._position_at(positions, second_idx)
-                consumed_tokens = 2
-            else:
-                token_ids = [target_token_id]
-                token_logprobs = [self._token_logprobs(
-                    pair_logprobs[0],
-                    target_token_id,
-                    sampling_params.logprobs,
-                )]
-                selected_hidden = hidden_states[first_idx]
-                selected_position = self._position_at(positions, first_idx)
-                consumed_tokens = 1
+                )
+                for token_id, logit_index in zip(
+                    verification.token_ids, verification.logit_indices
+                )
+            ]
+            selected_index = indices[verification.last_committed_index]
+            selected_hidden = hidden_states[selected_index]
+            selected_position = self._position_at(positions, selected_index)
 
             output = SequenceOutputs(
                 seq_id=seq_id,
@@ -1204,7 +1194,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                 logprobs=token_logprobs[0],
                 output_token_ids=token_ids,
                 output_logprobs=token_logprobs,
-                num_computed_tokens=consumed_tokens,
+                num_computed_tokens=verification.committed_tokens,
             )
             outputs[seq_id] = output
             final_token_id = token_ids[-1]
@@ -1280,7 +1270,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         draft_logits = self._compute_logits(mtp_hidden)
         draft_token_ids = torch.argmax(draft_logits, dim=-1).tolist()
         for context, draft_token_id in zip(contexts, draft_token_ids):
-            context[0].draft_token_id = int(draft_token_id)
+            context[0].set_draft_tokens([int(draft_token_id)])
 
     def forward(
         self,

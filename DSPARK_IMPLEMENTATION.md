@@ -14,7 +14,7 @@
 | 1 | DSpark 配置、Markov 与 confidence 输出头 | 已完成 |
 | 2 | DFlash 草稿模型、权重加载与目标层特征 | 已完成 |
 | 3 | Draft KV cache 与块内双向 attention | 已完成 |
-| 4 | 静态贪心块验证、调度与 GDN 状态事务 | 未开始 |
+| 4 | 静态贪心块验证、调度与 GDN 状态事务 | 已完成 |
 | 5 | 精确随机 rejection sampling | 未开始 |
 | 6 | confidence-scheduled 自适应验证 | 未开始 |
 | 7 | TP2、显存核算、融合算子与真实模型入口 | 未开始 |
@@ -53,3 +53,17 @@ prefill 传 `true`，DFlash 当前块传 `false`。后者让块内所有 query �
 验收结果：完成 Draft cache 物理块映射、逐层 context K/V 物化和非因果
 块内 paged attention；WSL2 `mini-vllm` 环境编译 CUDA 扩展后，DSpark、
 GQA 与 Qwen gated attention 共 11 项 CUDA/接口测试全部通过。
+
+## 阶段 4：静态块验证与状态事务
+
+本阶段把原有 MTP-1 扩展为统一的线性草稿块协议。调度器为“已知锚点 +
+草稿块”精确预留物理槽位；Target 的每个 logits 行依次验证一个草稿，首个
+不匹配位置输出 Target 修正 token，全部接受时再输出 bonus token。MTP 仍是
+块长为 1 的同一条路径。
+
+Qwen3.8 的 GDN state 不能像 paged KV 一样靠缩短逻辑长度隐藏错误写入。
+Worker 因此在验证前保存快照：若只接受草稿前缀，则恢复原状态，再按顺序
+重放锚点和已接受草稿；全接受时直接保留一次验证得到的状态。
+
+验收结果：新增 6 项 DSpark 块验证、变长调度和重放计划测试，与原有 9 项
+prefix/MTP 调度测试全部通过；原生 Qwen MTP CUDA 端到端测试继续通过。

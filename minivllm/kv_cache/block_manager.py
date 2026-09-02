@@ -296,12 +296,29 @@ class BlockSpaceManager:
         seq_group: SequenceGroup,
         num_slots: int,
     ) -> bool:
-        """Conservatively reserve decode plus speculative lookahead slots."""
+        """Check physical blocks needed by decode plus draft lookahead."""
         if num_slots <= 0:
             raise ValueError("num_slots must be positive")
         num_available_blocks = self._get_num_available_gpu_blocks()
-        num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
-        return num_seqs * num_slots <= num_available_blocks
+        num_required_blocks = 0
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            block_table = self.block_tables[seq.seq_id]
+            # The first scheduled input is already a known sequence token;
+            # only the remaining positions are speculative lookahead.
+            num_tokens = seq.get_len() + num_slots - 1
+            required_table_len = (
+                num_tokens + self.block_size - 1
+            ) // self.block_size
+            num_required_blocks += max(
+                required_table_len - len(block_table), 0
+            )
+            if (
+                block_table
+                and len(block_table) >= len(seq.logical_token_blocks)
+                and block_table[-1].ref_count > 1
+            ):
+                num_required_blocks += 1
+        return num_required_blocks <= num_available_blocks
 
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
@@ -329,15 +346,21 @@ class BlockSpaceManager:
             self.gpu_allocator.free(last_block)
             return last_block.block_id, new_block.block_id
 
-    def append_lookahead_slot(self, seq: Sequence) -> None:
-        """Ensure the one-token MTP proposal has a writable physical block."""
+    def append_lookahead_slots(self, seq: Sequence, num_slots: int) -> None:
+        """Ensure a speculative block has writable physical cache slots."""
+        if num_slots < 0:
+            raise ValueError("num_slots must be non-negative")
         block_table = self.block_tables[seq.seq_id]
-        num_tokens_with_lookahead = seq.get_len() + 1
+        num_tokens_with_lookahead = seq.get_len() + num_slots
         required_blocks = (
             num_tokens_with_lookahead + self.block_size - 1
         ) // self.block_size
         while len(block_table) < required_blocks:
             block_table.append(self._allocate_gpu_block())
+
+    def append_lookahead_slot(self, seq: Sequence) -> None:
+        """Compatibility wrapper for native one-token MTP."""
+        self.append_lookahead_slots(seq, 1)
     
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.

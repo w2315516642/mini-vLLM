@@ -95,8 +95,9 @@ class Sequence:
         # Number of tokens which have been computed.
         self.num_computed_tokens: int = 0
         self.num_cached_blocks: int = 0
-        # Native MTP proposes at most one token beyond the normal decode input.
-        self.speculative_token_id: Optional[int] = None
+        # The target verifies the previous known token followed by this draft
+        # block. Native MTP uses a one-token block; DSpark may provide more.
+        self.speculative_token_ids: List[int] = []
 
         self.block_hashes: List[BlockHash] = []
         self.logical_token_blocks: List[LogicalTokenBlock] = []
@@ -178,8 +179,22 @@ class Sequence:
         child_seq.num_computed_tokens = self.num_computed_tokens
         child_seq.num_cached_blocks = self.num_cached_blocks
         child_seq.block_hashes = self.block_hashes.copy()
-        child_seq.speculative_token_id = self.speculative_token_id
+        child_seq.speculative_token_ids = self.speculative_token_ids.copy()
         return None
+
+    @property
+    def speculative_token_id(self) -> Optional[int]:
+        """Compatibility view used by the existing one-token MTP path."""
+        if not self.speculative_token_ids:
+            return None
+        return self.speculative_token_ids[0]
+
+    @speculative_token_id.setter
+    def speculative_token_id(self, token_id: Optional[int]) -> None:
+        self.speculative_token_ids = [] if token_id is None else [int(token_id)]
+
+    def set_speculative_tokens(self, token_ids: List[int]) -> None:
+        self.speculative_token_ids = [int(token_id) for token_id in token_ids]
 
     def __repr__(self) -> str:
         return (f'Sequence(seq_id={self.seq_id}, '
@@ -241,6 +256,7 @@ class SequenceGroupMetadata:
         do_sample: bool = True,
         is_speculative: bool = False,
         speculative_token_ids: Optional[Dict[int, int]] = None,
+        speculative_token_blocks: Optional[Dict[int, List[int]]] = None,
         multi_modal_inputs: Optional[MultiModalInputs] = None,
     ) -> None:
         self.request_id = request_id
@@ -260,6 +276,10 @@ class SequenceGroupMetadata:
         self.do_sample = do_sample
         self.is_speculative = is_speculative
         self.speculative_token_ids = speculative_token_ids or {}
+        self.speculative_token_blocks = speculative_token_blocks or {
+            seq_id: [token_id]
+            for seq_id, token_id in self.speculative_token_ids.items()
+        }
         self.multi_modal_inputs = multi_modal_inputs
         
 
@@ -274,6 +294,7 @@ class SequenceOutputs:
         output_logprobs: Optional[List[Dict[int, float]]] = None,
         num_computed_tokens: Optional[int] = None,
         draft_token_id: Optional[int] = None,
+        draft_token_ids: Optional[List[int]] = None,
     ) -> None:
         self.seq_id = seq_id
         self.parent_seq_id = parent_seq_id
@@ -286,7 +307,15 @@ class SequenceOutputs:
                 "output_token_ids and output_logprobs must have equal length"
             )
         self.num_computed_tokens = num_computed_tokens
-        self.draft_token_id = draft_token_id
+        if draft_token_ids is None:
+            draft_token_ids = [] if draft_token_id is None else [draft_token_id]
+        self.set_draft_tokens(draft_token_ids)
+
+    def set_draft_tokens(self, token_ids: List[int]) -> None:
+        self.draft_token_ids = [int(token_id) for token_id in token_ids]
+        self.draft_token_id = (
+            self.draft_token_ids[0] if self.draft_token_ids else None
+        )
 
     def __repr__(self) -> str:
         return (f'SequenceOutputs(seq_id={self.seq_id}, '
@@ -303,4 +332,4 @@ class SequenceOutputs:
                 self.output_token_ids == other.output_token_ids and
                 self.output_logprobs == other.output_logprobs and
                 self.num_computed_tokens == other.num_computed_tokens and
-                self.draft_token_id == other.draft_token_id)
+                self.draft_token_ids == other.draft_token_ids)

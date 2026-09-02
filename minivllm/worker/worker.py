@@ -16,6 +16,9 @@ from minivllm.model_executor.parallel_utils.parallel_state import (
     initialize_all_reduce_launcher, initialize_model_parallel)
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
+from minivllm.spec_decode.state_transaction import (
+    build_speculative_replay_plan,
+)
 from minivllm.worker.cache_engine import CacheEngine
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
@@ -193,7 +196,8 @@ class Worker:
         prompt_sample_indices: List[int] = []
         speculative_seq_ids: List[int] = []
         speculative_token_ids: List[int] = []
-        speculative_hidden_indices: List[Tuple[int, int]] = []
+        speculative_token_blocks: List[List[int]] = []
+        speculative_hidden_indices: List[Tuple[int, ...]] = []
         speculative_sampling_params: List[SamplingParams] = []
         multimodal_inputs = {}
         multimodal_token_maps: List[Tuple[int, int, int, int]] = []
@@ -257,16 +261,18 @@ class Worker:
             query_len = metadata.num_scheduled_tokens[seq_id]
             end = start + query_len
             if metadata.is_speculative:
-                assert query_len == 2 and start + 1 == seq_data.get_len()
-                draft_token_id = metadata.speculative_token_ids[seq_id]
-                query_token_ids = [
-                    seq_data.get_token_ids()[start], draft_token_id
-                ]
-                speculative_seq_ids.append(seq_id)
-                speculative_token_ids.append(draft_token_id)
-                speculative_hidden_indices.append(
-                    (len(input_token_ids), len(input_token_ids) + 1)
+                draft_tokens = metadata.speculative_token_blocks[seq_id]
+                assert (
+                    query_len == len(draft_tokens) + 1
+                    and start + 1 == seq_data.get_len()
                 )
+                query_token_ids = [seq_data.get_token_ids()[start]] + draft_tokens
+                speculative_seq_ids.append(seq_id)
+                speculative_token_ids.append(draft_tokens[0])
+                speculative_token_blocks.append(draft_tokens)
+                speculative_hidden_indices.append(tuple(range(
+                    len(input_token_ids), len(input_token_ids) + query_len
+                )))
                 speculative_sampling_params.append(metadata.sampling_params)
             else:
                 assert 0 < query_len and end <= seq_data.get_len()
@@ -416,6 +422,7 @@ class Worker:
             prompt_sample_indices=prompt_sample_indices,
             speculative_seq_ids=speculative_seq_ids,
             speculative_token_ids=speculative_token_ids,
+            speculative_token_blocks=speculative_token_blocks,
             speculative_hidden_indices=speculative_hidden_indices,
             enable_mtp=(
                 getattr(
@@ -491,25 +498,35 @@ class Worker:
             input_metadata=input_metadata,
             cache_events=cache_events,
         )
-        rejected_seq_ids = [
-            seq_id for seq_id in input_metadata.speculative_seq_ids
-            if output[seq_id].num_computed_tokens == 1
-        ]
-        if rejected_seq_ids:
+        partially_accepted = {
+            seq_id: output[seq_id].num_computed_tokens
+            for seq_id, draft_tokens in zip(
+                input_metadata.speculative_seq_ids,
+                input_metadata.speculative_token_blocks,
+            )
+            if output[seq_id].num_computed_tokens < len(draft_tokens) + 1
+        }
+        if partially_accepted:
             assert self.hybrid_cache is not None and state_snapshot is not None
-            self.hybrid_cache.restore(state_snapshot, rejected_seq_ids)
-            self._replay_rejected_speculative_tokens(
-                seq_group_metadata_list, rejected_seq_ids
+            replay_seq_ids = list(partially_accepted)
+            self.hybrid_cache.restore(state_snapshot, replay_seq_ids)
+            self._replay_speculative_prefixes(
+                seq_group_metadata_list, partially_accepted
             )
         return output
 
-    def _replay_rejected_speculative_tokens(
+    def _replay_speculative_prefixes(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-        rejected_seq_ids: List[int],
+        committed_tokens: Dict[int, int],
     ) -> None:
-        """Rebuild target state through only the accepted verification input."""
-        rejected = set(rejected_seq_ids)
+        """Rebuild GDN state through each committed verification prefix.
+
+        Full-attention KV written for a rejected suffix may remain in physical
+        storage: the scheduler's logical context length hides it, and the next
+        decode overwrites those slots. Recurrent state has no such addressing,
+        so it must be restored and replayed in sequence order.
+        """
         token_ids: List[int] = []
         positions: List[int] = []
         positions_3d: List[List[int]] = [[], [], []]
@@ -518,36 +535,36 @@ class Worker:
         block_tables: List[List[int]] = []
         seq_data: Dict[int, SequenceData] = {}
         replay_seq_ids: List[int] = []
-        for metadata in seq_group_metadata_list:
-            if not metadata.is_speculative:
-                continue
-            seq_id = next(iter(metadata.seq_data))
-            if seq_id not in rejected:
-                continue
-            data = metadata.seq_data[seq_id]
-            position = metadata.num_computed_tokens[seq_id]
-            block_table = metadata.block_tables[seq_id]
-            token_ids.append(data.get_token_ids()[position])
-            multimodal = metadata.multi_modal_inputs
-            if multimodal is None:
-                position_values = (position, position, position)
-            else:
-                has_multimodal_positions = True
-                decode_position = position + multimodal.rope_delta
-                position_values = (
-                    decode_position,
-                    decode_position,
-                    decode_position,
+        replay_query_lens: List[int] = []
+        replay_context_lens: List[int] = []
+        replay_plan = build_speculative_replay_plan(
+            seq_group_metadata_list, committed_tokens
+        )
+        for item in replay_plan:
+            token_ids.extend(item.token_ids)
+            for position in item.positions:
+                multimodal = item.multimodal_inputs
+                if multimodal is None:
+                    position_values = (position, position, position)
+                else:
+                    has_multimodal_positions = True
+                    decode_position = position + multimodal.rope_delta
+                    position_values = (
+                        decode_position,
+                        decode_position,
+                        decode_position,
+                    )
+                positions.append(position)
+                for row, value in zip(positions_3d, position_values):
+                    row.append(value)
+                slot_mapping.append(
+                    _get_slot_id(item.block_table, position, self.block_size)
                 )
-            positions.append(position)
-            for row, value in zip(positions_3d, position_values):
-                row.append(value)
-            slot_mapping.append(
-                _get_slot_id(block_table, position, self.block_size)
-            )
-            block_tables.append(block_table)
-            seq_data[seq_id] = data
-            replay_seq_ids.append(seq_id)
+            block_tables.append(list(item.block_table))
+            replay_seq_ids.append(item.seq_id)
+            replay_query_lens.append(len(item.token_ids))
+            replay_context_lens.append(item.context_len)
+            seq_data[item.seq_id] = item.sequence_data
 
         num_tokens = len(token_ids)
         padded_tokens = _pad_to_alignment(token_ids, multiple_of=8)
@@ -559,13 +576,13 @@ class Worker:
         else:
             padded_positions = _pad_to_alignment(positions, multiple_of=8)
         device = torch.device("cuda")
-        cu_seqlens = torch.arange(
-            num_tokens + 1, dtype=torch.int32, device=device
-        )
+        cu_seqlens = [0]
+        for query_len in replay_query_lens:
+            cu_seqlens.append(cu_seqlens[-1] + query_len)
         replay_metadata = InputMetadata(
             seq_groups=[],
             seq_data=seq_data,
-            prompt_lens=[1] * num_tokens,
+            prompt_lens=replay_query_lens,
             slot_mapping=torch.tensor(
                 slot_mapping, dtype=torch.int32, device=device
             ),
@@ -573,17 +590,19 @@ class Worker:
             max_context_len=0,
             block_tables=torch.empty((0, 0), dtype=torch.int32, device=device),
             fresh_prompt_lens=[],
-            cached_prompt_query_lens=[1] * num_tokens,
-            cached_prompt_cu_seqlens=cu_seqlens,
+            cached_prompt_query_lens=replay_query_lens,
+            cached_prompt_cu_seqlens=torch.tensor(
+                cu_seqlens,
+                dtype=torch.int32,
+                device=device,
+            ),
             cached_prompt_context_lens=torch.tensor(
-                [position + 1 for position in positions],
+                replay_context_lens,
                 dtype=torch.int32,
                 device=device,
             ),
             cached_prompt_block_tables=_make_block_table_tensor(block_tables),
-            max_cached_prompt_context_len=max(
-                (position + 1 for position in positions), default=0
-            ),
+            max_cached_prompt_context_len=max(replay_context_lens, default=0),
             prompt_seq_ids=replay_seq_ids,
             prompt_sample_indices=[],
             enable_mtp=False,

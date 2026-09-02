@@ -38,7 +38,8 @@ class InputMetadata:
         prompt_sample_indices: Optional[List[int]] = None,
         speculative_seq_ids: Optional[List[int]] = None,
         speculative_token_ids: Optional[List[int]] = None,
-        speculative_hidden_indices: Optional[List[Tuple[int, int]]] = None,
+        speculative_token_blocks: Optional[List[List[int]]] = None,
+        speculative_hidden_indices: Optional[List[Tuple[int, ...]]] = None,
         enable_mtp: bool = False,
         speculative_sampling_params: Optional[List[SamplingParams]] = None,
         multimodal_inputs: Optional[Dict[int, MultiModalInputs]] = None,
@@ -82,7 +83,17 @@ class InputMetadata:
         self.num_prompt_samples = len(prompt_sample_indices)
         self.speculative_seq_ids = speculative_seq_ids or []
         self.speculative_token_ids = speculative_token_ids or []
-        self.speculative_hidden_indices = speculative_hidden_indices or []
+        if speculative_token_blocks is None:
+            speculative_token_blocks = [
+                [token_id] for token_id in self.speculative_token_ids
+            ]
+        self.speculative_token_blocks = [
+            [int(token_id) for token_id in block]
+            for block in speculative_token_blocks
+        ]
+        self.speculative_hidden_indices = [
+            tuple(indices) for indices in (speculative_hidden_indices or [])
+        ]
         self.enable_mtp = enable_mtp
         self.speculative_sampling_params = speculative_sampling_params or []
         self.multimodal_inputs = multimodal_inputs or {}
@@ -91,7 +102,7 @@ class InputMetadata:
         self.multimodal_token_maps = multimodal_token_maps or []
         if not (
             len(self.speculative_seq_ids)
-            == len(self.speculative_token_ids)
+            == len(self.speculative_token_blocks)
             == len(self.speculative_hidden_indices)
             == len(self.speculative_sampling_params)
         ):
