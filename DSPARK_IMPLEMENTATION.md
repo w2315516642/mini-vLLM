@@ -12,7 +12,7 @@
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | 1 | DSpark 配置、Markov 与 confidence 输出头 | 已完成 |
-| 2 | DFlash 草稿模型、权重加载与目标层特征 | 未开始 |
+| 2 | DFlash 草稿模型、权重加载与目标层特征 | 已完成 |
 | 3 | Draft KV cache 与块内双向 attention | 未开始 |
 | 4 | 静态贪心块验证、调度与 GDN 状态事务 | 未开始 |
 | 5 | 精确随机 rejection sampling | 未开始 |
@@ -31,3 +31,14 @@
 
 验收结果：WSL2 `mini-vllm` 环境运行 `tests.test_dspark_heads`，6 项测试
 全部通过。
+
+## 阶段 2：草稿骨干与目标层特征
+
+本阶段实现标准 Qwen3 GQA 草稿层，不能复用目标 Qwen3.8 的门控 Full
+Attention。目标模型通过默认关闭的 collector 回调暴露选定层输出；草稿
+模型把这些输出拼接投影为共享 context hidden，再由每个草稿层分别生成
+自己的 K/V。密集 reference 路径明确实现“历史上下文 + 块内双向注意力”，
+作为下一阶段 paged CUDA 路径的数值基准。
+
+验收结果：tiny DSpark 完成离线整块 proposal，目标层收集顺序、块内双向
+可见性和 packed QKV 权重映射均通过测试；阶段 1、2 合计 11 项测试通过。

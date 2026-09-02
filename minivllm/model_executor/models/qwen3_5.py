@@ -6,7 +6,7 @@ stream, while :class:`HybridCache` provides the different cache type required
 by each layer.
 """
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -930,6 +930,9 @@ class Qwen3_5Model(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[Sequence[Optional[torch.cuda.Event]]],
         inputs_embeds: Optional[torch.Tensor] = None,
+        hidden_state_collector: Optional[
+            Callable[[int, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         hidden_states = (
             self.embed_tokens(input_ids)
@@ -955,6 +958,8 @@ class Qwen3_5Model(nn.Module):
                 cache_event,
                 state_cache,
             )
+            if hidden_state_collector is not None:
+                hidden_state_collector(layer_idx, hidden_states)
         return self.norm(hidden_states)
 
 
