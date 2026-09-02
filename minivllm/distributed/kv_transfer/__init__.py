@@ -13,6 +13,12 @@ from minivllm.distributed.kv_transfer.layout import (
     register_cache_layout,
 )
 from minivllm.distributed.kv_transfer.p2p import P2PTransferBackend
+from minivllm.distributed.kv_transfer.manager import (
+    ManagedTransfer,
+    TransferManager,
+    TransferMetrics,
+    TransferResourceLease,
+)
 from minivllm.distributed.kv_transfer.types import (
     BufferSlice,
     RegisteredBuffer,
@@ -32,12 +38,16 @@ __all__ = [
     "InMemoryTransferRegistry",
     "RegisteredBuffer",
     "KVTransferPlanner",
+    "ManagedTransfer",
     "P2PTransferBackend",
     "TransferBackend",
     "TransferEndpoint",
     "TransferHandle",
+    "TransferManager",
+    "TransferMetrics",
     "TransferPlan",
     "TransferSlice",
     "TransferStatus",
+    "TransferResourceLease",
     "register_cache_layout",
 ]

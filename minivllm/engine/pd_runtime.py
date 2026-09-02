@@ -47,7 +47,7 @@ class PDEngineBridge:
                 - 1
             ) // source_layouts[0].block_size
             target_blocks = reservation.block_tables[sequence.seq_id]
-            results: List[dict] = []
+            plans = []
             for rank, (source_layout, target_layout) in enumerate(
                 zip(source_layouts, target_layouts)
             ):
@@ -65,10 +65,15 @@ class PDEngineBridge:
                     ),
                     metadata={"rank": rank},
                 )
-                result = self.prefill_engine.execute_rank_cache_transfer(
-                    rank, plan
-                )
-                results.append(result)
+                plans.append(plan)
+            if hasattr(self.prefill_engine, "execute_cache_transfers"):
+                results = self.prefill_engine.execute_cache_transfers(plans)
+            else:
+                results = [
+                    self.prefill_engine.execute_rank_cache_transfer(rank, plan)
+                    for rank, plan in enumerate(plans)
+                ]
+            for rank, result in enumerate(results):
                 if result["status"] != TransferStatus.COMPLETED.value:
                     raise RuntimeError(
                         f"rank {rank} cache transfer failed: "

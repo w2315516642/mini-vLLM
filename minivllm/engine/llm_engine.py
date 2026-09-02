@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional
 import time
 
@@ -462,6 +463,26 @@ class LLMEngine:
         if self.pd_config.role != PDRole.PREFILL:
             raise RuntimeError("only a prefill engine submits cache transfers")
         return self._run_worker_at(rank, "execute_cache_transfer", plan)
+
+    def execute_cache_transfers(
+        self,
+        plans: List[TransferPlan],
+    ) -> List[dict]:
+        """Execute one cache plan per TP rank without serializing the ranks."""
+        if len(plans) != len(self.workers):
+            raise ValueError("one transfer plan is required for each TP rank")
+        if self.parallel_config.worker_use_ray:
+            refs = [
+                worker.execute_cache_transfer.remote(plan)
+                for worker, plan in zip(self.workers, plans)
+            ]
+            return ray.get(refs)
+        with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
+            futures = [
+                executor.submit(worker.execute_cache_transfer, plan)
+                for worker, plan in zip(self.workers, plans)
+            ]
+            return [future.result() for future in futures]
 
     def _flush_pending_state_operations(self) -> None:
         releases, copies = self.scheduler.pop_pending_state_operations()
