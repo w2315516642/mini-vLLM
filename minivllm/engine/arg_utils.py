@@ -4,7 +4,8 @@ import dataclasses
 from dataclasses import dataclass
 
 from minivllm.configs import (
-    CacheConfig, ModelConfig, ParallelConfig, SchedulerConfig
+    CacheConfig, KVTransferBackend, ModelConfig, ParallelConfig, PDConfig,
+    PDRole, SchedulerConfig
 )
 
 
@@ -32,6 +33,14 @@ class EngineArgs:
     speculative_adaptive: bool = False
     speculative_min_survival: float = 0.0
     disable_log_stats: bool = False
+    pd_role: str = "unified"
+    pd_transfer_backend: str = "none"
+    pd_endpoint_id: str = ""
+    pd_hostname: str = ""
+    pd_peer_endpoint_id: str = ""
+    pd_peer_hostname: str = ""
+    pd_transfer_timeout: float = 30.0
+    pd_max_inflight_transfers: int = 8
 
     def __post_init__(self) -> None:
         self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
@@ -134,6 +143,28 @@ class EngineArgs:
         )
         parser.add_argument('--disable-log-stats', action='store_true',
                             help='disable logging statistics')
+        parser.add_argument(
+            '--pd-role', choices=['unified', 'prefill', 'decode'],
+            default=EngineArgs.pd_role,
+            help='run a unified, prefill-only, or decode-only engine',
+        )
+        parser.add_argument(
+            '--pd-transfer-backend', choices=['none', 'memory', 'tcp'],
+            default=EngineArgs.pd_transfer_backend,
+            help='cache data plane used by a prefill/decode engine',
+        )
+        parser.add_argument('--pd-endpoint-id', default='')
+        parser.add_argument('--pd-hostname', default='', help='local host:port')
+        parser.add_argument('--pd-peer-endpoint-id', default='')
+        parser.add_argument('--pd-peer-hostname', default='', help='peer host:port')
+        parser.add_argument(
+            '--pd-transfer-timeout', type=float,
+            default=EngineArgs.pd_transfer_timeout,
+        )
+        parser.add_argument(
+            '--pd-max-inflight-transfers', type=int,
+            default=EngineArgs.pd_max_inflight_transfers,
+        )
         return parser
 
     @classmethod
@@ -146,7 +177,13 @@ class EngineArgs:
 
     def create_engine_configs(
         self,
-    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig]:
+    ) -> Tuple[
+        ModelConfig,
+        CacheConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        PDConfig,
+    ]:
         # Initialize the configs.
         model_config = ModelConfig(
             self.model, self.download_dir, self.use_np_weights, 
@@ -170,6 +207,22 @@ class EngineArgs:
             draft_model=self.draft_model,
             draft_download_dir=(self.draft_download_dir or self.download_dir),
         )
-        return model_config, cache_config, parallel_config, scheduler_config
+        pd_config = PDConfig(
+            role=PDRole(self.pd_role),
+            backend=KVTransferBackend(self.pd_transfer_backend),
+            endpoint_id=self.pd_endpoint_id,
+            hostname=self.pd_hostname,
+            peer_endpoint_id=self.pd_peer_endpoint_id,
+            peer_hostname=self.pd_peer_hostname,
+            transfer_timeout_s=self.pd_transfer_timeout,
+            max_inflight_transfers=self.pd_max_inflight_transfers,
+        )
+        return (
+            model_config,
+            cache_config,
+            parallel_config,
+            scheduler_config,
+            pd_config,
+        )
 
     

@@ -224,6 +224,18 @@ class BlockSpaceManager:
         return (num_available_blocks - num_required_blocks
                 >= self.watermark_blocks)
 
+    def can_allocate_transferred(self, seq_group: SequenceGroup) -> bool:
+        """Check a D-side reservation without consulting local prefix hits."""
+        if seq_group.num_seqs() != 1:
+            return False
+        num_required_blocks = len(
+            seq_group.get_seqs()[0].logical_token_blocks
+        )
+        return (
+            self._get_num_available_gpu_blocks() - num_required_blocks
+            >= self.watermark_blocks
+        )
+
     def get_num_cached_tokens(self, seq_group: SequenceGroup) -> int:
         """Return the reusable prefix length without allocating block tables."""
         seq = seq_group.get_seqs()[0]
@@ -283,6 +295,29 @@ class BlockSpaceManager:
             seq.num_computed_tokens = num_computed_tokens
             seq.num_cached_blocks = len(hit_blocks)
             self.block_tables[seq.seq_id] = block_table.copy()
+
+    def allocate_transferred(
+        self,
+        seq_group: SequenceGroup,
+        num_computed_tokens: int,
+    ) -> None:
+        """Reserve fresh D blocks whose contents will arrive from P."""
+        if seq_group.num_seqs() != 1:
+            raise ValueError("PD handoff currently supports one sequence")
+        seq = seq_group.get_seqs()[0]
+        if not 0 < num_computed_tokens <= seq.get_prompt_len():
+            raise ValueError(
+                "transferred progress must lie inside the prompt"
+            )
+        if not self.can_allocate_transferred(seq_group):
+            raise ValueError("not enough GPU blocks for decode reservation")
+        block_table = [
+            self._allocate_gpu_block()
+            for _ in seq.logical_token_blocks
+        ]
+        seq.num_computed_tokens = num_computed_tokens
+        seq.num_cached_blocks = 0
+        self.block_tables[seq.seq_id] = block_table
     
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block

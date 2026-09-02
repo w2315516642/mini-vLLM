@@ -18,7 +18,7 @@
 | 5 | 精确随机 rejection sampling | 已完成 |
 | 6 | confidence-scheduled 自适应验证 | 已完成 |
 | 7 | TP2、显存核算、融合算子与真实模型入口 | 已完成 |
-| 8 | Mooncake 风格 PD 分离组合 | 未开始 |
+| 8 | Mooncake 风格 PD 分离组合 | 已完成 |
 
 ## 阶段 1：配置与输出头
 
@@ -139,3 +139,37 @@ outputs = llm.generate(
 验收结果：CUDA 12.8 下全量扩展编译成功；融合 Markov 算子的 FP16、BF16、
 FP32 与 tie-break 数值测试、完整 tiny DSpark context/paged proposal 测试、
 以及 17 项 GQA/GDN/Qwen hybrid CUDA 回归全部通过。
+
+## 阶段 8：Mooncake 风格 PD 分离组合
+
+本阶段把项目自有的 P/D 控制面和 cache 数据面组合到 DSpark 运行链路中，
+不导入 Mooncake。P worker 完成 prompt prefill 时，除了 Target 的 full-attention
+K/V 与 GDN recurrent state，还会把收集到的目标层特征投影到 Draft K/V。
+传输 layout 新增独立的 `draft_key`、`draft_value` 区域，并沿用 Target 的物理
+block 映射，因此 D 预留自己的 block 后可以一次接收三类持久状态。
+
+P 不在 handoff 前生成 speculative block。随机验证所需的逐 token 完整 q
+分布规模为 `draft_width * vocab_size`，把它放进控制面会破坏“小元数据、
+大 cache 走数据面”的边界。D 接管后先正常消费 P 已采样的首 token，同时把
+这一位置的目标特征补入收到的 Draft K/V；从该步输出开始再生成 DSpark
+proposal。这样只增加一次 decode warmup，不需要扩展 handoff 协议，也保持
+rejection sampling 的精确分布。
+
+资源生命周期仍由 PD coordinator 管理：P 的 Target/Draft blocks 在所有 TP
+rank 返回 ACK 前保持占用，D 的 blocks 和 GDN state slot 在传输前预留、传输
+成功后才进入 runnable queue。Draft workspace 只用于本地 proposal forward，
+虽然和持久 cache 一起注册，但 planner 只选择调度器拥有的 Target block id，
+不会搬运 workspace 内容。
+
+启动 P/D 时，两侧使用相同的 `--draft-model`、`--num-speculative-tokens` 和
+自适应验证参数。模型本体采用 TP=2 时，真正的 P/D 分离需要两套完整副本，
+即 P 两卡加 D 两卡；只有两张卡时可运行统一模式的 TP=2 DSpark，不能同时
+容纳两个 TP=2 role。
+
+验收范围：Draft K/V 跨不同物理 block id 搬运、P/D proposal 所有权、
+PD handoff 生命周期、TP layout 配对、DSpark 静态/随机/自适应验证及原有
+Qwen3.8 CUDA 路径回归。
+
+验收结果：WSL2 `mini-vllm` 环境中按模块隔离运行全仓测试，212 项全部
+通过；其中 21 项为显式启用 opt-in 开关后的 CUDA 数值测试。本阶段未修改
+C++/CUDA 源码，复用阶段 7 的已编译扩展完成验证。

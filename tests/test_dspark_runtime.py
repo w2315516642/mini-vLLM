@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from minivllm.configs.pd_config import PDRole
 from minivllm.sequence import SequenceOutputs
 from minivllm.worker.worker import Worker, _extend_draft_block_table
 
@@ -53,7 +54,17 @@ class DraftWorkerBookkeepingTest(unittest.TestCase):
             config=SimpleNamespace(eos_token_id=2)
         )
         worker._draft_probabilities = {}
+        worker.draft_model = object()
+        worker.pd_config = SimpleNamespace(role=PDRole.UNIFIED)
         return worker
+
+    def test_prefill_role_transfers_context_without_attaching_proposal(self):
+        worker = self.make_worker()
+        worker.pd_config = SimpleNamespace(role=PDRole.PREFILL)
+
+        self.assertFalse(worker._should_attach_dspark_drafts())
+        worker.pd_config = SimpleNamespace(role=PDRole.DECODE)
+        self.assertTrue(worker._should_attach_dspark_drafts())
 
     def test_partial_verification_advances_from_committed_prefix(self):
         worker = self.make_worker()

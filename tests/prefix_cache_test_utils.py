@@ -112,6 +112,25 @@ def load_worker_module():
         setattr(configs_config, name, object)
     sys.modules["minivllm.configs.config"] = configs_config
 
+    pd_config = types.ModuleType("minivllm.configs.pd_config")
+
+    class PDRole(str, Enum):
+        UNIFIED = "unified"
+        PREFILL = "prefill"
+        DECODE = "decode"
+
+    pd_config.KVTransferBackend = object
+    pd_config.PDConfig = object
+    pd_config.PDRole = PDRole
+    sys.modules["minivllm.configs.pd_config"] = pd_config
+
+    kv_transfer = types.ModuleType("minivllm.distributed.kv_transfer")
+    kv_transfer.CacheLayout = object
+    kv_transfer.P2PTransferBackend = object
+    kv_transfer.TransferPlan = object
+    kv_transfer.register_cache_layout = lambda *args, **kwargs: None
+    sys.modules["minivllm.distributed.kv_transfer"] = kv_transfer
+
     xformers = types.ModuleType("xformers")
     xformers_ops = types.ModuleType("xformers.ops")
     xformers_fmha = types.ModuleType("xformers.ops.fmha")
@@ -137,6 +156,7 @@ def load_worker_module():
     model_executor.InputMetadata = input_metadata.InputMetadata
     model_executor.set_random_seed = lambda *args, **kwargs: None
     model_executor.get_model = lambda *args, **kwargs: None
+    model_executor.get_dspark_model = lambda *args, **kwargs: None
     sys.modules["minivllm.model_executor"] = model_executor
 
     parallel_state = types.ModuleType(
@@ -156,6 +176,15 @@ def load_worker_module():
     cache_engine = types.ModuleType("minivllm.worker.cache_engine")
     cache_engine.CacheEngine = object
     sys.modules["minivllm.worker.cache_engine"] = cache_engine
+
+    draft_cache = types.ModuleType("minivllm.worker.draft_cache")
+    draft_cache.DraftCacheEngine = object
+    sys.modules["minivllm.worker.draft_cache"] = draft_cache
+
+    hybrid_cache = types.ModuleType("minivllm.worker.hybrid_cache")
+    hybrid_cache.GatedDeltaNetStateSpec = object
+    hybrid_cache.HybridCache = object
+    sys.modules["minivllm.worker.hybrid_cache"] = hybrid_cache
 
     device = types.ModuleType("minivllm.utils.device")
     device.get_gpu_memory = lambda *args, **kwargs: 0
