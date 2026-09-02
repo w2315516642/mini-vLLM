@@ -17,7 +17,7 @@
 | 4 | 静态贪心块验证、调度与 GDN 状态事务 | 已完成 |
 | 5 | 精确随机 rejection sampling | 已完成 |
 | 6 | confidence-scheduled 自适应验证 | 已完成 |
-| 7 | TP2、显存核算、融合算子与真实模型入口 | 未开始 |
+| 7 | TP2、显存核算、融合算子与真实模型入口 | 已完成 |
 | 8 | Mooncake 风格 PD 分离组合 | 未开始 |
 
 ## 阶段 1：配置与输出头
@@ -93,3 +93,49 @@ probability（前缀概率连乘），再把一个 batch 内所有候选位置�
 
 验收结果：4 项 cost profile、全局排序、预算限制和调度集成测试通过；同时
 重跑静态块与原有 MTP 调度测试，共 19 项全部通过。
+
+## 阶段 7：真实运行链路与融合算子
+
+本阶段把前六阶段的独立模块接入 Worker。目标 Qwen3.8 forward 通过可选
+collector 采集发布配置指定的 `5/19/33/47/61` 层输出；草稿模型复用目标
+embedding 和 TP LM head，并把目标特征投影到独立 Draft KV cache。Draft
+cache 镜像调度器物理 block id，额外给每个并发请求保留只在草稿 forward
+期间使用的 workspace block。Target 的 swap/copy 生命周期会同步应用到
+Draft cache，但 workspace 不进入调度器所有权。
+
+发布版 `RadixArk/Qwen3.8-27B-DSpark` 为 1.86B BF16、5 层、32 个 query
+head/8 个 KV head、hidden size 5120、vocab 248320。其草稿 RoPE 使用 YaRN，
+因此由 Transformers 5.7 的官方 YaRN 参数函数生成频率和 attention scale。
+TP 下草稿层权重按既有 Column/Row Parallel 规则切分，最终 logits 聚合后再
+裁掉词表 padding；FC、Markov 和 confidence 小头保持每卡复制。
+
+贪心 Markov 路径新增 `dspark_ops.markov_argmax`：第一级 kernel 并行计算
+词表 tile 内的 `base + embedding @ weight.T` 最大值，第二级归约得到最终
+token，并在相同分数时保持最小 token id，行为与 `torch.argmax` 一致。
+随机路径保留完整 FP32 proposal 分布，用于下一轮精确 rejection sampling；
+显存规划会预留这些分布、草稿 KV block 和 workspace 的容量。
+
+真实模型离线入口：
+
+```python
+from minivllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3.8-27B-FP8",
+    draft_model="RadixArk/Qwen3.8-27B-DSpark",
+    tensor_parallel_size=2,
+    num_speculative_tokens=7,
+    speculative_adaptive=True,
+)
+outputs = llm.generate(
+    ["请介绍一下投机解码。"],
+    SamplingParams(temperature=0.0, max_tokens=128),
+)
+```
+
+当前 DSpark 在线路径只接收纯文本请求；Qwen3.8 原有图像、视频和 MTP 路径
+保持可用，但含多模态位置的请求不能与 Qwen3 风格的 DSpark RoPE 混用。
+
+验收结果：CUDA 12.8 下全量扩展编译成功；融合 Markov 算子的 FP16、BF16、
+FP32 与 tie-break 数值测试、完整 tiny DSpark context/paged proposal 测试、
+以及 17 项 GQA/GDN/Qwen hybrid CUDA 回归全部通过。

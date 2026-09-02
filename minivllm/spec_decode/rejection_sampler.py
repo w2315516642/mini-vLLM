@@ -45,6 +45,36 @@ def logits_to_probs(
     return filtered / filtered.sum(dim=-1, keepdim=True)
 
 
+def step_sampling_probs(
+    logits: torch.Tensor,
+    *,
+    output_history: Sequence[int],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    presence_penalty: float,
+    frequency_penalty: float,
+) -> torch.Tensor:
+    """Build one transformed distribution for autoregressive draft sampling."""
+    if logits.ndim != 1:
+        raise ValueError("Step logits must be one-dimensional")
+    adjusted = logits.float().clone()
+    if output_history and (presence_penalty or frequency_penalty):
+        history = torch.as_tensor(
+            list(output_history), dtype=torch.long, device=adjusted.device
+        )
+        counts = torch.zeros_like(adjusted)
+        counts.scatter_add_(0, history, torch.ones_like(history).float())
+        adjusted -= presence_penalty * (counts > 0)
+        adjusted -= frequency_penalty * counts
+    return logits_to_probs(
+        adjusted,
+        temperature=max(float(temperature), 1e-5),
+        top_p=top_p,
+        top_k=top_k,
+    )
+
+
 def target_block_probs(
     logits: torch.Tensor,
     *,
@@ -214,5 +244,6 @@ __all__ = [
     "draft_block_probs",
     "logits_to_probs",
     "rejection_sample_block",
+    "step_sampling_probs",
     "target_block_probs",
 ]

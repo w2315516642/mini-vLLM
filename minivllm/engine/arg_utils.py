@@ -27,10 +27,20 @@ class EngineArgs:
     max_num_batched_tokens: int = 2560
     max_num_seqs: int = 256
     num_speculative_tokens: int = 0
+    draft_model: Optional[str] = None
+    draft_download_dir: Optional[str] = None
+    speculative_adaptive: bool = False
+    speculative_min_survival: float = 0.0
     disable_log_stats: bool = False
 
     def __post_init__(self) -> None:
         self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
+        if self.draft_model is not None and self.num_speculative_tokens == 0:
+            self.num_speculative_tokens = 7
+        if self.draft_model is None and self.num_speculative_tokens not in (0, 1):
+            raise ValueError(
+                "Multi-token speculation requires --draft-model"
+            )
 
     @staticmethod
     def add_cli_args(
@@ -97,8 +107,30 @@ class EngineArgs:
             '--num-speculative-tokens',
             type=int,
             default=EngineArgs.num_speculative_tokens,
-            choices=[0, 1],
-            help='enable one-token native Qwen MTP speculative decoding',
+            help='draft tokens per speculative step; native MTP supports one',
+        )
+        parser.add_argument(
+            '--draft-model',
+            type=str,
+            default=EngineArgs.draft_model,
+            help='Hugging Face path of a DSpark draft checkpoint',
+        )
+        parser.add_argument(
+            '--draft-download-dir',
+            type=str,
+            default=EngineArgs.draft_download_dir,
+            help='cache directory for the DSpark checkpoint',
+        )
+        parser.add_argument(
+            '--speculative-adaptive',
+            action='store_true',
+            help='select DSpark verification widths from confidence scores',
+        )
+        parser.add_argument(
+            '--speculative-min-survival',
+            type=float,
+            default=EngineArgs.speculative_min_survival,
+            help='minimum cumulative confidence considered by the planner',
         )
         parser.add_argument('--disable-log-stats', action='store_true',
                             help='disable logging statistics')
@@ -133,6 +165,10 @@ class EngineArgs:
             self.max_num_batched_tokens,
             self.max_num_seqs,
             self.num_speculative_tokens,
+            speculative_adaptive=self.speculative_adaptive,
+            speculative_min_survival=self.speculative_min_survival,
+            draft_model=self.draft_model,
+            draft_download_dir=(self.draft_download_dir or self.download_dir),
         )
         return model_config, cache_config, parallel_config, scheduler_config
 

@@ -1321,6 +1321,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         | HybridCache,
         input_metadata: InputMetadata,
         cache_events: Optional[Sequence[Optional[torch.cuda.Event]]],
+        hidden_state_collector: Optional[
+            Callable[[int, torch.Tensor], None]
+        ] = None,
     ) -> Dict[int, SequenceOutputs]:
         inputs_embeds = self._embed_inputs(input_ids, input_metadata)
         hidden_states = self.model(
@@ -1330,6 +1333,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             input_metadata,
             cache_events,
             inputs_embeds=inputs_embeds,
+            hidden_state_collector=hidden_state_collector,
         )
         outputs: Dict[int, SequenceOutputs] = {}
         proposal_contexts = []

@@ -108,6 +108,42 @@ class VanillaMarkov(nn.Module):
             previous_embeddings=torch.stack(previous_embeddings, dim=1),
         )
 
+    def sample_block_greedy_cuda(
+        self,
+        base_logits: torch.Tensor,
+        first_previous_token_ids: torch.Tensor,
+    ) -> MarkovBlockOutput:
+        """Greedily sample without materializing every corrected logit row."""
+        if not base_logits.is_cuda:
+            raise ValueError("Fused DSpark Markov sampling requires CUDA logits")
+        if base_logits.ndim != 3 or base_logits.shape[-1] != self.vocab_size:
+            raise ValueError("base_logits must have shape [batch, block, vocab]")
+        batch_size, block_size, _ = base_logits.shape
+        if first_previous_token_ids.shape != (batch_size,):
+            raise ValueError("first_previous_token_ids must have shape [batch]")
+        from minivllm.spec_decode.dspark_cuda import markov_argmax
+
+        sampled_tokens = []
+        previous_embeddings = []
+        previous_token_ids = first_previous_token_ids.long()
+        for step_idx in range(block_size):
+            step_previous = self.get_previous_embeddings(
+                previous_token_ids
+            ).contiguous()
+            next_token_ids = markov_argmax(
+                base_logits[:, step_idx].contiguous(),
+                step_previous,
+                self.markov_w2.weight.contiguous(),
+            )
+            previous_embeddings.append(step_previous)
+            sampled_tokens.append(next_token_ids)
+            previous_token_ids = next_token_ids
+        return MarkovBlockOutput(
+            token_ids=torch.stack(sampled_tokens, dim=1),
+            logits=base_logits.new_empty((batch_size, 0, self.vocab_size)),
+            previous_embeddings=torch.stack(previous_embeddings, dim=1),
+        )
+
     def _validate_block_inputs(
         self,
         base_logits: torch.Tensor,

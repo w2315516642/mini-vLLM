@@ -193,6 +193,8 @@ class SchedulerConfig:
         speculative_cost_latency_ms: Optional[Sequence[float]] = None,
         speculative_draft_latency_ms: float = 0.0,
         speculative_min_survival: float = 0.0,
+        draft_model: Optional[str] = None,
+        draft_download_dir: Optional[str] = None,
     ) -> None:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_seqs = max_num_seqs
@@ -215,6 +217,8 @@ class SchedulerConfig:
             raise ValueError("Speculative cost profile requires both axes")
         self.speculative_draft_latency_ms = float(speculative_draft_latency_ms)
         self.speculative_min_survival = float(speculative_min_survival)
+        self.draft_model = draft_model
+        self.draft_download_dir = draft_download_dir
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

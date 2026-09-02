@@ -126,6 +126,14 @@ gated_delta_net_extension = CUDAExtension(
 )
 ext_modules.append(gated_delta_net_extension)
 
+# DSpark low-rank Markov correction and greedy selection.
+dspark_extension = CUDAExtension(
+    name="minivllm.dspark_ops",
+    sources=["csrc/dspark.cpp", "csrc/dspark_kernels.cu"],
+    extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
+)
+ext_modules.append(dspark_extension)
+
 
 def get_path(*file_path) -> str:
     return os.path.join(ROOT_DIR, *file_path)

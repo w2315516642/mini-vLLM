@@ -1,5 +1,8 @@
-import torch
+import math
+from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional
+
+import torch
 
 from torch.nn import parallel
 
@@ -10,21 +13,43 @@ from minivllm.configs.config import (
     SchedulerConfig
 )
 
-from minivllm.model_executor import InputMetadata, set_random_seed, get_model
+from minivllm.model_executor import (
+    InputMetadata,
+    get_dspark_model,
+    get_model,
+    set_random_seed,
+)
 
 from minivllm.model_executor.parallel_utils.parallel_state import (
     initialize_all_reduce_launcher, initialize_model_parallel)
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
+from minivllm.spec_decode.draft_metadata import DraftAttentionMetadata
+from minivllm.spec_decode.dspark_context import TargetHiddenStateCollector
 from minivllm.spec_decode.state_transaction import (
     build_speculative_replay_plan,
 )
 from minivllm.worker.cache_engine import CacheEngine
+from minivllm.worker.draft_cache import DraftCacheEngine
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
     HybridCache,
 )
 from minivllm.utils.device import get_gpu_memory
+
+
+@dataclass(frozen=True)
+class _DraftRequest:
+    """One output token that can seed the next DSpark proposal block."""
+
+    seq_id: int
+    output: SequenceOutputs
+    block_table: List[int]
+    next_position: int
+    anchor_token_id: int
+    sampling_params: SamplingParams
+    output_history: List[int]
+    draft_width: int
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -53,6 +78,20 @@ class Worker:
 
         set_random_seed(self.model_config.seed)
         self.model = get_model(model_config)
+        self.draft_model = None
+        self.draft_config = None
+        self.draft_cache_engine = None
+        self.draft_gpu_cache = None
+        self._draft_probabilities: Dict[int, torch.Tensor] = {}
+        if self.scheduler_config.draft_model is not None:
+            self.draft_model = get_dspark_model(
+                self.scheduler_config.draft_model,
+                dtype=self.model_config.dtype,
+                cache_dir=self.scheduler_config.draft_download_dir,
+                use_dummy_weights=self.model_config.use_dummy_weights,
+            )
+            self.draft_config = self.draft_model.config
+            self._validate_dspark_target()
         initialize_all_reduce_launcher(
             self.scheduler_config.max_num_batched_tokens,
             self.model_config.get_hidden_size(),
@@ -66,6 +105,33 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
         self.hybrid_cache = None
+
+    def _validate_dspark_target(self) -> None:
+        """Fail early when a draft checkpoint cannot share target modules."""
+        if not hasattr(self.model, "model") or not hasattr(self.model, "lm_head"):
+            raise ValueError("DSpark requires a Qwen target with embedding and LM head")
+        target_backbone = self.model.model
+        if not hasattr(target_backbone, "embed_tokens") or not hasattr(
+            target_backbone, "layers"
+        ):
+            raise ValueError("DSpark target backbone is missing required Qwen modules")
+        if self.draft_config.hidden_size != self.model_config.get_hidden_size():
+            raise ValueError("DSpark and target hidden sizes must match")
+        if self.draft_config.vocab_size > int(self.model.config.vocab_size):
+            raise ValueError("DSpark vocabulary cannot exceed the target vocabulary")
+        if self.draft_config.mask_token_id >= int(self.model.config.vocab_size):
+            raise ValueError("DSpark mask token is outside the target embedding table")
+        target_layers = len(target_backbone.layers)
+        if any(
+            layer_id < 0 or layer_id >= target_layers
+            for layer_id in self.draft_config.target_layer_ids
+        ):
+            raise ValueError("DSpark auxiliary layer ids exceed the target depth")
+        requested_width = self.scheduler_config.num_speculative_tokens
+        if requested_width <= 0 or requested_width > self.draft_config.block_size:
+            raise ValueError(
+                "DSpark speculative width must be between 1 and its block size"
+            )
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -117,6 +183,8 @@ class Worker:
             f"max gpu memory usage {peak_memory}")
         cache_block_size = CacheEngine.get_cache_block_size(
             block_size, self.model_config, self.parallel_config)
+        draft_cache_block_size = self._get_draft_cache_block_size(block_size)
+        cache_block_size += draft_cache_block_size
         state_cache_size = CacheEngine.get_state_cache_size(
             self.model_config,
             self.parallel_config,
@@ -126,15 +194,25 @@ class Worker:
             total_gpu_memory * gpu_memory_utilization
             - peak_memory
             - state_cache_size
+            - self._get_draft_workspace_size(
+                block_size, draft_cache_block_size
+            )
+            - self._get_draft_probability_reserve()
         )
         if usable_cache_memory <= 0:
             state_gib = state_cache_size / (1024 ** 3)
+            draft_gib = (
+                self._get_draft_workspace_size(
+                    block_size, draft_cache_block_size
+                )
+                + self._get_draft_probability_reserve()
+            ) / (1024 ** 3)
             raise ValueError(
-                "The persistent recurrent-state cache does not fit in the "
-                "configured GPU memory budget: "
-                f"{state_gib:.2f} GiB for max_num_seqs="
+                "Persistent runtime buffers do not fit in the configured GPU "
+                f"memory budget: recurrent={state_gib:.2f} GiB, "
+                f"DSpark={draft_gib:.2f} GiB for max_num_seqs="
                 f"{self.scheduler_config.max_num_seqs}. Reduce "
-                "--max-num-seqs for hybrid Qwen models."
+                "--max-num-seqs or the speculative width."
             )
         num_gpu_blocks = int(usable_cache_memory // cache_block_size)
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
@@ -142,6 +220,49 @@ class Worker:
 
         set_random_seed(self.model_config.seed)
         return num_gpu_blocks, num_cpu_blocks
+
+    def _get_draft_cache_block_size(self, block_size: int) -> int:
+        if self.draft_config is None:
+            return 0
+        tp_size = self.parallel_config.tensor_parallel_size
+        if self.draft_config.num_key_value_heads % tp_size:
+            raise ValueError("DSpark KV heads must be divisible by TP size")
+        return DraftCacheEngine.get_cache_block_size(
+            num_layers=self.draft_config.num_hidden_layers,
+            block_size=block_size,
+            num_kv_heads=self.draft_config.num_key_value_heads // tp_size,
+            head_dim=self.draft_config.head_dim,
+            dtype=self.model_config.dtype,
+        )
+
+    def _get_draft_workspace_blocks(self, block_size: int) -> int:
+        if self.draft_config is None:
+            return 0
+        blocks_per_request = math.ceil(
+            self.draft_config.block_size / block_size
+        )
+        return self.scheduler_config.max_num_seqs * blocks_per_request
+
+    def _get_draft_workspace_size(
+        self,
+        block_size: int,
+        draft_cache_block_size: int,
+    ) -> int:
+        return (
+            self._get_draft_workspace_blocks(block_size)
+            * draft_cache_block_size
+        )
+
+    def _get_draft_probability_reserve(self) -> int:
+        """Reserve worst-case FP32 q distributions for exact rejection."""
+        if self.draft_config is None:
+            return 0
+        return (
+            self.scheduler_config.max_num_seqs
+            * self.scheduler_config.num_speculative_tokens
+            * self.draft_config.vocab_size
+            * torch.tensor([], dtype=torch.float32).element_size()
+        )
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         if (
@@ -177,6 +298,23 @@ class Worker:
             self.gpu_cache = self.hybrid_cache
         else:
             self.gpu_cache = self.cache_engine.gpu_cache
+        if self.draft_config is not None:
+            tp_size = self.parallel_config.tensor_parallel_size
+            self.draft_cache_engine = DraftCacheEngine(
+                num_layers=self.draft_config.num_hidden_layers,
+                num_gpu_blocks=cache_config.num_gpu_blocks,
+                num_cpu_blocks=cache_config.num_cpu_blocks,
+                block_size=cache_config.block_size,
+                num_kv_heads=(
+                    self.draft_config.num_key_value_heads // tp_size
+                ),
+                head_dim=self.draft_config.head_dim,
+                dtype=self.model_config.dtype,
+                workspace_blocks=self._get_draft_workspace_blocks(
+                    cache_config.block_size
+                ),
+            )
+            self.draft_gpu_cache = self.draft_cache_engine.gpu_cache
 
     def _prepare_inputs(
         self,
@@ -431,6 +569,12 @@ class Worker:
                     0,
                 )
                 == 1
+                and getattr(
+                    getattr(self, "scheduler_config", None),
+                    "draft_model",
+                    None,
+                )
+                is None
             ),
             speculative_sampling_params=speculative_sampling_params,
             multimodal_inputs=multimodal_inputs,
@@ -454,12 +598,18 @@ class Worker:
         issued_cache_op = False
         if blocks_to_swap_in:
             self.cache_engine.swap_in(blocks_to_swap_in)
+            if self.draft_cache_engine is not None:
+                self.draft_cache_engine.swap_in(blocks_to_swap_in)
             issued_cache_op = True
         if blocks_to_swap_out:
             self.cache_engine.swap_out(blocks_to_swap_out)
+            if self.draft_cache_engine is not None:
+                self.draft_cache_engine.swap_out(blocks_to_swap_out)
             issued_cache_op = True
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
+            if self.draft_cache_engine is not None:
+                self.draft_cache_engine.copy(blocks_to_copy)
             issued_cache_op = True
         
         if issued_cache_op:
@@ -473,11 +623,21 @@ class Worker:
                 for event in cache_events:
                     if event is not None:
                         event.wait()
+            if self.draft_cache_engine is not None:
+                self.draft_cache_engine.wait_for_cache_ops()
             return {}
+        if self.draft_model is not None and any(
+            metadata.multi_modal_inputs is not None
+            for metadata in seq_group_metadata_list
+        ):
+            raise NotImplementedError(
+                "DSpark proposals currently support text requests only"
+            )
         
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list=seq_group_metadata_list)
+        self._attach_saved_draft_probabilities(input_metadata)
         if self.hybrid_cache is not None:
             input_metadata.state_slot_mapping = self.hybrid_cache.acquire(
                 input_metadata.prompt_seq_ids
@@ -491,13 +651,33 @@ class Worker:
         
         # Execute the model.
         # output: List[int (seq_id), SequenceOutputs]
+        hidden_collector = (
+            TargetHiddenStateCollector(self.draft_config.target_layer_ids)
+            if self.draft_config is not None
+            else None
+        )
+        model_kwargs = {}
+        if hidden_collector is not None:
+            model_kwargs["hidden_state_collector"] = hidden_collector
         output = self.model(
             input_ids=input_tokens,
             positions=input_positions,
             kv_caches=self.gpu_cache,
             input_metadata=input_metadata,
             cache_events=cache_events,
+            **model_kwargs,
         )
+        if hidden_collector is not None:
+            self.draft_cache_engine.wait_for_cache_ops()
+            target_hidden = hidden_collector.concatenate()[
+                :input_metadata.num_valid_tokens
+            ]
+            self.draft_model.materialize_context_kv(
+                target_hidden,
+                input_positions[:input_metadata.num_valid_tokens],
+                input_metadata.slot_mapping,
+                self.draft_gpu_cache,
+            )
         partially_accepted = {
             seq_id: output[seq_id].num_computed_tokens
             for seq_id, draft_tokens in zip(
@@ -513,7 +693,220 @@ class Worker:
             self._replay_speculative_prefixes(
                 seq_group_metadata_list, partially_accepted
             )
+        if self.draft_model is not None:
+            self._attach_dspark_drafts(output, seq_group_metadata_list)
         return output
+
+    def _attach_saved_draft_probabilities(
+        self,
+        input_metadata: InputMetadata,
+    ) -> None:
+        """Move the previous proposal distributions into target verification."""
+        probability_blocks = []
+        has_stochastic_request = False
+        for seq_id, draft_tokens, sampling_params in zip(
+            input_metadata.speculative_seq_ids,
+            input_metadata.speculative_token_blocks,
+            input_metadata.speculative_sampling_params,
+        ):
+            probabilities = self._draft_probabilities.pop(seq_id, None)
+            if sampling_params.temperature == 0.0:
+                probability_blocks.append(None)
+                continue
+            has_stochastic_request = True
+            if probabilities is None:
+                raise RuntimeError(
+                    f"Missing DSpark draft probabilities for sequence {seq_id}"
+                )
+            if probabilities.ndim != 2 or probabilities.shape[0] < len(
+                draft_tokens
+            ):
+                raise RuntimeError(
+                    f"Incomplete DSpark draft probabilities for sequence {seq_id}"
+                )
+            probability_blocks.append(probabilities[:len(draft_tokens)])
+        if has_stochastic_request:
+            input_metadata.speculative_draft_probs = probability_blocks
+
+    def _attach_dspark_drafts(
+        self,
+        outputs: Dict[int, SequenceOutputs],
+        metadata_list: List[SequenceGroupMetadata],
+    ) -> None:
+        requests = self._collect_draft_requests(outputs, metadata_list)
+        if not requests:
+            return
+        gamma = self.draft_config.block_size
+        token_rows = [
+            [request.anchor_token_id]
+            + [self.draft_config.mask_token_id] * (gamma - 1)
+            for request in requests
+        ]
+        token_ids = torch.tensor(
+            token_rows, dtype=torch.long, device="cuda"
+        ).flatten()
+        positions = torch.tensor(
+            [
+                position
+                for request in requests
+                for position in range(
+                    request.next_position, request.next_position + gamma
+                )
+            ],
+            dtype=torch.long,
+            device="cuda",
+        )
+        draft_metadata = self._build_draft_metadata(requests)
+        proposal = self.draft_model.propose_paged(
+            self.model.model.embed_tokens(token_ids),
+            positions,
+            self.draft_gpu_cache,
+            draft_metadata,
+            self.model.lm_head.weight,
+            torch.tensor(
+                [request.anchor_token_id for request in requests],
+                dtype=torch.long,
+                device="cuda",
+            ),
+            [request.sampling_params for request in requests],
+            [request.output_history for request in requests],
+        )
+        for batch_index, request in enumerate(requests):
+            width = request.draft_width
+            confidence = None
+            if proposal.confidence is not None:
+                confidence = proposal.confidence[
+                    batch_index, :width
+                ].tolist()
+            request.output.set_draft_tokens(
+                proposal.token_ids[batch_index, :width].tolist(),
+                confidence,
+            )
+            probabilities = proposal.draft_probs[batch_index]
+            if probabilities is None:
+                self._draft_probabilities.pop(request.seq_id, None)
+            else:
+                self._draft_probabilities[request.seq_id] = (
+                    probabilities[:width].detach()
+                )
+
+    def _collect_draft_requests(
+        self,
+        outputs: Dict[int, SequenceOutputs],
+        metadata_list: List[SequenceGroupMetadata],
+    ) -> List[_DraftRequest]:
+        requests = []
+        gamma = min(
+            self.scheduler_config.num_speculative_tokens,
+            self.draft_config.block_size,
+        )
+        eos_token_id = getattr(self.model.config, "eos_token_id", None)
+        eos_token_ids = (
+            set(eos_token_id)
+            if isinstance(eos_token_id, (list, tuple, set))
+            else ({eos_token_id} if eos_token_id is not None else set())
+        )
+        for metadata in metadata_list:
+            params = metadata.sampling_params
+            supported = (
+                params.best_of == 1
+                and not params.use_beam_search
+                and not params.stop
+                and (
+                    params.temperature > 0.0
+                    or (
+                        params.presence_penalty == 0.0
+                        and params.frequency_penalty == 0.0
+                    )
+                )
+            )
+            for seq_id, seq_data in metadata.seq_data.items():
+                output = outputs.get(seq_id)
+                if output is None:
+                    continue
+                self._draft_probabilities.pop(seq_id, None)
+                if not supported or not output.output_token_ids:
+                    continue
+                anchor_token_id = int(output.output_token_ids[-1])
+                if not params.ignore_eos and anchor_token_id in eos_token_ids:
+                    continue
+                output_len = (
+                    len(seq_data.output_token_ids)
+                    + len(output.output_token_ids)
+                )
+                remaining = params.max_tokens - output_len
+                draft_width = min(gamma, remaining - 1)
+                if draft_width <= 0:
+                    continue
+                committed = (
+                    output.num_computed_tokens
+                    if output.num_computed_tokens is not None
+                    else metadata.num_scheduled_tokens[seq_id]
+                )
+                next_position = metadata.num_computed_tokens[seq_id] + committed
+                if next_position + self.draft_config.block_size > (
+                    self.draft_config.max_position_embeddings
+                ):
+                    continue
+                requests.append(_DraftRequest(
+                    seq_id=seq_id,
+                    output=output,
+                    block_table=list(metadata.block_tables[seq_id]),
+                    next_position=next_position,
+                    anchor_token_id=anchor_token_id,
+                    sampling_params=params,
+                    output_history=(
+                        list(seq_data.output_token_ids)
+                        + list(output.output_token_ids)
+                    ),
+                    draft_width=draft_width,
+                ))
+        return requests
+
+    def _build_draft_metadata(
+        self,
+        requests: List[_DraftRequest],
+    ) -> DraftAttentionMetadata:
+        gamma = self.draft_config.block_size
+        blocks_per_request = math.ceil(gamma / self.block_size)
+        workspace_ids = list(self.draft_cache_engine.workspace_block_ids)
+        block_tables = []
+        slot_mapping = []
+        context_lens = []
+        for batch_index, request in enumerate(requests):
+            workspace_start = batch_index * blocks_per_request
+            request_workspace = workspace_ids[
+                workspace_start:workspace_start + blocks_per_request
+            ]
+            block_table = _extend_draft_block_table(
+                request.block_table,
+                request.next_position,
+                gamma,
+                self.block_size,
+                request_workspace,
+            )
+            block_tables.append(block_table)
+            for position in range(
+                request.next_position, request.next_position + gamma
+            ):
+                slot_mapping.append(
+                    _get_slot_id(block_table, position, self.block_size)
+                )
+            context_lens.append(request.next_position + gamma)
+        cu_seqlens = [index * gamma for index in range(len(requests) + 1)]
+        return DraftAttentionMetadata(
+            query_lens=[gamma] * len(requests),
+            cu_seqlens_q=torch.tensor(
+                cu_seqlens, dtype=torch.int32, device="cuda"
+            ),
+            context_lens=torch.tensor(
+                context_lens, dtype=torch.int32, device="cuda"
+            ),
+            block_tables=_make_block_table_tensor(block_tables),
+            slot_mapping=torch.tensor(
+                slot_mapping, dtype=torch.int32, device="cuda"
+            ),
+        )
 
     def _replay_speculative_prefixes(
         self,
@@ -629,6 +1022,12 @@ class Worker:
         state_copies: Dict[int, int],
     ) -> None:
         """Apply scheduler lifecycle changes to persistent GDN states."""
+        for child_seq_id, parent_seq_id in state_copies.items():
+            probabilities = self._draft_probabilities.get(parent_seq_id)
+            if probabilities is not None:
+                self._draft_probabilities[child_seq_id] = probabilities.clone()
+        for seq_id in seq_ids_to_release:
+            self._draft_probabilities.pop(seq_id, None)
         copy_multimodal = getattr(self.model, "copy_multimodal_cache", None)
         release_multimodal = getattr(
             self.model, "release_multimodal_cache", None
@@ -694,3 +1093,25 @@ def _make_block_table_tensor(
     ]
     return torch.as_tensor(
         padded_block_tables, dtype=torch.int, device="cuda")
+
+
+def _extend_draft_block_table(
+    block_table: List[int],
+    start_position: int,
+    query_len: int,
+    block_size: int,
+    workspace_block_ids: List[int],
+) -> List[int]:
+    """Append temporary draft-only blocks without changing target ownership."""
+    if start_position < 0 or query_len <= 0 or block_size <= 0:
+        raise ValueError("Invalid DSpark block-table range")
+    extended = list(block_table)
+    required_blocks = math.ceil((start_position + query_len) / block_size)
+    missing_blocks = required_blocks - len(extended)
+    if missing_blocks > len(workspace_block_ids):
+        raise RuntimeError(
+            "DSpark workspace cannot cover the next proposal block"
+        )
+    if missing_blocks > 0:
+        extended.extend(workspace_block_ids[:missing_blocks])
+    return extended

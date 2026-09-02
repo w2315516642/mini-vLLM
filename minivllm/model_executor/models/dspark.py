@@ -1,11 +1,12 @@
 """DFlash backbone and DSpark heads for Qwen3.8 speculative decoding."""
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from minivllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -16,6 +17,7 @@ from minivllm.spec_decode.draft_metadata import DraftAttentionMetadata
 from minivllm.model_executor.parallel_utils.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
+    gather_from_tensor_model_parallel_region,
 )
 from minivllm.model_executor.weight_utils import (
     hf_model_weights_iterator,
@@ -27,6 +29,7 @@ from minivllm.spec_decode.dspark_heads import (
     StepSampler,
     VanillaMarkov,
 )
+from minivllm.spec_decode.rejection_sampler import logits_to_probs
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -325,6 +328,7 @@ class DFlashDecoderLayer(nn.Module):
 class DSparkProposal:
     token_ids: torch.Tensor
     draft_logits: torch.Tensor
+    draft_probs: Tuple[Optional[torch.Tensor], ...]
     confidence: Optional[torch.Tensor]
     hidden_states: torch.Tensor
 
@@ -364,15 +368,25 @@ class DSparkDraftModel(nn.Module):
             if self.config.enable_confidence_head
             else None
         )
-        inv_freq = 1.0 / (
-            self.config.rope_theta
-            ** (torch.arange(0, self.config.head_dim, 2).float() / self.config.head_dim)
-        )
+        rope_parameters = getattr(config, "rope_parameters", {}) or {}
+        rope_type = rope_parameters.get("rope_type", "default")
+        attention_scale = 1.0
+        if rope_type == "yarn":
+            inv_freq, attention_scale = ROPE_INIT_FUNCTIONS["yarn"](config)
+        else:
+            inv_freq = 1.0 / (
+                self.config.rope_theta
+                ** (
+                    torch.arange(0, self.config.head_dim, 2).float()
+                    / self.config.head_dim
+                )
+            )
         positions = torch.arange(self.config.max_position_embeddings).float()
         frequencies = torch.outer(positions, inv_freq)
         self.register_buffer(
             "cos_sin_cache",
-            torch.cat((frequencies.cos(), frequencies.sin()), dim=-1),
+            torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+            * float(attention_scale),
             persistent=False,
         )
 
@@ -456,6 +470,155 @@ class DSparkDraftModel(nn.Module):
             )
         return self.norm(hidden_states)
 
+    def compute_base_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if lm_head_weight.ndim != 2 or (
+            lm_head_weight.shape[1] != self.config.hidden_size
+        ):
+            raise ValueError("Target LM head is incompatible with DSpark checkpoint")
+        local_logits = F.linear(
+            hidden_states.to(lm_head_weight.dtype), lm_head_weight
+        )
+        logits = gather_from_tensor_model_parallel_region(local_logits)
+        if logits.shape[-1] < self.config.vocab_size:
+            raise ValueError("Gathered target LM head is smaller than draft vocabulary")
+        return logits[..., :self.config.vocab_size].float()
+
+    def propose_paged(
+        self,
+        input_embeddings: torch.Tensor,
+        positions: torch.Tensor,
+        caches: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+        metadata: DraftAttentionMetadata,
+        lm_head_weight: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        sampling_params: Iterable[object],
+        output_histories: Iterable[Iterable[int]],
+    ) -> DSparkProposal:
+        """Run one packed DFlash block and sample each Markov chain in order."""
+        query_lens = tuple(metadata.query_lens)
+        if not query_lens or any(
+            query_len != self.config.block_size for query_len in query_lens
+        ):
+            raise ValueError("DSpark runtime expects one full block per request")
+        batch_size = len(query_lens)
+        if anchor_token_ids.shape != (batch_size,):
+            raise ValueError("DSpark anchors must contain one token per request")
+        params_list = list(sampling_params)
+        histories = [list(history) for history in output_histories]
+        if len(params_list) != batch_size or len(histories) != batch_size:
+            raise ValueError("DSpark sampling metadata must match the draft batch")
+
+        hidden_states = self.forward_paged(
+            input_embeddings, positions, caches, metadata
+        ).view(batch_size, self.config.block_size, self.config.hidden_size)
+        base_logits = self.compute_base_logits(hidden_states, lm_head_weight)
+        fused_greedy = base_logits.is_cuda and all(
+            params.temperature == 0.0
+            and params.presence_penalty == 0.0
+            and params.frequency_penalty == 0.0
+            for params in params_list
+        )
+        if fused_greedy:
+            markov = self.markov_head.sample_block_greedy_cuda(
+                base_logits, anchor_token_ids
+            )
+            draft_probs = tuple(None for _ in range(batch_size))
+        else:
+            markov, draft_probs = self._sample_markov_block(
+                base_logits,
+                anchor_token_ids,
+                params_list,
+                histories,
+            )
+        confidence = None
+        if self.confidence_head is not None:
+            confidence = self.confidence_head.probabilities(
+                hidden_states, markov.previous_embeddings
+            )
+        return DSparkProposal(
+            token_ids=markov.token_ids,
+            draft_logits=markov.logits,
+            draft_probs=draft_probs,
+            confidence=confidence,
+            hidden_states=hidden_states,
+        )
+
+    def _sample_markov_block(
+        self,
+        base_logits: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        params_list: List[object],
+        histories: List[List[int]],
+    ):
+        """Readable sampling path used when full proposal probabilities matter."""
+        batch_size = base_logits.shape[0]
+        probability_steps = [[] for _ in range(batch_size)]
+        history_counts = []
+        for params, history in zip(params_list, histories):
+            if params.presence_penalty or params.frequency_penalty:
+                tokens = torch.tensor(
+                    history, dtype=torch.long, device=base_logits.device
+                )
+                counts = torch.bincount(
+                    tokens, minlength=self.config.vocab_size
+                ).float()
+            else:
+                counts = None
+            history_counts.append(counts)
+
+        def sample_step(step_logits: torch.Tensor, _: int) -> torch.Tensor:
+            sampled = []
+            for batch_index, params in enumerate(params_list):
+                if (
+                    params.temperature == 0.0
+                    and params.presence_penalty == 0.0
+                    and params.frequency_penalty == 0.0
+                ):
+                    token_id = torch.argmax(step_logits[batch_index])
+                    sampled.append(token_id)
+                    continue
+                adjusted = step_logits[batch_index].float()
+                counts = history_counts[batch_index]
+                if counts is not None:
+                    adjusted = adjusted - (
+                        params.presence_penalty * (counts > 0)
+                        + params.frequency_penalty * counts
+                    )
+                probs = logits_to_probs(
+                    adjusted,
+                    temperature=max(float(params.temperature), 1e-5),
+                    top_p=params.top_p,
+                    top_k=min(params.top_k, self.config.vocab_size),
+                )
+                token_id = (
+                    torch.argmax(probs)
+                    if params.temperature == 0.0
+                    else torch.multinomial(probs, 1).squeeze(0)
+                )
+                if params.temperature > 0.0:
+                    probability_steps[batch_index].append(probs)
+                sampled.append(token_id)
+                if counts is not None:
+                    counts.scatter_add_(
+                        0,
+                        token_id.reshape(1),
+                        counts.new_ones(1),
+                    )
+            return torch.stack(sampled).long()
+
+        markov = self.markov_head.sample_block(
+            base_logits, anchor_token_ids, sample_step
+        )
+        draft_probs = tuple(
+            torch.stack(steps) if steps else None
+            for steps in probability_steps
+        )
+        return markov, draft_probs
+
     def propose_reference(
         self,
         input_embeddings: torch.Tensor,
@@ -469,12 +632,7 @@ class DSparkDraftModel(nn.Module):
         hidden_states = self.forward_reference(
             input_embeddings, positions, context_hidden, context_positions
         )
-        if lm_head_weight.shape != (
-            self.config.vocab_size,
-            self.config.hidden_size,
-        ):
-            raise ValueError("Target LM head is incompatible with DSpark checkpoint")
-        base_logits = F.linear(hidden_states.to(lm_head_weight.dtype), lm_head_weight)
+        base_logits = self.compute_base_logits(hidden_states, lm_head_weight)
         markov = self.markov_head.sample_block(
             base_logits, anchor_token_ids, sampler
         )
@@ -486,6 +644,7 @@ class DSparkDraftModel(nn.Module):
         return DSparkProposal(
             token_ids=markov.token_ids,
             draft_logits=markov.logits,
+            draft_probs=tuple(None for _ in range(base_logits.shape[0])),
             confidence=confidence,
             hidden_states=hidden_states,
         )

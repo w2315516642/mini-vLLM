@@ -120,6 +120,24 @@ class DSparkSchedulerTest(unittest.TestCase):
         self.assertEqual(seq.get_output_token_ids(), [90, 91, 92, 111])
         self.assertEqual(seq.speculative_token_ids, [])
 
+    def test_external_drafter_supports_stochastic_width_one(self):
+        scheduler, seq = self._running_sequence()
+        scheduler.scheduler_config.num_speculative_tokens = 1
+        scheduler.scheduler_config.draft_model = "draft"
+        scheduler.running[0].sampling_params = SimpleNamespace(
+            temperature=0.7,
+            best_of=1,
+            use_beam_search=False,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            stop=[],
+            max_tokens=32,
+        )
+
+        self.assertTrue(
+            scheduler._can_speculate(scheduler.running[0], draft_width=1)
+        )
+
 
 class GDNStateTransactionTest(unittest.TestCase):
 

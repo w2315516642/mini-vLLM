@@ -42,7 +42,7 @@ class InputMetadata:
         speculative_hidden_indices: Optional[List[Tuple[int, ...]]] = None,
         enable_mtp: bool = False,
         speculative_sampling_params: Optional[List[SamplingParams]] = None,
-        speculative_draft_probs: Optional[List[torch.Tensor]] = None,
+        speculative_draft_probs: Optional[List[Optional[torch.Tensor]]] = None,
         multimodal_inputs: Optional[Dict[int, MultiModalInputs]] = None,
         multimodal_token_maps: Optional[
             List[Tuple[int, int, int, int]]

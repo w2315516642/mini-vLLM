@@ -85,6 +85,11 @@ class DSparkDraftModelTest(unittest.TestCase):
                 "get_tensor_model_parallel_world_size",
                 return_value=1,
             ),
+            patch(
+                "minivllm.model_executor.models.dspark."
+                "gather_from_tensor_model_parallel_region",
+                side_effect=lambda tensor: tensor,
+            ),
         )
         for tp_patch in tp_patches:
             tp_patch.start()
@@ -107,6 +112,23 @@ class DSparkDraftModelTest(unittest.TestCase):
         self.assertEqual(tuple(proposal.token_ids.shape), (1, 3))
         self.assertEqual(tuple(proposal.draft_logits.shape), (1, 3, 11))
         self.assertEqual(tuple(proposal.confidence.shape), (1, 3))
+        self.assertEqual(proposal.draft_probs, (None,))
+
+    def test_base_logits_gather_tp_shards_and_remove_padding(self):
+        model = DSparkDraftModel.__new__(DSparkDraftModel)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(hidden_size=2, vocab_size=3)
+        hidden = torch.tensor([[1.0, 2.0]])
+        local_weight = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        with patch(
+            "minivllm.model_executor.models.dspark."
+            "gather_from_tensor_model_parallel_region",
+            side_effect=lambda local: torch.cat((local, local[:, :1]), dim=-1),
+        ):
+            logits = model.compute_base_logits(hidden, local_weight)
+
+        torch.testing.assert_close(logits, torch.tensor([[1.0, 2.0, 1.0]]))
 
     def test_qkv_loader_places_each_local_segment(self):
         parameter = torch.zeros(8, 3)

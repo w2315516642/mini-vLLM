@@ -1,6 +1,8 @@
 
 import torch
 import torch.nn as nn
+from typing import Optional
+from transformers import AutoConfig
 
 from minivllm.configs import ModelConfig
 from minivllm.model_executor.models.registry import MODEL_REGISTRY, ModelClass
@@ -33,5 +35,31 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             model_config.download_dir,
             model_config.use_np_weights
         )
+        model = model.cuda()
+    return model.eval()
+
+
+def get_dspark_model(
+    model_name_or_path: str,
+    *,
+    dtype: torch.dtype,
+    cache_dir: Optional[str] = None,
+    use_dummy_weights: bool = False,
+) -> nn.Module:
+    """Load the standalone DSpark weights without duplicating target modules."""
+    from minivllm.model_executor.models.dspark import DSparkDraftModel
+
+    config = AutoConfig.from_pretrained(
+        model_name_or_path,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+    )
+    torch.set_default_dtype(dtype)
+    model = DSparkDraftModel(config)
+    if use_dummy_weights:
+        model = model.cuda()
+        initialize_dummy_weights(model)
+    else:
+        model.load_weights(model_name_or_path, cache_dir)
         model = model.cuda()
     return model.eval()

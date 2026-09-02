@@ -196,11 +196,18 @@ class Scheduler:
             return False
         # Native MTP does not preserve its proposal distribution. DSpark does,
         # so a multi-token drafter can also use exact stochastic verification.
-        return max_draft_tokens > 1 or (
+        greedy_without_penalties = (
             params.temperature == 0.0
             and params.presence_penalty == 0.0
             and params.frequency_penalty == 0.0
         )
+        has_external_drafter = getattr(
+            self.scheduler_config, "draft_model", None
+        ) is not None
+        return (
+            has_external_drafter
+            and (params.temperature > 0.0 or greedy_without_penalties)
+        ) or greedy_without_penalties
 
     def _plan_speculative_widths(
         self,

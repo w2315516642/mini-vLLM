@@ -29,6 +29,7 @@ class DraftCacheEngine:
         head_dim: int,
         dtype: torch.dtype,
         device: str = "cuda",
+        workspace_blocks: int = 0,
     ) -> None:
         values = {
             "num_layers": num_layers,
@@ -38,7 +39,7 @@ class DraftCacheEngine:
             "head_dim": head_dim,
         }
         invalid = [name for name, value in values.items() if value <= 0]
-        if invalid or num_cpu_blocks < 0:
+        if invalid or num_cpu_blocks < 0 or workspace_blocks < 0:
             raise ValueError("Invalid draft cache dimensions: " + ", ".join(invalid))
         self.num_layers = int(num_layers)
         self.num_gpu_blocks = int(num_gpu_blocks)
@@ -48,7 +49,10 @@ class DraftCacheEngine:
         self.head_dim = int(head_dim)
         self.dtype = dtype
         self.device = torch.device(device)
-        self.gpu_cache = self._allocate(self.num_gpu_blocks, self.device)
+        self.workspace_blocks = int(workspace_blocks)
+        self.gpu_cache = self._allocate(
+            self.num_gpu_blocks + self.workspace_blocks, self.device
+        )
         self.cpu_cache = self._allocate(
             self.num_cpu_blocks,
             torch.device("cpu"),
@@ -56,6 +60,11 @@ class DraftCacheEngine:
         )
         self.cache_stream = (
             torch.cuda.Stream() if self.device.type == "cuda" else None
+        )
+        self.events = (
+            [torch.cuda.Event() for _ in range(self.num_layers)]
+            if self.device.type == "cuda"
+            else []
         )
 
     def _allocate(
@@ -102,6 +111,31 @@ class DraftCacheEngine:
             * element_size
         )
 
+    @property
+    def workspace_block_ids(self) -> range:
+        return range(
+            self.num_gpu_blocks,
+            self.num_gpu_blocks + self.workspace_blocks,
+        )
+
+    @staticmethod
+    def get_cache_block_size(
+        *,
+        num_layers: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> int:
+        return (
+            int(num_layers)
+            * 2
+            * int(block_size)
+            * int(num_kv_heads)
+            * int(head_dim)
+            * torch.tensor([], dtype=dtype).element_size()
+        )
+
     def _swap(
         self,
         source: List[DraftKVCache],
@@ -113,11 +147,14 @@ class DraftCacheEngine:
         if self.cache_stream is None:
             raise RuntimeError("Draft cache swap requires CUDA")
         with torch.cuda.stream(self.cache_stream):
-            for source_cache, destination_cache in zip(source, destination):
+            for layer_idx, (source_cache, destination_cache) in enumerate(
+                zip(source, destination)
+            ):
                 for source_tensor, destination_tensor in zip(
                     source_cache, destination_cache
                 ):
                     cache_ops.swap_blocks(source_tensor, destination_tensor, mapping)
+                self.events[layer_idx].record(self.cache_stream)
 
     def swap_in(self, mapping: Dict[int, int]) -> None:
         self._swap(self.cpu_cache, self.gpu_cache, mapping)
@@ -133,3 +170,11 @@ class DraftCacheEngine:
             [cache[1] for cache in self.gpu_cache],
             mapping,
         )
+
+    def wait_for_cache_ops(self) -> None:
+        """Make the current stream wait for outstanding draft-cache swaps."""
+        if self.device.type != "cuda":
+            return
+        current_stream = torch.cuda.current_stream()
+        for event in self.events:
+            current_stream.wait_event(event)
