@@ -369,6 +369,11 @@ class LLMEngine:
             state_slots = rank_state_slots[0]
             if any(item != state_slots for item in rank_state_slots[1:]):
                 raise RuntimeError("P workers disagree on hybrid state slots")
+            if (
+                self.model_config.architecture.num_linear_attention_layers
+                and set(state_slots) != set(seq_ids)
+            ):
+                raise RuntimeError("P handoff is missing Qwen hybrid state")
             handoff = RequestHandoff.from_sequence_group(
                 seq_group,
                 block_tables=block_tables,
@@ -416,6 +421,11 @@ class LLMEngine:
             state_slots = rank_state_slots[0]
             if any(item != state_slots for item in rank_state_slots[1:]):
                 raise RuntimeError("D workers disagree on hybrid state slots")
+            if (
+                self.model_config.architecture.num_linear_attention_layers
+                and set(state_slots) != set(seq_ids)
+            ):
+                raise RuntimeError("D reservation is missing Qwen hybrid state")
         except Exception:
             self.scheduler.abort_seq_group(handoff.request_id)
             self._flush_pending_state_operations()

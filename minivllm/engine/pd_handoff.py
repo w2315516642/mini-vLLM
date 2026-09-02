@@ -92,7 +92,12 @@ class MultiModalPositionHandoff:
 
 @dataclass(frozen=True)
 class SequenceHandoff:
-    """Model-independent sequence progress at the P/D boundary."""
+    """Model-independent sequence progress at the P/D boundary.
+
+    A hybrid source slot contains state *after* ``num_computed_tokens``. P has
+    already sampled ``output_token_ids[0]``, so D continues by consuming that
+    token. This direct handoff does not replay the final prompt token.
+    """
 
     seq_id: int
     prompt: Optional[str]
