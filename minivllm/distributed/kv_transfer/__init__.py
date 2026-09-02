@@ -5,6 +5,13 @@ from minivllm.distributed.kv_transfer.memory import (
     InMemoryTransferBackend,
     InMemoryTransferRegistry,
 )
+from minivllm.distributed.kv_transfer.layout import (
+    CacheLayout,
+    CacheRegion,
+    CacheRegionKind,
+    KVTransferPlanner,
+    register_cache_layout,
+)
 from minivllm.distributed.kv_transfer.types import (
     BufferSlice,
     RegisteredBuffer,
@@ -17,13 +24,18 @@ from minivllm.distributed.kv_transfer.types import (
 
 __all__ = [
     "BufferSlice",
+    "CacheLayout",
+    "CacheRegion",
+    "CacheRegionKind",
     "InMemoryTransferBackend",
     "InMemoryTransferRegistry",
     "RegisteredBuffer",
+    "KVTransferPlanner",
     "TransferBackend",
     "TransferEndpoint",
     "TransferHandle",
     "TransferPlan",
     "TransferSlice",
     "TransferStatus",
+    "register_cache_layout",
 ]

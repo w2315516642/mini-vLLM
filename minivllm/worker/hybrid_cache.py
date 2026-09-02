@@ -340,6 +340,14 @@ class HybridCache:
         self._require_layer_type(layer_idx, FULL_ATTENTION)
         return self._full_attention_caches[layer_idx]
 
+    def get_state_slot(self, seq_id: int) -> int:
+        """Return the stable request slot advertised during PD handoff."""
+        return self._slots.lookup(seq_id)
+
+    def get_state_pools(self) -> Mapping[int, GatedDeltaNetState]:
+        """Expose persistent pools for one-time transfer-engine registration."""
+        return self._linear_state_pools.copy()
+
     def read_state(
         self,
         layer_idx: int,
