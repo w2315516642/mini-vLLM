@@ -13,7 +13,7 @@ class PDRole(str, Enum):
 class KVTransferBackend(str, Enum):
     NONE = "none"
     MEMORY = "memory"
-    MOONCAKE = "mooncake"
+    TCP = "tcp"
 
 
 @dataclass(frozen=True)
@@ -63,4 +63,3 @@ class PDConfig:
     @property
     def enabled(self) -> bool:
         return self.role != PDRole.UNIFIED
-
