@@ -11,6 +11,8 @@ from minivllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from minivllm.model_executor.layers.dspark_attention import DraftPagedAttention
+from minivllm.spec_decode.draft_metadata import DraftAttentionMetadata
 from minivllm.model_executor.parallel_utils.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -149,6 +151,12 @@ class DFlashAttention(nn.Module):
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.paged_attention = DraftPagedAttention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.scaling,
+        )
 
     def _project_qkv(
         self, hidden_states: torch.Tensor
@@ -196,6 +204,37 @@ class DFlashAttention(nn.Module):
             block_value,
             self.scaling,
         )
+        output, _ = self.o_proj(output.flatten(-2))
+        return output
+
+    def project_context_kv(
+        self,
+        context_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key, value = self._project_context_kv(context_hidden)
+        key = _apply_neox_rope(
+            key.unsqueeze(0), positions.unsqueeze(0), cos_sin_cache
+        ).squeeze(0)
+        return key, value
+
+    def forward_paged(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Tuple[torch.Tensor, torch.Tensor],
+        metadata: DraftAttentionMetadata,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        query, key, value = self._project_qkv(hidden_states)
+        query = _apply_neox_rope(
+            query.unsqueeze(0), positions.unsqueeze(0), cos_sin_cache
+        ).squeeze(0)
+        key = _apply_neox_rope(
+            key.unsqueeze(0), positions.unsqueeze(0), cos_sin_cache
+        ).squeeze(0)
+        output = self.paged_attention(query, key, value, cache, metadata)
         output, _ = self.o_proj(output.flatten(-2))
         return output
 
@@ -264,6 +303,22 @@ class DFlashDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return residual + self.mlp(hidden_states)
+
+    def forward_paged(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Tuple[torch.Tensor, torch.Tensor],
+        metadata: DraftAttentionMetadata,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = residual + self.self_attn.forward_paged(
+            hidden_states, positions, cache, metadata, cos_sin_cache
+        )
+        residual = hidden_states
+        return residual + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
 @dataclass
@@ -350,6 +405,53 @@ class DSparkDraftModel(nn.Module):
                 positions,
                 context_hidden,
                 context_positions,
+                self.cos_sin_cache,
+            )
+        return self.norm(hidden_states)
+
+    def materialize_context_kv(
+        self,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        caches: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Project committed target features into every draft-layer cache."""
+        context_hidden = self.project_target_hidden(target_hidden)
+        cache_list = list(caches)
+        if len(cache_list) != len(self.layers):
+            raise ValueError("Draft cache layer count does not match the model")
+        for layer, cache in zip(self.layers, cache_list):
+            key, value = layer.self_attn.project_context_kv(
+                context_hidden, positions, self.cos_sin_cache
+            )
+            layer.self_attn.paged_attention.write_context(
+                key, value, cache, slot_mapping
+            )
+        return context_hidden
+
+    def forward_paged(
+        self,
+        input_embeddings: torch.Tensor,
+        positions: torch.Tensor,
+        caches: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+        metadata: DraftAttentionMetadata,
+    ) -> torch.Tensor:
+        if input_embeddings.shape != (
+            metadata.num_tokens,
+            self.config.hidden_size,
+        ):
+            raise ValueError("Packed DSpark embeddings do not match metadata")
+        cache_list = list(caches)
+        if len(cache_list) != len(self.layers):
+            raise ValueError("Draft cache layer count does not match the model")
+        hidden_states = input_embeddings
+        for layer, cache in zip(self.layers, cache_list):
+            hidden_states = layer.forward_paged(
+                hidden_states,
+                positions,
+                cache,
+                metadata,
                 self.cos_sin_cache,
             )
         return self.norm(hidden_states)

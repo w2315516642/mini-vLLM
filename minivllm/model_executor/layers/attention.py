@@ -169,6 +169,7 @@ class PagedAttention(nn.Module):
             input_metadata.cached_prompt_context_lens,
             block_size,
             input_metadata.max_cached_prompt_context_len,
+            True,
         )
 
     def forward(

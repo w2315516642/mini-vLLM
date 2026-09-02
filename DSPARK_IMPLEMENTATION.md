@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | 1 | DSpark 配置、Markov 与 confidence 输出头 | 已完成 |
 | 2 | DFlash 草稿模型、权重加载与目标层特征 | 已完成 |
-| 3 | Draft KV cache 与块内双向 attention | 未开始 |
+| 3 | Draft KV cache 与块内双向 attention | 已完成 |
 | 4 | 静态贪心块验证、调度与 GDN 状态事务 | 未开始 |
 | 5 | 精确随机 rejection sampling | 未开始 |
 | 6 | confidence-scheduled 自适应验证 | 未开始 |
@@ -42,3 +42,14 @@ Attention。目标模型通过默认关闭的 collector 回调暴露选定层输
 
 验收结果：tiny DSpark 完成离线整块 proposal，目标层收集顺序、块内双向
 可见性和 packed QKV 权重映射均通过测试；阶段 1、2 合计 11 项测试通过。
+
+## 阶段 3：Draft KV 与块内双向注意力
+
+Draft KV cache 镜像 Target 的物理 block id，但保存 5 个草稿层各自的 K/V。
+现有 varlen paged-attention kernel 增加 `query_is_causal` 参数：Target cached
+prefill 传 `true`，DFlash 当前块传 `false`。后者让块内所有 query 看见完整
+当前块，同时仍用 `context_len` 屏蔽物理 block 末尾未使用的槽位。
+
+验收结果：完成 Draft cache 物理块映射、逐层 context K/V 物化和非因果
+块内 paged attention；WSL2 `mini-vllm` 环境编译 CUDA 扩展后，DSpark、
+GQA 与 Qwen gated attention 共 11 项 CUDA/接口测试全部通过。

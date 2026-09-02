@@ -20,7 +20,7 @@ void varlen_query_cached_kv_attention(
   int max_seqlen_q, float scale,
   torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]          
   torch::Tensor &context_lens,      // [num_seqs]
-  int block_size, int max_context_len);
+  int block_size, int max_context_len, bool query_is_causal);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(

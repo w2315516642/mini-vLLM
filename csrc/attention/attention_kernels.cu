@@ -355,7 +355,8 @@ __global__ void varlen_query_cached_kv_attention_kernel(
     const int *__restrict__ block_tables, // [num_seqs, max_num_blocks_per_seq]
     const int *__restrict__ context_lens, // [num_seqs]
     const int max_num_blocks_per_seq,
-    const int num_kv_heads, const int q_stride) {
+    const int num_kv_heads, const int q_stride,
+    const bool query_is_causal) {
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
   constexpr int NUM_TOKENS_PER_THREAD_GROUP =
       (BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
@@ -522,8 +523,9 @@ __global__ void varlen_query_cached_kv_attention_kernel(
             if (thread_group_offset == 0) {
               float* row_logits = block_logits_smem +
                                   (warp_idx * TM + row_offset) * BLOCK_SIZE;
-              const int query_position =
-                  query_start + m_block_offset + q_token_idx;
+              const int query_position = query_is_causal
+                  ? query_start + m_block_offset + q_token_idx
+                  : context_len - 1;
               const bool mask = token_idx > query_position;
               row_logits[physical_block_offset] = mask ? -FLT_MAX : qk;
               block_max_tg[row_offset] = mask ? block_max_tg[row_offset] : 
@@ -565,8 +567,9 @@ __global__ void varlen_query_cached_kv_attention_kernel(
         if (q_token_idx < num_q_tokens) {
           float* row_logits = block_logits_smem +
                               (warp_idx * TM + row_offset) * BLOCK_SIZE;
-          const int query_position =
-              query_start + m_block_offset + q_token_idx;
+          const int query_position = query_is_causal
+              ? query_start + m_block_offset + q_token_idx
+              : context_len - 1;
           for (int i = lane_idx; i < BLOCK_SIZE; i += WARP_SIZE) {
             const int token_idx = block_idx * BLOCK_SIZE + i;
             const bool mask = token_idx > query_position;
@@ -835,7 +838,7 @@ void single_query_cached_kv_attention(
       <<<grid, block, shared_mem_size, stream>>>(                                   \
           out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, cu_seqlens_q_ptr,     \
           max_seqlen_q, scale, block_tables_ptr, context_lens_ptr,                  \
-          max_num_blocks_per_seq, num_kv_heads, query_stride)
+          max_num_blocks_per_seq, num_kv_heads, query_stride, query_is_causal)
 
 template <typename T, int BLOCK_SIZE, int NUM_THREADS = 128, int TM = 4>
 void varlen_query_cached_kv_attention_launcher(
@@ -849,7 +852,7 @@ void varlen_query_cached_kv_attention_launcher(
     int max_seqlen_q, float scale,            
     torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]
     torch::Tensor &context_lens,      // [num_seqs]      
-    int max_context_len) {
+    int max_context_len, bool query_is_causal) {
   int num_seqs = cu_seqlens_q.size(0) - 1;
   int num_heads = query.size(1);
   int num_kv_heads = key_cache.size(1);
@@ -912,7 +915,8 @@ void varlen_query_cached_kv_attention_launcher(
 #define CALL_VARLEN_KERNEL_LAUNCHER(T, BLOCK_SIZE)                      \
   varlen_query_cached_kv_attention_launcher<T, BLOCK_SIZE>(             \
     out, query, key_cache, value_cache, cu_seqlens_q,                   \
-    max_seqlen_q, scale, block_tables, context_lens, max_context_len);
+    max_seqlen_q, scale, block_tables, context_lens, max_context_len,   \
+    query_is_causal);
 
 #define CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(T)                       \
     switch (block_size) {                                               \
@@ -938,9 +942,9 @@ void varlen_query_cached_kv_attention(
     torch::Tensor &value_cache,       // [num_blocks, num_heads, head_size, block_size]        
     torch::Tensor &cu_seqlens_q,      // [num_seqs + 1]
     int max_seqlen_q, float scale,
-    torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]          
-    torch::Tensor &context_lens,      // [num_seqs]
-    int block_size, int max_context_len) {
+  torch::Tensor &block_tables,      // [num_seqs, max_num_blocks_per_seq]
+  torch::Tensor &context_lens,      // [num_seqs]
+  int block_size, int max_context_len, bool query_is_causal) {
   if (query.dtype() == at::ScalarType::Float) {
     CALL_VARLEN_KERNEL_LAUNCHER_BLOCK_SIZE(float);
   } else if (query.dtype() == at::ScalarType::Half) {

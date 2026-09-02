@@ -192,6 +192,7 @@ class GQACudaKernelTest(unittest.TestCase):
             torch.tensor([context_len], dtype=torch.int32, device="cuda"),
             block_size,
             context_len,
+            True,
         )
         torch.cuda.synchronize()
 

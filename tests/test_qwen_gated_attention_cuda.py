@@ -157,6 +157,7 @@ class QwenGatedAttentionCudaTest(unittest.TestCase):
             torch.tensor([context_len], device="cuda", dtype=torch.int32),
             block_size,
             context_len,
+            True,
         )
         torch.cuda.synchronize()
 
