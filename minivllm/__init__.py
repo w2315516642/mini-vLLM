@@ -3,7 +3,7 @@ from minivllm.engine.arg_utils import EngineArgs #, AsyncEngineArgs
 from minivllm.engine.llm_engine import LLMEngine
 from minivllm.engine.ray_utils import initialize_cluster
 from minivllm.entrypoints.llm import LLM
-from minivllm.outputs import CompletionOutput, RequestOutput
+from minivllm.outputs import CompletionOutput, RequestOutput, RequestOutputKind
 from minivllm.sampling_params import SamplingParams
 
 __version__ = "0.1.0"
@@ -12,6 +12,7 @@ __all__ = [
     "LLM",
     "SamplingParams",
     "RequestOutput",
+    "RequestOutputKind",
     "CompletionOutput",
     "LLMEngine",
     "EngineArgs",

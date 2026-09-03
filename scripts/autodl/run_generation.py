@@ -3,6 +3,7 @@
 import argparse
 import json
 import time
+from contextlib import closing
 
 
 def parse_args():
@@ -25,6 +26,7 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--requests", type=int, default=1)
+    parser.add_argument("--stream", action="store_true")
     return parser.parse_args()
 
 
@@ -33,7 +35,7 @@ def main() -> None:
     if args.requests <= 0 or args.warmup < 0:
         raise ValueError("requests must be positive and warmup non-negative")
 
-    from minivllm import LLM, SamplingParams
+    from minivllm import LLM, SamplingParams, RequestOutputKind
 
     engine_kwargs = {
         "model": args.model,
@@ -60,11 +62,24 @@ def main() -> None:
         max_tokens=args.max_tokens,
     )
 
-    def generate_once():
+    def generate_once(stream_output=False):
         started = time.perf_counter()
-        result = llm.generate(
-            [args.prompt], sampling_params, use_tqdm=False
-        )[0]
+        if stream_output:
+            printed_chars = 0
+            # Cumulative mode keeps the final snapshot for the existing stats.
+            with closing(llm.generate_stream(
+                [args.prompt], sampling_params,
+                output_kind=RequestOutputKind.CUMULATIVE,
+            )) as stream:
+                for result in stream:
+                    text = result.outputs[0].text
+                    print(text[printed_chars:], end="", flush=True)
+                    printed_chars = len(text)
+            print()
+        else:
+            result = llm.generate(
+                [args.prompt], sampling_params, use_tqdm=False
+            )[0]
         return result, time.perf_counter() - started
 
     for _ in range(args.warmup):
@@ -74,12 +89,13 @@ def main() -> None:
     total_tokens = 0
     last_output = None
     for _ in range(args.requests):
-        last_output, elapsed = generate_once()
+        last_output, elapsed = generate_once(stream_output=args.stream)
         latencies.append(elapsed)
         total_tokens += len(last_output.outputs[0].token_ids)
 
     assert last_output is not None
-    print(last_output.outputs[0].text)
+    if not args.stream:
+        print(last_output.outputs[0].text)
     print(
         json.dumps(
             {

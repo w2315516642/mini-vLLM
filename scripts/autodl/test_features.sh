@@ -27,6 +27,9 @@ echo "== Cluster initialization and tensor parallelism =="
 run_test_modules \
   tests.test_ray_utils tests.test_graph_all_reduce tests.test_graph_all_reduce_cuda
 
+echo "== Streaming output =="
+run_test_modules tests.test_streaming tests.test_pd_streaming
+
 echo "== Qwen3.8 Python/CUDA =="
 run_test_modules \
   tests.test_model_architecture tests.test_model_registry \

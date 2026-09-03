@@ -248,6 +248,10 @@ class LLMEngine:
     def abort_request(self, request_id: str) -> None:
         """Aborts a request with the given ID."""
         self.scheduler.abort_seq_group(request_id)
+        self._sealed_handoffs = [
+            handoff for handoff in self._sealed_handoffs
+            if handoff.request_id != request_id
+        ]
         self._flush_pending_state_operations()
 
     def get_num_unfinished_requests(self) -> int:
@@ -508,7 +512,8 @@ class LLMEngine:
                         skip_special_tokens=True,
                     )
                     seq.output_tokens.append(new_token)
-                    seq.output_text += new_output_text
+                    # The tokenizer returns the complete decoded prefix.
+                    seq.output_text = new_output_text
 
     def _stop_sequences(self, seq_groups: List[SequenceGroup]) -> None:
         """Stop the finished sequences."""
@@ -516,17 +521,15 @@ class LLMEngine:
             sampling_params = seq_group.sampling_params
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 # Check if the sequence has generated a stop string.
-                stopped = False
-                for stop_str in sampling_params.stop:
-                    if seq.output_text.endswith(stop_str):
-                        # Truncate the output text so that the stop string is
-                        # not included in the output.
-                        seq.output_text = seq.output_text[:-len(stop_str)]
-                        self.scheduler.free_seq(
-                            seq, SequenceStatus.FINISHED_STOPPED)
-                        stopped = True
-                        break
-                if stopped:
+                # A verified DSpark block may contain several tokens, so a
+                # stop string can occur before the end of this step's text.
+                stop_positions = [
+                    pos for stop_str in sampling_params.stop
+                    if (pos := seq.output_text.find(stop_str)) >= 0
+                ]
+                if stop_positions:
+                    seq.output_text = seq.output_text[:min(stop_positions)]
+                    self.scheduler.free_seq(seq, SequenceStatus.FINISHED_STOPPED)
                     continue
                     
                 # Check if the sequence has reached max_tokens.

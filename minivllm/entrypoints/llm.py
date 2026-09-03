@@ -1,12 +1,14 @@
-from typing import Any, List, Mapping, Optional, Sequence, Union
+from contextlib import closing
+from typing import Any, Iterator, List, Mapping, Optional, Sequence, Union
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from minivllm.engine.arg_utils import EngineArgs
 from minivllm.engine.llm_engine import LLMEngine
+from minivllm.engine.output_processor import OutputProcessor
 from minivllm.multimodal import MultiModalInputs
-from minivllm.outputs import RequestOutput
+from minivllm.outputs import RequestOutput, RequestOutputKind
 from minivllm.sampling_params import SamplingParams
 from minivllm.utils import Counter
 
@@ -20,8 +22,8 @@ class LLM:
     this class generates texts from the model, using an intelligent batching
     mechanism and efficient memory management.
 
-    NOTE: This class is intended to be used for offline inference. For online
-    serving, use the `AsyncLLMEngine` class instead.
+    NOTE: This is a synchronous inference interface. A single caller owns the
+    engine loop, including while a streaming generator is suspended.
     NOTE: For the comprehensive list of arguments, see `EngineArgs`.
 
     Args:
@@ -56,6 +58,7 @@ class LLM:
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_conuter = Counter()
         self._processor = None
+        self._generation_active = False
 
     def get_tokenizer(
         self,
@@ -103,6 +106,51 @@ class LLM:
             A list of `RequestOutput` objects containing the generated
             completions in the same order as the input prompts.
         """
+        outputs = list(self.generate_stream(
+            prompts, sampling_params, prompt_token_ids, use_tqdm,
+            multi_modal_inputs, output_kind=RequestOutputKind.FINAL_ONLY,
+        ))
+        return sorted(outputs, key=lambda output: int(output.request_id))
+
+    def generate_stream(
+        self,
+        prompts: Optional[Union[str, List[str]]] = None,
+        sampling_params: Optional[SamplingParams] = None,
+        prompt_token_ids: Optional[List[List[int]]] = None,
+        use_tqdm: bool = False,
+        multi_modal_inputs: Optional[
+            List[Union[MultiModalInputs, Mapping[str, Any]]]
+        ] = None,
+        *,
+        output_kind: RequestOutputKind = RequestOutputKind.DELTA,
+    ) -> Iterator[RequestOutput]:
+        """Yield updates tagged by request_id and completion index.
+
+        DELTA contains only new text/tokens; a verified speculative block may
+        produce multiple tokens at once. Close the generator (for example with
+        contextlib.closing) when stopping early to release outstanding requests.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        processor = OutputProcessor(sampling_params, output_kind)
+        with closing(self._generate(
+            prompts, sampling_params, prompt_token_ids, use_tqdm,
+            multi_modal_inputs,
+        )) as stream:
+            for output in stream:
+                update = processor.process(output)
+                if update is not None:
+                    yield update
+
+    def _generate(
+        self, prompts, sampling_params, prompt_token_ids, use_tqdm,
+        multi_modal_inputs,
+    ) -> Iterator[RequestOutput]:
+        """Own submission, stepping and cleanup for one synchronous batch."""
+        if self._generation_active:
+            raise RuntimeError(
+                "Finish or close the active generation before starting another"
+            )
         if (
             prompts is None
             and prompt_token_ids is None
@@ -118,10 +166,6 @@ class LLM:
                 raise ValueError(
                     "The length of prompts and prompt_token_ids must be the same."
                 )
-        if sampling_params is None:
-            # Use default samping params.
-            sampling_params = SamplingParams()
-
         if multi_modal_inputs is not None:
             expected = (
                 len(prompts)
@@ -142,31 +186,43 @@ class LLM:
             num_requests = len(prompt_token_ids)
         else:
             num_requests = len(multi_modal_inputs)
-        for i in range(num_requests):
-            prompt = prompts[i] if prompts is not None else None
-            if prompt_token_ids is None:
-                token_ids = None
-            else:
-                token_ids = prompt_token_ids[i]
-            request_inputs = None
-            if multi_modal_inputs is not None:
-                request_inputs = multi_modal_inputs[i]
-                if isinstance(request_inputs, Mapping):
-                    processed_ids, request_inputs = (
-                        MultiModalInputs.from_processor_output(request_inputs)
-                    )
-                    if token_ids is not None and tuple(token_ids) != processed_ids:
-                        raise ValueError(
-                            "prompt_token_ids do not match processor input_ids"
+        if num_requests == 0:
+            return
+        pending = set()
+        self._generation_active = True
+        try:
+            for i in range(num_requests):
+                prompt = prompts[i] if prompts is not None else None
+                token_ids = (
+                    prompt_token_ids[i] if prompt_token_ids is not None else None
+                )
+                request_inputs = None
+                if multi_modal_inputs is not None:
+                    request_inputs = multi_modal_inputs[i]
+                    if isinstance(request_inputs, Mapping):
+                        processed_ids, request_inputs = (
+                            MultiModalInputs.from_processor_output(request_inputs)
                         )
-                    token_ids = list(processed_ids)
-            self._add_request(
-                prompt,
-                sampling_params,
-                token_ids,
-                request_inputs,
-            )
-        return self._run_engine(use_tqdm)
+                        if (
+                            token_ids is not None
+                            and tuple(token_ids) != processed_ids
+                        ):
+                            raise ValueError(
+                                "prompt_token_ids do not match processor input_ids"
+                            )
+                        token_ids = list(processed_ids)
+                pending.add(self._add_request(
+                    prompt, sampling_params, token_ids, request_inputs,
+                ))
+            with closing(self._run_engine(use_tqdm)) as stream:
+                for output in stream:
+                    if output.is_finished():
+                        pending.discard(output.request_id)
+                    yield output
+        finally:
+            self._generation_active = False
+            for request_id in pending:
+                self.llm_engine.abort_request(request_id)
 
     def chat(
         self,
@@ -179,13 +235,39 @@ class LLM:
         use_tqdm: bool = True,
     ) -> List[RequestOutput]:
         """Run Qwen processor chat templates for image and video messages."""
+        processed = self._prepare_chat(messages, enable_thinking)
+        return self.generate(
+            sampling_params=sampling_params,
+            multi_modal_inputs=processed,
+            use_tqdm=use_tqdm,
+        )
+
+    def chat_stream(
+        self,
+        messages: Union[
+            Sequence[Mapping[str, Any]],
+            Sequence[Sequence[Mapping[str, Any]]],
+        ],
+        sampling_params: Optional[SamplingParams] = None,
+        enable_thinking: bool = True,
+        *,
+        output_kind: RequestOutputKind = RequestOutputKind.DELTA,
+    ) -> Iterator[RequestOutput]:
+        """Stream image/video chat using the same processor path as chat()."""
+        return self.generate_stream(
+            sampling_params=sampling_params,
+            multi_modal_inputs=self._prepare_chat(messages, enable_thinking),
+            output_kind=output_kind,
+        )
+
+    def _prepare_chat(self, messages, enable_thinking):
         conversations = list(messages)
         if not conversations:
             return []
         if isinstance(conversations[0], Mapping):
             conversations = [conversations]
         processor = self.get_processor()
-        processed = [
+        return [
             processor.apply_chat_template(
                 conversation,
                 add_generation_prompt=True,
@@ -196,11 +278,6 @@ class LLM:
             )
             for conversation in conversations
         ]
-        return self.generate(
-            sampling_params=sampling_params,
-            multi_modal_inputs=processed,
-            use_tqdm=use_tqdm,
-        )
 
     def _add_request(
         self,
@@ -208,7 +285,7 @@ class LLM:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
         multi_modal_inputs: Optional[MultiModalInputs] = None,
-    ) -> None:
+    ) -> str:
         request_id = str(next(self.request_conuter))
         self.llm_engine.add_request(
             request_id,
@@ -217,21 +294,18 @@ class LLM:
             prompt_token_ids,
             multi_modal_inputs=multi_modal_inputs,
         )
+        return request_id
         
-    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
-        # Initialize tqdm.
-        if use_tqdm:
-            num_requests = self.llm_engine.get_num_unfinished_requests()
-            pbar = tqdm(total=num_requests, desc="Processed prompts")
-        # Run the engine.
-        outputs: List[RequestOutput] = []
-        while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
-            for output in step_outputs:
-                if output.is_finished():
-                    outputs.append(output)
-                    if use_tqdm:
+    def _run_engine(self, use_tqdm: bool) -> Iterator[RequestOutput]:
+        pbar = tqdm(
+            total=self.llm_engine.get_num_unfinished_requests(),
+            desc="Processed prompts", disable=not use_tqdm,
+        )
+        try:
+            while self.llm_engine.has_unfinished_requests():
+                for output in self.llm_engine.step():
+                    if output.is_finished():
                         pbar.update(1)
-        if use_tqdm:
+                    yield output
+        finally:
             pbar.close()
-        return outputs

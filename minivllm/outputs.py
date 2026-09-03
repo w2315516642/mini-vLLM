@@ -1,6 +1,15 @@
+from enum import Enum
 from typing import Optional, List, Dict
 
 from minivllm.sequence import SequenceGroup, SequenceStatus
+
+
+class RequestOutputKind(str, Enum):
+    """Whether a consumer receives the whole result or only its new suffix."""
+
+    CUMULATIVE = "cumulative"
+    DELTA = "delta"
+    FINAL_ONLY = "final_only"
 
 
 # 单条output
@@ -54,6 +63,7 @@ class RequestOutput:
         prompt: The prompt string of the request.
         prompt_token_ids: The token IDs of the prompt.
         outputs: The output sequences of the request.
+        finished: Whether the entire request (not just this update) is finished.
     """
 
     def __init__(
@@ -62,11 +72,17 @@ class RequestOutput:
         prompt: str,
         prompt_token_ids: List[int],
         outputs: List[CompletionOutput],
+        finished: Optional[bool] = None,
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
         self.outputs = outputs
+        # A delta can contain only one finished completion of an active group.
+        self.finished = (
+            all(output.finished() for output in outputs)
+            if finished is None else finished
+        )
 
     @classmethod
     def from_seq_group(cls, seq_group: SequenceGroup) -> "RequestOutput":
@@ -81,17 +97,15 @@ class RequestOutput:
         # Create the outputs.
         outputs: List[CompletionOutput] = []
         for seq in top_n_seqs:
-            logprobs = seq.output_logprobs
-            if seq_group.sampling_params.logprobs is None:
-                # NOTE: We need to take care of this case because the sequence
-                # always has the logprobs of the sampled tokens even if the
-                # logprobs are not requested.
-                logprobs = {}
+            # The sequence keeps sampled logprobs even when not requested.
+            logprobs = None
+            if seq_group.sampling_params.logprobs is not None:
+                logprobs = [dict(item) for item in seq.output_logprobs]
             finished_reason = SequenceStatus.get_finished_reason(seq.status)
             output = CompletionOutput(
                 seqs.index(seq),
                 seq.output_text,
-                seq.get_output_token_ids(),
+                list(seq.get_output_token_ids()),
                 seq.get_cumulative_logprob(),
                 logprobs,
                 finished_reason
@@ -99,8 +113,12 @@ class RequestOutput:
             outputs.append(output)
         
         prompt = top_n_seqs[0].prompt
-        prompt_token_ids = top_n_seqs[0].data.prompt_token_ids
-        return cls(seq_group.request_id, prompt, prompt_token_ids, outputs)
+        # These snapshots may outlive the next engine step in a stream.
+        prompt_token_ids = list(top_n_seqs[0].data.prompt_token_ids)
+        return cls(
+            seq_group.request_id, prompt, prompt_token_ids, outputs,
+            finished=seq_group.is_finished(),
+        )
 
     def __repr__(self) -> str:
         return (f"RequestOutput(request_id={self.request_id}, "
@@ -109,4 +127,4 @@ class RequestOutput:
                 f"outputs={self.outputs})")
 
     def is_finished(self) -> bool:
-        return all(output.finished() for output in self.outputs)
+        return self.finished

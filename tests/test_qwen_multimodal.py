@@ -7,6 +7,7 @@ import torch
 
 from minivllm.multimodal import MultiModalInputs
 from minivllm.entrypoints.llm import LLM
+from minivllm.sampling_params import SamplingParams
 from minivllm.model_executor.models.qwen3_5 import (
     _apply_interleaved_mrope,
 )
@@ -89,9 +90,11 @@ class MultiModalLLMApiTest(unittest.TestCase):
 
     def test_generate_accepts_one_processor_output_per_request(self):
         llm = object.__new__(LLM)
+        llm._generation_active = False
+        llm.llm_engine = Mock()
         recorded = []
         llm._add_request = lambda *args: recorded.append(args)
-        llm._run_engine = lambda use_tqdm: []
+        llm._run_engine = lambda use_tqdm: (item for item in [])
         processor_output = {
             "input_ids": [[3, 120, 4]],
             "mm_token_type_ids": [[0, 1, 0]],
@@ -99,8 +102,9 @@ class MultiModalLLMApiTest(unittest.TestCase):
             "image_grid_thw": [[1, 2, 2]],
         }
 
+        default_params = SamplingParams()
         with patch.object(llm_module, "SamplingParams") as params:
-            params.return_value = object()
+            params.return_value = default_params
             llm.generate(
                 multi_modal_inputs=[processor_output], use_tqdm=False
             )
@@ -114,9 +118,11 @@ class MultiModalLLMApiTest(unittest.TestCase):
 
     def test_generate_keeps_use_tqdm_as_fourth_positional_argument(self):
         llm = object.__new__(LLM)
+        llm._generation_active = False
+        llm.llm_engine = Mock()
         llm._add_request = Mock()
-        llm._run_engine = Mock(return_value=[])
-        sampling_params = object()
+        llm._run_engine = Mock(return_value=(item for item in []))
+        sampling_params = SamplingParams()
 
         llm.generate(None, sampling_params, [[3, 4]], False)
 

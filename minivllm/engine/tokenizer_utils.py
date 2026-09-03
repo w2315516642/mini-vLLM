@@ -52,11 +52,16 @@ def detokenize_incrementally(
 
     Returns:
         new_token: The new token as a string.
-        output_text: The new output text as a string.
+        output_text: The cumulative output text, including the new token.
     """
-    new_token = tokenizer.convert_ids_to_tokens(
-        new_token_id, skip_special_tokens=skip_special_tokens)
+    # Keep one token entry per ID, including EOS; filter only for rendering.
+    new_token = tokenizer.convert_ids_to_tokens(new_token_id)
     output_tokens = prev_output_tokens + [new_token]
+    if skip_special_tokens:
+        special_tokens = set(tokenizer.all_special_tokens)
+        output_tokens = [
+            token for token in output_tokens if token not in special_tokens
+        ]
 
     # Convert the tokens to a string.
     # Optimization: If the tokenizer does not have `added_tokens_encoder`,
@@ -72,8 +77,6 @@ def detokenize_incrementally(
     sub_texts = []
     current_sub_text = []
     for token in output_tokens:
-        if skip_special_tokens and token in tokenizer.all_special_ids:
-            continue
         if token in tokenizer.added_tokens_encoder:
             if current_sub_text:
                 sub_text = tokenizer.convert_tokens_to_string(current_sub_text)

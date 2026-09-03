@@ -5,17 +5,20 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Connection, Listener
-from typing import Any, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
+from minivllm.engine.output_processor import OutputProcessor
 from minivllm.engine.pd_runtime import PDEngineBridge
 from minivllm.multimodal import MultiModalInputs
-from minivllm.outputs import RequestOutput
+from minivllm.outputs import RequestOutput, RequestOutputKind
 from minivllm.sampling_params import SamplingParams
 
 
 _RPC_METHODS = {
+    "abort_request",
     "abort_decode_handoff",
     "activate_decode_handoff",
     "add_request",
@@ -147,7 +150,11 @@ class RemoteEngineClient:
 
 
 class PDClient:
-    """Small synchronous client that demonstrates the complete PD path."""
+    """Single-owner synchronous client for a dedicated pair of P/D engines.
+
+    Do not attach concurrent PDClients to the same engines: step() returns all
+    scheduled requests, so concurrent serving needs a central output dispatcher.
+    """
 
     def __init__(
         self,
@@ -158,6 +165,7 @@ class PDClient:
         self.prefill = RemoteEngineClient(prefill_control, authkey)
         self.decode = RemoteEngineClient(decode_control, authkey)
         self.bridge = PDEngineBridge(self.prefill, self.decode)
+        self._generating = False
 
     def generate(
         self,
@@ -184,70 +192,126 @@ class PDClient:
         multi_modal_inputs: Optional[MultiModalInputs] = None,
         request_id: Optional[str] = None,
     ) -> Tuple[RequestOutput, "PDGenerationMetrics"]:
+        with closing(self._generate(
+            prompt, sampling_params, prompt_token_ids, multi_modal_inputs,
+            request_id,
+        )) as stream:
+            for output, metrics in stream:
+                if metrics is not None:
+                    return output, metrics
+        raise RuntimeError("PD generation ended without a final output")
+
+    def generate_stream(
+        self,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+        prompt_token_ids: Optional[list[int]] = None,
+        multi_modal_inputs: Optional[MultiModalInputs] = None,
+        request_id: Optional[str] = None,
+        *,
+        output_kind: RequestOutputKind = RequestOutputKind.DELTA,
+    ) -> Iterator[RequestOutput]:
+        """Yield P's first token and then D's updates, with shared offsets.
+
+        Close this generator when abandoning a request. The RPC connection
+        remains reusable; only this request's cache/state is released.
+        """
+        processor = OutputProcessor(sampling_params, output_kind)
+        with closing(self._generate(
+            prompt, sampling_params, prompt_token_ids, multi_modal_inputs,
+            request_id,
+        )) as stream:
+            for output, _ in stream:
+                update = processor.process(output)
+                if update is not None:
+                    yield update
+
+    def _generate(
+        self, prompt, sampling_params, prompt_token_ids, multi_modal_inputs,
+        request_id,
+    ) -> Iterator[Tuple[RequestOutput, Optional["PDGenerationMetrics"]]]:
+        """One PD execution loop shared by final, measured and streamed APIs."""
+        if self._generating:
+            raise RuntimeError("Finish or close the active PD generation first")
         request_id = request_id or uuid.uuid4().hex
         started_at = time.perf_counter()
-        self.prefill.add_request(
-            request_id,
-            prompt,
-            sampling_params,
-            prompt_token_ids,
-            multi_modal_inputs=multi_modal_inputs,
-        )
+        self._generating = True
+        transferred = False
+        finished = False
         first_token_at = None
-        while True:
-            prefill_outputs = self.prefill.step()
-            for output in prefill_outputs:
-                if output.request_id != request_id:
-                    continue
-                if output.outputs and output.outputs[0].token_ids:
-                    first_token_at = first_token_at or time.perf_counter()
-                if output.is_finished():
-                    finished_at = time.perf_counter()
-                    return output, PDGenerationMetrics(
-                        prefill_s=finished_at - started_at,
-                        transfer_s=0.0,
-                        decode_s=0.0,
-                        ttft_s=(first_token_at or finished_at) - started_at,
-                        tpot_s=0.0,
-                    )
-            handoffs = self.prefill.pop_prefill_handoffs()
-            selected = [
-                handoff
-                for handoff in handoffs
-                if handoff.request_id == request_id
-            ]
-            if selected:
-                if len(selected) != 1:
-                    raise RuntimeError("P produced duplicate request handoffs")
-                transfer_started_at = time.perf_counter()
-                self.bridge.transfer(selected[0])
-                transfer_finished_at = time.perf_counter()
-                break
+        try:
+            self.prefill.add_request(
+                request_id, prompt, sampling_params, prompt_token_ids,
+                multi_modal_inputs=multi_modal_inputs,
+            )
+            while True:
+                for output in self.prefill.step():
+                    if output.request_id != request_id:
+                        continue
+                    if output.outputs and output.outputs[0].token_ids:
+                        first_token_at = first_token_at or time.perf_counter()
+                    if output.is_finished():
+                        finished = True
+                        finished_at = time.perf_counter()
+                        yield output, PDGenerationMetrics(
+                            prefill_s=finished_at - started_at,
+                            transfer_s=0.0,
+                            decode_s=0.0,
+                            ttft_s=(first_token_at or finished_at) - started_at,
+                            tpot_s=0.0,
+                        )
+                        return
+                    # P already sampled the first token. Emit it before the
+                    # transfer; D's cumulative snapshot will include it again.
+                    yield output, None
+                selected = [
+                    handoff for handoff in self.prefill.pop_prefill_handoffs()
+                    if handoff.request_id == request_id
+                ]
+                if selected:
+                    if len(selected) != 1:
+                        raise RuntimeError("P produced duplicate request handoffs")
+                    transfer_started_at = time.perf_counter()
+                    self.bridge.transfer(selected[0])
+                    transfer_finished_at = time.perf_counter()
+                    transferred = True
+                    break
 
-        decode_started_at = time.perf_counter()
-        while self.decode.has_unfinished_requests():
-            for output in self.decode.step():
-                if output.request_id == request_id and output.is_finished():
+            decode_started_at = time.perf_counter()
+            while self.decode.has_unfinished_requests():
+                for output in self.decode.step():
+                    if output.request_id != request_id:
+                        continue
+                    if not output.is_finished():
+                        yield output, None
+                        continue
                     self.bridge.coordinator.finish(request_id)
+                    finished = True
                     finished_at = time.perf_counter()
                     num_decode_intervals = max(
                         len(output.outputs[0].token_ids) - 1, 1
                     )
-                    return output, PDGenerationMetrics(
+                    yield output, PDGenerationMetrics(
                         prefill_s=transfer_started_at - started_at,
-                        transfer_s=(
-                            transfer_finished_at - transfer_started_at
-                        ),
+                        transfer_s=transfer_finished_at - transfer_started_at,
                         decode_s=finished_at - decode_started_at,
                         ttft_s=(
                             (first_token_at or transfer_started_at) - started_at
                         ),
                         tpot_s=(
-                            (finished_at - decode_started_at)
-                            / num_decode_intervals
+                            (finished_at - decode_started_at) / num_decode_intervals
                         ),
                     )
-        raise RuntimeError("D released the request without a final output")
+                    return
+            raise RuntimeError("D released the request without a final output")
+        finally:
+            self._generating = False
+            if not finished:
+                if transferred:
+                    self.bridge.coordinator.cancel(request_id)
+                    self.decode.abort_request(request_id)
+                else:
+                    self.prefill.abort_request(request_id)
 
     def close(self) -> None:
         self.prefill.close()

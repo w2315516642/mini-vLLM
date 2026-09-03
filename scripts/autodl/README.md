@@ -58,6 +58,22 @@ bash scripts/autodl/run_dspark.sh
 提示词、输出长度和显存参数分别通过 `PROMPT`、`MAX_TOKENS`、
 `GPU_MEMORY_UTILIZATION`、`MAX_NUM_SEQS` 覆盖。
 
+### 流式输出
+
+普通生成、MTP、DSpark 和 PD 请求均可加 `--stream`，已有非流式调用不变：
+
+```bash
+bash scripts/autodl/run_qwen38.sh --stream
+bash scripts/autodl/run_dspark.sh --stream
+bash scripts/autodl/run_pd_request.sh --stream
+```
+
+PD 仍需先启动 P、D 服务。更新本次 Python 代码后需要重启两个服务，但不需要
+重新编译 CUDA 扩展。DSpark 的每次更新可能包含多个已通过验证的 token，
+不会输出未接受的草稿。流式模式的耗时包含终端输出开销；对比吞吐时不要加
+`--stream`。Python API、停止词缓冲和取消请求的说明见
+[流式输出设计](STREAMING.md)。
+
 ## PD 模式
 
 PD 需要三个终端。终端 1、2 分别运行：
