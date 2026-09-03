@@ -61,7 +61,9 @@ class PagedAttention(nn.Module):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_size = head_size
         self.scale = scale
-        self.attn_op = xops.fmha.cutlass.FwOp()
+        # Let xFormers select a compatible CUDA backend. The legacy CUTLASS
+        # operator rejects GPUs newer than SM90, including SM120 (Blackwell).
+        self.attn_op = None
 
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
             raise ValueError(f"head size ({self.head_size}) is not supported. "

@@ -1,9 +1,14 @@
 import os
 import unittest
+from itertools import product
+from unittest.mock import patch
 
 import torch
 
 from minivllm import attention_ops, cache_ops, pos_encoding_ops
+from minivllm.model_executor.layers import attention as attention_module
+from minivllm.model_executor.layers.attention import PagedAttention
+from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
 
 
 RUN_CUDA_GQA_TESTS = (
@@ -65,6 +70,65 @@ def _pack_cache(
     "set MINIVLLM_RUN_CUDA_GQA_TESTS=1 after rebuilding CUDA extensions",
 )
 class GQACudaKernelTest(unittest.TestCase):
+    def test_fresh_prefill_without_cutlass_matches_reference(self):
+        torch.manual_seed(4)
+        dtypes = [torch.float16]
+        if torch.cuda.is_bf16_supported():
+            dtypes.append(torch.bfloat16)
+
+        # Simulate CUTLASS being unavailable without pretending this GPU is SM120.
+        # The automatic dispatcher must choose another real CUDA implementation.
+        with patch.object(
+            attention_module.xops.fmha.cutlass.FwOp,
+            "not_supported_reasons",
+            return_value=["CUTLASS disabled for dispatch regression test"],
+        ):
+            for dtype, head_size, heads, prompt_lens in product(
+                dtypes, (64, 256), ((2, 2), (2, 1), (8, 2)), ((4,), (3, 5)),
+            ):
+                with self.subTest(
+                    dtype=dtype, head_size=head_size,
+                    heads=heads, prompt_lens=prompt_lens,
+                ):
+                    num_heads, num_kv_heads = heads
+                    scale = head_size ** -0.5
+                    attention = PagedAttention(
+                        num_heads, head_size, scale, num_kv_heads,
+                    )
+                    query = torch.randn(
+                        sum(prompt_lens), num_heads, head_size,
+                        device="cuda", dtype=dtype,
+                    )
+                    key = torch.randn(
+                        sum(prompt_lens), num_kv_heads, head_size,
+                        device="cuda", dtype=dtype,
+                    )
+                    value = torch.randn_like(key)
+                    output = torch.empty_like(query)
+                    attention.multi_query_kv_attention(
+                        output, query, key, value,
+                        BlockDiagonalCausalMask.from_seqlens(list(prompt_lens)),
+                    )
+
+                    # Each prompt starts a new causal context; no cross-prompt KV.
+                    expected = torch.empty_like(output)
+                    start = 0
+                    for length in prompt_lens:
+                        for offset in range(length):
+                            token = start + offset
+                            for head in range(num_heads):
+                                kv_head = head // (num_heads // num_kv_heads)
+                                expected[token, head] = _reference_attention(
+                                    query[token, head].unsqueeze(0),
+                                    key[start:token + 1, kv_head],
+                                    value[start:token + 1, kv_head],
+                                    scale,
+                                ).squeeze(0)
+                        start += length
+                    torch.testing.assert_close(
+                        output, expected, rtol=2e-2, atol=2e-2,
+                    )
+
     def test_decode_reads_compact_kv_cache(self):
         torch.manual_seed(1)
         dtype = torch.float16

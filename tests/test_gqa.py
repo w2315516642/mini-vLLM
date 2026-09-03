@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from minivllm.model_executor.layers.attention import PagedAttention
+from minivllm.model_executor.layers import attention as attention_module
 from minivllm.model_executor.models import llama as llama_module
 from minivllm.model_executor.models.llama import (
     LlamaAttention,
@@ -99,6 +100,31 @@ class GQALayoutTest(unittest.TestCase):
 
         self.assertEqual(attention.num_kv_heads, 4)
         self.assertEqual(attention.num_queries_per_kv, 1)
+
+    def test_prefill_leaves_backend_selection_to_xformers(self):
+        for num_kv_heads in (2, 8):
+            with self.subTest(num_kv_heads=num_kv_heads):
+                attention = PagedAttention(8, 64, 0.125, num_kv_heads)
+                query = torch.randn(4, 8, 64)
+                key = torch.randn(4, num_kv_heads, 64)
+                value = torch.randn_like(key)
+                output = torch.empty_like(query)
+                expected = torch.randn_like(query)
+                bias = object()
+                with patch.object(
+                    attention_module.xops,
+                    "memory_efficient_attention_forward",
+                    return_value=expected,
+                ) as forward:
+                    result = attention.multi_query_kv_attention(
+                        output, query, key, value, bias,
+                    )
+
+                self.assertIsNone(forward.call_args.kwargs.get("op"))
+                self.assertIs(forward.call_args.kwargs["attn_bias"], bias)
+                self.assertEqual(forward.call_args.kwargs["scale"], 0.125)
+                self.assertIs(result, output)
+                torch.testing.assert_close(output, expected)
 
     def test_invalid_gqa_ratio_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "grouped"):
