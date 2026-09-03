@@ -24,6 +24,7 @@ _RPC_METHODS = {
     "add_request",
     "execute_cache_transfers",
     "get_num_unfinished_requests",
+    "get_runtime_stats",
     "get_transfer_layouts",
     "has_unfinished_requests",
     "pop_prefill_handoffs",
@@ -118,9 +119,14 @@ class PDControlServer:
 class RemoteEngineClient:
     """Duck-typed engine proxy consumed directly by ``PDEngineBridge``."""
 
-    def __init__(self, address: str, authkey: bytes) -> None:
+    def __init__(
+        self, address: str, authkey: bytes, timeout_s: Optional[float] = None,
+    ) -> None:
         if not authkey:
             raise ValueError("control-plane authkey must not be empty")
+        if timeout_s is not None and timeout_s <= 0:
+            raise ValueError("RPC timeout must be positive")
+        self.timeout_s = timeout_s
         self.connection = Client(
             parse_control_address(address), authkey=authkey
         )
@@ -133,6 +139,10 @@ class RemoteEngineClient:
             self.connection.send(
                 {"method": method, "args": args, "kwargs": kwargs}
             )
+            if self.timeout_s is not None and not self.connection.poll(self.timeout_s):
+                # A late response cannot be paired with the next RPC request.
+                self.connection.close()
+                raise TimeoutError(f"RPC {method} exceeded {self.timeout_s}s")
             response = self.connection.recv()
         if not response["ok"]:
             raise RemoteEngineError(

@@ -104,3 +104,7 @@ Prefix Cache；DSpark 当前只接受文本请求。
 
 所有默认值都在 `common.sh` 和各入口脚本顶部通过环境变量覆盖，不需要修改
 脚本本身。
+# Streaming benchmarks
+
+For reproducible TTFT, decoding speed, speculative acceptance and equal-GPU
+PD comparisons, see [BENCHMARKS.md](BENCHMARKS.md).

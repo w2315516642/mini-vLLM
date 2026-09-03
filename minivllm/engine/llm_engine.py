@@ -402,6 +402,29 @@ class LLMEngine:
             "get_transfer_layout", get_all_outputs=True
         )
 
+    def get_runtime_stats(self) -> dict:
+        """Read cumulative counters and the configuration they describe."""
+        return {
+            "speculative": dict(self.scheduler.speculative_stats),
+            "config": {
+                "model": self.model_config.model,
+                "dtype": str(self.model_config.dtype),
+                "seed": self.model_config.seed,
+                "tensor_parallel_size": self.parallel_config.tensor_parallel_size,
+                "pd_role": self.pd_config.role.value,
+                "draft_model": self.scheduler_config.draft_model,
+                "num_speculative_tokens": self.scheduler_config.num_speculative_tokens,
+                "speculative_adaptive": self.scheduler_config.speculative_adaptive,
+                "speculative_min_survival": self.scheduler_config.speculative_min_survival,
+                "speculative_cost_token_counts": self.scheduler_config.speculative_cost_token_counts,
+                "speculative_cost_latency_ms": self.scheduler_config.speculative_cost_latency_ms,
+                "max_num_seqs": self.scheduler_config.max_num_seqs,
+                "max_num_batched_tokens": self.scheduler_config.max_num_batched_tokens,
+                "enable_prefix_caching": self.cache_config.enable_prefix_caching,
+                "gpu_memory_utilization": self.cache_config.gpu_memory_utilization,
+            },
+        }
+
     def prepare_decode_handoff(
         self,
         handoff: RequestHandoff,

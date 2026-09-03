@@ -105,6 +105,12 @@ class Scheduler:
         # List[timestamp, num_tokens]
         self.num_input_tokens: List[Tuple[float, int]] = []
         self.adaptive_planner = self._create_adaptive_planner()
+        # Lifetime counters; benchmark snapshots exclude warmup by subtraction.
+        self.speculative_stats = {
+            "verification_rounds": 0,
+            "verified_draft_tokens": 0,
+            "accepted_draft_tokens": 0,
+        }
 
     def _create_adaptive_planner(self) -> Optional[AdaptiveVerificationPlanner]:
         if not getattr(self.scheduler_config, "speculative_adaptive", False):
@@ -632,9 +638,16 @@ class Scheduler:
                 seq.num_computed_tokens += num_scheduled_tokens
                 max_computed = seq.get_len()
                 if seq.seq_id in scheduler_outputs.speculative_seq_ids:
-                    max_computed += scheduler_outputs.speculative_token_counts[
-                        seq.seq_id
-                    ]
+                    draft_width = scheduler_outputs.speculative_token_counts[
+                        seq.seq_id]
+                    max_computed += draft_width
+                    # Committed inputs are the anchor plus accepted drafts.
+                    # Unlike output length, this also handles an accepted EOS
+                    # without confusing it with a correction or bonus token.
+                    self.speculative_stats["verification_rounds"] += 1
+                    self.speculative_stats["verified_draft_tokens"] += draft_width
+                    self.speculative_stats["accepted_draft_tokens"] += (
+                        num_scheduled_tokens - 1)
                 assert seq.num_computed_tokens <= max_computed, (
                     f"Sequence {seq.seq_id} computed "
                     f"{seq.num_computed_tokens} tokens, but has "

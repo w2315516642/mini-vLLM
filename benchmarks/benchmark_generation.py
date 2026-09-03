@@ -1,0 +1,88 @@
+"""Measure local streaming batches with or without DSpark."""
+
+import argparse
+from contextlib import closing
+import time
+
+from benchmarks.benchmark_utils import WorkItem, prepare_prompts, write_result
+from benchmarks.streaming_metrics import RequestTrace, speculative_delta
+
+
+def measure_batch(llm, prompts, params):
+    traces = {}
+    started = time.perf_counter()
+    with closing(llm.generate_stream(
+        prompt_token_ids=prompts, sampling_params=params, use_tqdm=False,
+    )) as stream:
+        for output in stream:
+            now = time.perf_counter()
+            trace = traces.setdefault(output.request_id, RequestTrace(
+                output.request_id, len(output.prompt_token_ids), started))
+            trace.observe(output, now, cumulative=False)
+    ended = time.perf_counter()
+    if len(traces) != len(prompts) or any(t.finished_at is None for t in traces.values()):
+        raise RuntimeError("Batch ended without all final outputs")
+    if any(t.output_tokens != params.max_tokens for t in traces.values()):
+        raise RuntimeError("Generated token count differs from the fixed benchmark workload")
+    return list(traces.values()), (started, ended)
+
+
+def main():
+    from minivllm import LLM, SamplingParams
+    from minivllm.engine.arg_utils import EngineArgs
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    EngineArgs.add_cli_args(parser)
+    parser.add_argument("--dataset", help="JSONL prompt records or ShareGPT JSON")
+    parser.add_argument("--synthetic", action="store_true", help="Random-token smoke benchmark only")
+    parser.add_argument("--input-len", type=int, default=2048)
+    parser.add_argument("--output-len", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-batches", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--prime-prefix", action="store_true", help="Prefill each measured batch before timing")
+    parser.add_argument("--output", required=True)
+    parser.set_defaults(max_num_seqs=16, disable_log_stats=True)
+    args = parser.parse_args()
+    if min(args.input_len, args.output_len, args.batch_size, args.num_batches) <= 0 or args.warmup < 0:
+        parser.error("Lengths, batch size and batch count must be positive; warmup must be non-negative")
+    if bool(args.dataset) == args.synthetic:
+        parser.error("Choose exactly one of --dataset and --synthetic")
+    if args.pd_role != "unified":
+        parser.error("Use benchmark_serving for PD roles")
+    if args.prime_prefix and not args.enable_prefix_caching:
+        parser.error("--prime-prefix requires --enable-prefix-caching")
+    engine_args = EngineArgs.from_cli_args(args)
+    llm = LLM(**vars(engine_args))
+    tokenizer = llm.get_tokenizer()
+    count = args.batch_size * args.num_batches
+    prompts = prepare_prompts(tokenizer, count, args.input_len, dataset=args.dataset,
+                              synthetic=args.synthetic, seed=args.seed)
+    params = SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=args.output_len)
+    # Warmup inputs differ from measured inputs, so warming CUDA does not
+    # silently turn the first Prefix Cache measurement into a cache hit.
+    warmup_prompts = prepare_prompts(tokenizer, args.batch_size, args.input_len,
+                                     synthetic=True, seed=args.seed + 10000)
+    for _ in range(args.warmup):
+        llm.generate(prompt_token_ids=warmup_prompts, sampling_params=params, use_tqdm=False)
+    before = [llm.llm_engine.get_runtime_stats()]
+    traces, windows = [], []
+    for offset in range(0, count, args.batch_size):
+        batch = prompts[offset:offset + args.batch_size]
+        if args.prime_prefix:
+            llm.generate(prompt_token_ids=batch, sampling_params=SamplingParams(
+                temperature=0.0, ignore_eos=True, max_tokens=1), use_tqdm=False)
+        observed, window = measure_batch(llm, batch, params)
+        traces.extend(observed)
+        windows.append(window)
+    after = [llm.llm_engine.get_runtime_stats()]
+    workload = [WorkItem(str(i), ids, args.output_len) for i, ids in enumerate(prompts)]
+    write_result(args.output, traces=traces, windows=windows,
+                 config={**vars(args), "benchmark": "generation", "ignore_eos": True},
+                 workload=workload, speculative=speculative_delta(before, after),
+                 servers=[{"config": after[0]["config"]}])
+
+
+if __name__ == "__main__":
+    main()
