@@ -502,7 +502,7 @@ class RowParallelLinear(nn.Module):
             all_reduce_launcher = get_all_reduce_launcher()
             num_tokens = input_parallel.shape[0]
             # 取cuda graph要用的固定显存位置
-            output_buffer = all_reduce_launcher.buffer[:num_tokens]
+            output_buffer = all_reduce_launcher.get_buffer(num_tokens)
             torch.matmul(input_parallel, weight.t(), out=output_buffer)
             # All-reduce across all the partitions.
             output_ = all_reduce_launcher.launch(output_buffer)

@@ -161,6 +161,13 @@ def get_all_reduce_launcher() -> 'GraphAllReduce':
 
 
 class GraphAllReduce:
+    """Reduce valid token rows using fixed-address, aligned communication buffers.
+
+    Callers write into get_buffer(N). Only the collective sees the padding;
+    launch returns the same N-row view, so model code need not align its inputs.
+    """
+
+    _TOKEN_ALIGNMENT = 8
 
     def __init__(
         self,
@@ -172,6 +179,7 @@ class GraphAllReduce:
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.disable_graph = disable_graph
+        self.buffer_capacity = self._aligned_num_tokens(max_num_tokens)
 
         tp_world_size = get_tensor_model_parallel_world_size()
         if tp_world_size == 1:
@@ -179,16 +187,33 @@ class GraphAllReduce:
 
         self.group = get_tensor_model_parallel_group()
         self.buffer = torch.empty(
-            size=(max_num_tokens + 1, hidden_size),
+            size=(self.buffer_capacity, hidden_size),
             dtype=dtype,
             device="cuda",
         )
 
-        # Build graphs for different number of tokens.
+        # The last bucket also covers a scheduler limit that is not aligned.
         if not self.disable_graph:
             self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
-            for num_tokens in range(8, max_num_tokens + 1, 8):
+            for num_tokens in range(
+                self._TOKEN_ALIGNMENT, self.buffer_capacity + 1,
+                self._TOKEN_ALIGNMENT,
+            ):
                 self.graphs[num_tokens] = self._build_graph(num_tokens)
+
+    @classmethod
+    def _aligned_num_tokens(cls, num_tokens: int) -> int:
+        alignment = cls._TOKEN_ALIGNMENT
+        return (num_tokens + alignment - 1) // alignment * alignment
+
+    def get_buffer(self, num_tokens: int) -> torch.Tensor:
+        """Reserve a prefix before matmul, without resizing captured storage."""
+        if not 0 <= num_tokens <= self.buffer_capacity:
+            raise ValueError(
+                f"All-reduce token count {num_tokens} is outside buffer capacity "
+                f"[0, {self.buffer_capacity}]"
+            )
+        return self.buffer[:num_tokens]
 
     def _build_graph(self, num_tokens: int) -> torch.cuda.CUDAGraph:
         # Warm up
@@ -205,11 +230,20 @@ class GraphAllReduce:
         return graph
 
     def launch(self, x: torch.Tensor) -> torch.Tensor:
-        # NOTE: x must be a slice of self.buffer.
         num_tokens = x.shape[0]
-        # if self.disable_graph or (num_tokens not in self.graphs.keys()):
+        expected = self.get_buffer(num_tokens)
+        # Replay uses the captured pointer, not x; an arbitrary view is unsafe.
+        if (x.shape != expected.shape or x.stride() != expected.stride()
+                or x.dtype != expected.dtype or x.device != expected.device
+                or x.data_ptr() != expected.data_ptr()):
+            raise ValueError("All-reduce input must be the captured buffer prefix")
+        if num_tokens == 0:
+            return x
         if self.disable_graph:
             torch.distributed.all_reduce(x, group=self.group)
         else:
-            self.graphs[num_tokens].replay()
+            graph_tokens = self._aligned_num_tokens(num_tokens)
+            # Never reduce stale rows left by a previous, longer token batch.
+            self.buffer[num_tokens:graph_tokens].zero_()
+            self.graphs[graph_tokens].replay()
         return x

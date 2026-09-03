@@ -21,9 +21,11 @@ export MINIVLLM_RUN_CUDA_GQA_TESTS=1
 export MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1
 export MINIVLLM_RUN_CUDA_QWEN_HYBRID_TESTS=1
 export MINIVLLM_RUN_CUDA_DSPARK_TESTS=1
+export MINIVLLM_RUN_CUDA_TP_TESTS=1
 
-echo "== Cluster initialization =="
-run_test_modules tests.test_ray_utils
+echo "== Cluster initialization and tensor parallelism =="
+run_test_modules \
+  tests.test_ray_utils tests.test_graph_all_reduce tests.test_graph_all_reduce_cuda
 
 echo "== Qwen3.8 Python/CUDA =="
 run_test_modules \
