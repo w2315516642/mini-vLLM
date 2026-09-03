@@ -1,4 +1,5 @@
 import random
+from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
 try:
@@ -8,8 +9,35 @@ except ImportError:
 
 from minivllm.configs import ParallelConfig
 
-# rank, node resource (node IP), device id
+# rank, Ray node-affinity resource key, node-local device id
 DeviceID = Tuple[int, Optional[str], int]
+
+
+@dataclass(frozen=True)
+class _RayGPUNode:
+    address: str
+    num_gpus: int
+
+    @property
+    def resource_key(self) -> str:
+        # A Ray scheduling key is not itself a network address.
+        return f"node:{self.address}"
+
+
+def _get_gpu_nodes() -> List[_RayGPUNode]:
+    """Read each live GPU node once, using Ray's explicit network address."""
+    nodes = []
+    for node in ray.nodes():
+        if not node["Alive"]:
+            continue
+        # Each worker reserves one whole GPU; CPU-only nodes omit this resource.
+        num_gpus = int(node["Resources"].get("GPU", 0))
+        if num_gpus <= 0:
+            continue
+        # Resource labels (including node:__internal_head__) do not enumerate
+        # machines. NodeManagerAddress is the address advertised by the raylet.
+        nodes.append(_RayGPUNode(node["NodeManagerAddress"], num_gpus))
+    return nodes
 
 
 def initialize_cluster(
@@ -50,26 +78,15 @@ def initialize_cluster(
         all_stage_devices = [[(0, None, 0)]]
         return distributed_init_method, all_stage_devices
 
-    # Assume we have a uniform cluster that each node has the same number of
-    # GPUs for now.
-    valid_node_resources = []
-    num_devices_per_node = None
-    for node in ray.nodes():
-        if (not node['Alive']) or node['Resources']['GPU'] <= 0:
-            continue
-        if num_devices_per_node is None:
-            num_devices_per_node = node['Resources']['GPU']
-        else:
-            # TODO
-            assert num_devices_per_node == node['Resources']['GPU'], (
-                "The number of GPUs per node is not uniform.")
-        for key in node['Resources']:
-            if key.startswith('node:'):
-                valid_node_resources.append(key)
-        
-    # Verify the parallel config.
-    num_nodes = len(valid_node_resources)
-    if parallel_config.world_size > num_nodes * num_devices_per_node:
+    nodes = _get_gpu_nodes()
+    if not nodes:
+        raise ValueError("No alive Ray nodes with GPUs are available.")
+
+    # The existing rank layout requires equal GPU capacity on every node.
+    num_devices_per_node = nodes[0].num_gpus
+    if any(node.num_gpus != num_devices_per_node for node in nodes):
+        raise ValueError("The number of GPUs per node is not uniform.")
+    if parallel_config.world_size > len(nodes) * num_devices_per_node:
         raise ValueError(
             "The number of required GPUs exceeds the total number of "
             "available GPUs."
@@ -86,28 +103,21 @@ def initialize_cluster(
                 "The number of GPUs per node is not divisible by the number "
                 "of tensor parallelism.")
 
-    # Assign GPUs to pipeline stages.
+    # Rank 0 is placed on the first GPU node and hosts the rendezvous store.
+    port = random.randint(10000, 20000)
+    distributed_init_method = f"tcp://{nodes[0].address}:{port}"
+
+    # Assign contiguous ranks within each node, preserving the DeviceID API.
     rank = 0
-    current_node_id = 0
-    current_device_id = 0
-    distributed_init_method = None
     all_stage_devices = []
 
     for _ in range(parallel_config.pipeline_parallel_size):
         stage_devices = []
         for _ in range(parallel_config.tensor_parallel_size):
-            node_resource = valid_node_resources[current_node_id]
-            stage_devices.append((rank, node_resource, current_device_id))
-            if distributed_init_method is None:
-                ip = node_resource.split("node:")[-1]
-                # TODO: 不会随机到冲突的端口？
-                port = random.randint(10000, 20000)
-                distributed_init_method = f"tcp://{ip}:{port}"
+            node_index, device_id = divmod(rank, num_devices_per_node)
+            node = nodes[node_index]
+            stage_devices.append((rank, node.resource_key, device_id))
             rank += 1
-            current_device_id += 1
-            if current_device_id >= num_devices_per_node:
-                current_node_id += 1
-                current_device_id = 0
         all_stage_devices.append(stage_devices)
 
     return distributed_init_method, all_stage_devices
