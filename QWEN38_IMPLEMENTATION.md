@@ -21,7 +21,7 @@
 | 4 | Qwen Gated Full Attention（含 Q/K RMSNorm 与门控融合算子） | 已完成 |
 | 5 | Gated DeltaNet 参考实现 | 已完成 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 已完成 |
-| 7 | Hybrid Cache | 未开始 |
+| 7 | Hybrid Cache | 已完成 |
 | 8 | 真实小模型端到端推理 | 未开始 |
 | 9 | FP8 权重 | 未开始 |
 | 10 | TP=2 与 Qwen3.8-27B | 未开始 |
@@ -577,4 +577,108 @@ Reference 与完整回归：
 - 边界与连续性：CUDA 数值测试覆盖 FP16/BF16/FP32、batch/head、非整 chunk 尾部、`chunk_size` 为 1/4/16、prefill final state 接续 decode 和 FP32 state 契约；额外 smoke 确认非 contiguous decode 输入在 binding 前置拒绝。
 - 信息性计时：在 `B=2,T=64,H=4,Dk=Dv=128,FP16,chunk=16`、5 次 warmup 后，20 次 prefill 平均约 1.5592 ms，100 次 decode 平均约 0.0478 ms，最终 state 全部有限；本阶段不设置性能门槛。
 - 已知限制：prefill 是同 stream 上按 chunk launch、chunk 内按 token 串行的教学实现，不是 FLA 的 WY 并行 chunk algorithm；算子仍使用 batch-major contiguous tensor 和显式 state，尚未接入 Worker、packed request metadata 或请求级 state slot。
-- 下一阶段：阶段 7“Hybrid Cache”保持未开始，等待讲义和作业脚手架准备。
+- 下一阶段：阶段 7“Hybrid Cache”已准备讲义和作业脚手架，进入学习者实现。
+
+## 阶段 7：Hybrid Cache
+
+### 在推理链路中的位置
+
+阶段 3 的 Paged KV Cache 按 token block 保存 full-attention 历史；阶段 5、6 的 Gated DeltaNet 则要求调用者为每个请求、每个 linear-attention layer 保存固定大小的 Conv State 和 Recurrent State。本阶段在两者之间增加层索引对齐的 Hybrid Cache：full-attention layer 继续引用既有 KV cache，linear-attention layer 从预分配 state pool 按稳定 request slot 读写状态。
+
+本阶段不提前装配完整 Qwen decoder。阶段 8 会在 `Scheduler -> Worker._prepare_inputs -> model -> decoder layer` 链路上使用这里稳定下来的接口：根据实际 batch 中的 `seq_id` acquire slot，linear layer 在 kernel 前 gather state、kernel 后 scatter state，请求结束时 release，beam fork 时复制父状态。
+
+### Codex 负责
+
+- 新增 `GatedDeltaNetStateSpec`，从 Qwen text config 推导 Conv/Recurrent State shape。
+- 定义层索引对齐的 `HybridCache` 稳定接口，并预分配每个 linear layer 的 FP32 state pool。
+- 保留 full-attention layer index 到既有 KV cache 的显式映射，不改变当前 `CacheEngine` 和 PagedAttention。
+- 编写 CPU 可执行的 shape、slot、gather/scatter、fork、release/reuse、reset 和错误契约测试。
+- 在 `docs/qwen38-learning/stage-07-hybrid-cache.md` 提供不跟踪讲义、实现顺序和参考源码。
+
+### 学习者作业
+
+完成 `minivllm/worker/hybrid_cache.py` 中全部 `TODO(student, stage 7)`：
+
+1. `RequestStateSlotAllocator`：实现稳定的 `seq_id -> slot` acquire、lookup、release 和 reset。
+2. `HybridCache.acquire`：保持动态 batch 顺序；新请求的所有 linear-layer state 必须清零，已有请求不得清零。
+3. `HybridCache.read_state`：按 slot gather 某一 linear layer 的连续 FP32 state batch。
+4. `HybridCache.write_state`：把 kernel 更新结果 scatter 回长期 pool；由调用方保证 state 的 shape、FP32 dtype、device 和 batch 维匹配，不在逐层读写热路径增加校验。
+5. `HybridCache.fork`：为 child 分配独立 slot，并复制 parent 在所有 linear layer 的 Conv/Recurrent State。
+6. `HybridCache.release/reset`：释放所有权并清理 state，保证 slot 复用时不泄漏上一个请求历史。
+
+预计自然实现量约 200 到 300 行。不要改 Scheduler、Worker、阶段 6 kernel 或完整 Qwen model；接口接线属于阶段 8。
+
+### 约束
+
+- `seq_id` 是长期请求身份，batch index 只是本轮位置；不得用 batch index 直接拥有 state。
+- state pool 第一维固定为 `max_num_seqs`，动态 batch 只负责选择其中若干行。
+- Conv State 固定为 `[slot, conv_dim, kernel_size]` FP32；Recurrent State 固定为 `[slot, H_v, D_k, D_v]` FP32。
+- 同一活跃请求重复 acquire 必须得到同一 slot；不同活跃请求不得共享 slot。
+- gather 返回的 batch state 被 kernel 原地更新后，必须通过 `write_state` 显式写回 pool。
+- release/reuse 和 reset 都必须清理 linear-layer state；fork 必须复制所有 linear layer 且 parent/child 后续互不别名。
+- full/linear layer 使用错误以及请求 ID、槽位所有权错误在 Python 管理边界处理；allocator 产生唯一且有效的 slot，read/write 不扫描 CUDA 索引值，避免逐层主机同步。
+- read/write 的调用方负责提供匹配的 FP32 state 和有效索引；不保证非法输入的 Python 自定义异常或失败后原子回滚。现有张量元数据检查不涉及 CUDA 数据回传。
+- 本阶段不实现 hybrid prefix-state snapshot、CPU state swap、跨 worker state transfer、TP state 分片或 CUDA Graph。
+- 在阶段 8 完成 state-aware prefix 语义前，hybrid model 不得只复用 full-attention KV prefix 而跳过 GDN 前缀计算。
+
+### 验收命令
+
+阶段 7 聚焦测试：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  tests/test_hybrid_cache.py -v
+```
+
+阶段 5/6 状态与算子回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest \
+  tests/test_gated_delta_net_reference.py \
+  tests/test_gated_delta_net_cuda_contract.py -v
+```
+
+完整回归：
+
+```bash
+/home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+```
+
+### 预提交基线
+
+- 2026-08-30：讲义、稳定接口和 19 项聚焦测试已准备；`docs/` 继续由 `.gitignore` 忽略。
+- 阶段测试成功导入：配置与层布局 6 项通过，另外 13 项只在 `TODO(student, stage 7)` 指向的 slot/lifecycle 方法失败，没有语法、导入或 fixture 错误。
+- 原有 89 项回归保持通过：78 项执行通过，11 项既有 CUDA 用例按环境开关跳过；本阶段是 CPU 状态管理，不需要重新编译 CUDA extension。
+
+### 本轮修复与验证（2026-09-05）
+
+- 按学习者要求修复 `_clear_rows`、`release`、`reset` 和 `fork`：按行原地清零；整批请求检查通过后归还槽位；保留按层缓存结构；拒绝复用活跃 child，并直接用 Python 整数槽位复制所有 linear-layer state。
+- 不给 read/write 增加 state 校验；移除 `_normalize_slot_ids` 中读取 CUDA 索引值的 `torch.any` 和 `torch.unique` 检查。层类型和索引元数据检查仍保留，不读取 GPU 张量内容。
+- 测试约定同步调整：read/write 的错误 shape/dtype 交给 PyTorch，不要求自定义 ValueError 或非法输入的原子回滚；补充新槽位清零、释放前全批检查、层 ID 与请求 ID 冲突、fork 所有权、固定池复用、空 batch 和读出副本独立性测试。
+- 环境：WSL2 Ubuntu，`/home/yue/miniconda3/envs/mini-vllm/bin/python`，Python 3.10.20，PyTorch 2.11.0+cu128，NVIDIA GeForce RTX 4070 Laptop GPU。
+- 聚焦结果：HybridCache 28 项、GDN reference 14 项、GDN wrapper contract 7 项，共 49 项全部通过。
+- CUDA 同步检查：read/write 使用 CUDA 索引进行 CUDA Graph 捕获成功，连续两次 replay 正确更新池，未选择槽位保持不变。本用例只验证局部热路径，不代表完整模型 CUDA Graph 接线或吞吐基准。
+- 完整回归：117 项全部执行通过，无跳过；使用已有扩展，没有重新编译。WSL 启动时有已有 localhost 代理提示，不影响测试。
+- 阶段 7 已通过验收并完成收尾；阶段 8 仍保持未开始。
+
+复现命令（WSL 项目根目录）：
+
+```bash
+PYTHONPATH=tests /home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest -v \
+  tests.test_hybrid_cache tests.test_gated_delta_net_reference \
+  tests.test_gated_delta_net_cuda_contract
+
+PYTHONPATH=tests MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
+  MINIVLLM_RUN_CUDA_GQA_TESTS=1 MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
+  /home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+```
+
+### 原理验收
+
+- 为什么动态 batch 可以使用固定大小 state pool？
+- 为什么 request slot 绑定 `seq_id` 而不是本轮 batch index？
+- 为什么 `index_select` gather 后必须显式 `index_copy_` scatter？
+- 为什么 release/reuse 是正确性问题，而不仅是显存管理？
+- 为什么 beam fork 必须复制 recurrent state，而不能只共享 slot？
+- 为什么 full-attention Prefix Cache 命中不足以证明 hybrid prefix 可以直接跳过？
+- Hybrid Cache、Scheduler 和 GDN kernel 各自拥有哪一部分状态与生命周期？
