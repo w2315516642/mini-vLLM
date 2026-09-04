@@ -5,9 +5,6 @@ import torch
 
 from prefix_cache_test_utils import make_group, make_scheduler, make_seq, sequence
 from minivllm.spec_decode.greedy_verifier import verify_greedy_block
-from minivllm.spec_decode.state_transaction import (
-    build_speculative_replay_plan,
-)
 
 
 def _logits(token_ids, vocab_size=128):
@@ -137,32 +134,6 @@ class DSparkSchedulerTest(unittest.TestCase):
         self.assertTrue(
             scheduler._can_speculate(scheduler.running[0], draft_width=1)
         )
-
-
-class GDNStateTransactionTest(unittest.TestCase):
-
-    def test_replay_plan_contains_anchor_and_accepted_drafts_only(self):
-        data = sequence.SequenceData([1, 2, 3, 4])
-        data.append_token_id(90, 0.0)
-        metadata = sequence.SequenceGroupMetadata(
-            request_id="dspark",
-            is_prompt=True,
-            seq_data={7: data},
-            sampling_params=self,
-            block_tables={7: [3, 5, 8]},
-            num_computed_tokens={7: 4},
-            num_scheduled_tokens={7: 8},
-            is_speculative=True,
-            speculative_token_blocks={7: [91, 92, 93, 94, 95, 96, 97]},
-        )
-
-        plan = build_speculative_replay_plan([metadata], {7: 3})
-
-        self.assertEqual(len(plan), 1)
-        self.assertEqual(plan[0].token_ids, (90, 91, 92))
-        self.assertEqual(plan[0].positions, (4, 5, 6))
-        self.assertEqual(plan[0].context_len, 7)
-        self.assertEqual(plan[0].block_table, (3, 5, 8))
 
 
 if __name__ == "__main__":

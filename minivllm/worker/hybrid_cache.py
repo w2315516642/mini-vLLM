@@ -354,8 +354,16 @@ class HybridCache:
         slot_ids: torch.Tensor | Sequence[int],
     ) -> GatedDeltaNetState:
         """Gather a contiguous GDN state batch for one linear layer."""
+        return self._read_state(layer_idx, self._normalize_slot_ids(slot_ids))
+
+    def _read_state(self, layer_idx: int, slots: torch.Tensor) -> GatedDeltaNetState:
+        """Internal gather for an unchanged mapping returned by acquire().
+
+        Slot ownership is checked on the CPU when the worker constructs the
+        batch. Rechecking CUDA values here would synchronize every layer.
+        External slot IDs must still enter through read_state/write_state.
+        """
         self._require_layer_type(layer_idx, LINEAR_ATTENTION)
-        slots = self._normalize_slot_ids(slot_ids)
         pool = self._linear_state_pools[layer_idx]
         return GatedDeltaNetState(
             conv_state=pool.conv_state.index_select(0, slots),
@@ -369,8 +377,13 @@ class HybridCache:
         state: GatedDeltaNetState,
     ) -> None:
         """Scatter a kernel-updated GDN state batch back to its slots."""
+        self._write_state(layer_idx, self._normalize_slot_ids(slot_ids), state)
+
+    def _write_state(
+        self, layer_idx: int, slots: torch.Tensor, state: GatedDeltaNetState,
+    ) -> None:
+        """Internal scatter for acquire() slots; retain cheap metadata checks."""
         self._require_layer_type(layer_idx, LINEAR_ATTENTION)
-        slots = self._normalize_slot_ids(slot_ids)
         if not isinstance(state, GatedDeltaNetState):
             raise TypeError("state must be a GatedDeltaNetState")
 
@@ -469,9 +482,10 @@ class HybridCache:
         layer_states = {}
         for layer_idx, pool in self._linear_state_pools.items():
             layer_states[layer_idx] = GatedDeltaNetState(
-                conv_state=pool.conv_state.index_select(0, slots).clone(),
+                # index_select already owns storage independent of the pool.
+                conv_state=pool.conv_state.index_select(0, slots),
                 recurrent_state=(
-                    pool.recurrent_state.index_select(0, slots).clone()
+                    pool.recurrent_state.index_select(0, slots)
                 ),
             )
         return HybridStateSnapshot(normalized, layer_states)

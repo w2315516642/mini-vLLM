@@ -33,11 +33,9 @@ from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from minivllm.spec_decode.draft_metadata import DraftAttentionMetadata
 from minivllm.spec_decode.dspark_context import TargetHiddenStateCollector
-from minivllm.spec_decode.state_transaction import (
-    build_speculative_replay_plan,
-)
 from minivllm.worker.cache_engine import CacheEngine
 from minivllm.worker.draft_cache import DraftCacheEngine
+from minivllm.worker.gdn_replay import GatedDeltaNetReplay, replay_buffer_bytes
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
     HybridCache,
@@ -205,6 +203,7 @@ class Worker:
             total_gpu_memory * gpu_memory_utilization
             - peak_memory
             - state_cache_size
+            - self._get_gdn_replay_reserve()
             - self._get_draft_workspace_size(
                 block_size, draft_cache_block_size
             )
@@ -221,6 +220,7 @@ class Worker:
             raise ValueError(
                 "Persistent runtime buffers do not fit in the configured GPU "
                 f"memory budget: recurrent={state_gib:.2f} GiB, "
+                f"GDN replay={self._get_gdn_replay_reserve() / (1024 ** 3):.2f} GiB, "
                 f"DSpark={draft_gib:.2f} GiB for max_num_seqs="
                 f"{self.scheduler_config.max_num_seqs}. Reduce "
                 "--max-num-seqs or the speculative width."
@@ -231,6 +231,21 @@ class Worker:
 
         set_random_seed(self.model_config.seed)
         return num_gpu_blocks, num_cpu_blocks
+
+    def _get_gdn_replay_reserve(self) -> int:
+        num_layers = self.model_config.architecture.num_linear_attention_layers
+        width = self.scheduler_config.num_speculative_tokens
+        if not num_layers or not width:
+            return 0
+        spec = GatedDeltaNetStateSpec.from_text_config(
+            self.model_config.architecture.text_config,
+            self.parallel_config.tensor_parallel_size,
+        )
+        max_seqs = self.scheduler_config.max_num_seqs
+        max_tokens = min(self.scheduler_config.max_num_batched_tokens,
+                         max_seqs * (width + 1))
+        return replay_buffer_bytes(spec, num_layers, max_seqs, max_tokens,
+                                   self.model_config.dtype)
 
     def _get_draft_cache_block_size(self, block_size: int) -> int:
         if self.draft_config is None:
@@ -747,10 +762,10 @@ class Worker:
                 input_metadata.prompt_seq_ids
                 + input_metadata.generation_seq_ids
             )
-        state_snapshot = None
         if self.hybrid_cache is not None and input_metadata.speculative_seq_ids:
-            state_snapshot = self.hybrid_cache.snapshot(
-                input_metadata.speculative_seq_ids
+            input_metadata.gdn_replay = GatedDeltaNetReplay(
+                input_metadata,
+                self.hybrid_cache.snapshot(input_metadata.speculative_seq_ids),
             )
         
         # Execute the model.
@@ -791,12 +806,14 @@ class Worker:
             if output[seq_id].num_computed_tokens < len(draft_tokens) + 1
         }
         if partially_accepted:
-            assert self.hybrid_cache is not None and state_snapshot is not None
-            replay_seq_ids = list(partially_accepted)
-            self.hybrid_cache.restore(state_snapshot, replay_seq_ids)
-            self._replay_speculative_prefixes(
-                seq_group_metadata_list, partially_accepted
+            assert self.hybrid_cache is not None and input_metadata.gdn_replay is not None
+            input_metadata.gdn_replay.commit(
+                self.hybrid_cache,
+                {seq_id: output[seq_id].num_computed_tokens
+                 for seq_id in input_metadata.speculative_seq_ids},
             )
+        # Release the transaction before allocating the next draft workspace.
+        input_metadata.gdn_replay = None
         if self._should_attach_dspark_drafts():
             self._attach_dspark_drafts(output, seq_group_metadata_list)
         return output
@@ -1022,114 +1039,6 @@ class Worker:
             slot_mapping=torch.tensor(
                 slot_mapping, dtype=torch.int32, device="cuda"
             ),
-        )
-
-    def _replay_speculative_prefixes(
-        self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        committed_tokens: Dict[int, int],
-    ) -> None:
-        """Rebuild GDN state through each committed verification prefix.
-
-        Full-attention KV written for a rejected suffix may remain in physical
-        storage: the scheduler's logical context length hides it, and the next
-        decode overwrites those slots. Recurrent state has no such addressing,
-        so it must be restored and replayed in sequence order.
-        """
-        token_ids: List[int] = []
-        positions: List[int] = []
-        positions_3d: List[List[int]] = [[], [], []]
-        has_multimodal_positions = False
-        slot_mapping: List[int] = []
-        block_tables: List[List[int]] = []
-        seq_data: Dict[int, SequenceData] = {}
-        replay_seq_ids: List[int] = []
-        replay_query_lens: List[int] = []
-        replay_context_lens: List[int] = []
-        replay_plan = build_speculative_replay_plan(
-            seq_group_metadata_list, committed_tokens
-        )
-        for item in replay_plan:
-            token_ids.extend(item.token_ids)
-            for position in item.positions:
-                multimodal = item.multimodal_inputs
-                if multimodal is None:
-                    position_values = (position, position, position)
-                else:
-                    has_multimodal_positions = True
-                    decode_position = position + multimodal.rope_delta
-                    position_values = (
-                        decode_position,
-                        decode_position,
-                        decode_position,
-                    )
-                positions.append(position)
-                for row, value in zip(positions_3d, position_values):
-                    row.append(value)
-                slot_mapping.append(
-                    _get_slot_id(item.block_table, position, self.block_size)
-                )
-            block_tables.append(list(item.block_table))
-            replay_seq_ids.append(item.seq_id)
-            replay_query_lens.append(len(item.token_ids))
-            replay_context_lens.append(item.context_len)
-            seq_data[item.seq_id] = item.sequence_data
-
-        num_tokens = len(token_ids)
-        padded_tokens = _pad_to_alignment(token_ids, multiple_of=8)
-        if has_multimodal_positions:
-            padded_positions = [
-                _pad_to_alignment(row, multiple_of=8)
-                for row in positions_3d
-            ]
-        else:
-            padded_positions = _pad_to_alignment(positions, multiple_of=8)
-        device = torch.device("cuda")
-        cu_seqlens = [0]
-        for query_len in replay_query_lens:
-            cu_seqlens.append(cu_seqlens[-1] + query_len)
-        replay_metadata = InputMetadata(
-            seq_groups=[],
-            seq_data=seq_data,
-            prompt_lens=replay_query_lens,
-            slot_mapping=torch.tensor(
-                slot_mapping, dtype=torch.int32, device=device
-            ),
-            context_lens=torch.empty(0, dtype=torch.int32, device=device),
-            max_context_len=0,
-            block_tables=torch.empty((0, 0), dtype=torch.int32, device=device),
-            fresh_prompt_lens=[],
-            cached_prompt_query_lens=replay_query_lens,
-            cached_prompt_cu_seqlens=torch.tensor(
-                cu_seqlens,
-                dtype=torch.int32,
-                device=device,
-            ),
-            cached_prompt_context_lens=torch.tensor(
-                replay_context_lens,
-                dtype=torch.int32,
-                device=device,
-            ),
-            cached_prompt_block_tables=_make_block_table_tensor(block_tables),
-            max_cached_prompt_context_len=max(replay_context_lens, default=0),
-            prompt_seq_ids=replay_seq_ids,
-            prompt_sample_indices=[],
-            enable_mtp=False,
-        )
-        replay_metadata.state_slot_mapping = self.hybrid_cache.acquire(
-            replay_seq_ids
-        )
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        self.model(
-            input_ids=torch.tensor(
-                padded_tokens, dtype=torch.long, device=device
-            ),
-            positions=torch.tensor(
-                padded_positions, dtype=torch.long, device=device
-            ),
-            kv_caches=self.gpu_cache,
-            input_metadata=replay_metadata,
-            cache_events=[None] * num_layers,
         )
 
     def apply_hybrid_state_operations(

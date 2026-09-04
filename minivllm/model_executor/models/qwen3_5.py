@@ -31,8 +31,10 @@ from minivllm.model_executor.layers.gated_delta_net import (
 )
 from minivllm.model_executor.layers.gated_delta_net_cuda import (
     causal_conv1d_update,
+    causal_conv1d_varlen,
     gated_delta_rule_decode,
     gated_delta_rule_prefill,
+    gated_delta_rule_varlen,
     prepare_gated_delta_qk,
 )
 from minivllm.model_executor.layers.layer_norm import Qwen3_5RMSNorm
@@ -628,8 +630,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         state: GatedDeltaNetState,
         *,
         is_decode: bool,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: int = 1,
+        replay=None,
     ) -> torch.Tensor:
-        if is_decode:
+        if cu_seqlens is not None:
+            mixed_qkv = causal_conv1d_varlen(
+                qkv.contiguous(), state.conv_state,
+                self.conv1d.weight.squeeze(1).contiguous(), cu_seqlens,
+            )
+        elif is_decode:
             mixed_qkv = causal_conv1d_update(
                 qkv.contiguous(),
                 state.conv_state,
@@ -665,7 +675,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         log_decay = log_decay.contiguous()
         value = value.contiguous()
 
-        if is_decode:
+        if replay is not None:
+            # Causality makes these inputs valid for every accepted prefix.
+            # Retain only speculative tokens, not long unrelated prompts.
+            replay.record(
+                self.layer_idx, qkv, self.conv1d.weight.squeeze(1),
+                key, value, log_decay, beta,
+            )
+        if cu_seqlens is not None:
+            core_output = gated_delta_rule_varlen(
+                query, key, value, log_decay, beta, state.recurrent_state,
+                cu_seqlens, max_seqlen,
+            )
+        elif is_decode:
             core_output = gated_delta_rule_decode(
                 query,
                 key,
@@ -694,16 +716,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         input_metadata: InputMetadata,
         state_cache: Optional[HybridCache],
     ) -> torch.Tensor:
-        """Run every packed prompt independently and all decode tokens together."""
+        """Run all packed sequences together, preserving each state's ownership."""
         num_valid_tokens = input_metadata.num_valid_tokens
         valid_hidden_states = hidden_states[:num_valid_tokens]
         projected = self._project(valid_hidden_states)
-        mixed_output = torch.zeros(
-            (num_valid_tokens, self.value_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
         state_slots = getattr(input_metadata, "state_slot_mapping", None)
         expected_state_count = (
             input_metadata.num_prompts
@@ -715,48 +731,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     "state_slot_mapping must contain one slot per packed sequence"
                 )
 
-        prompt_offset = 0
-        for prompt_idx, prompt_len in enumerate(input_metadata.prompt_lens):
-            end = prompt_offset + prompt_len
-            if state_cache is None:
-                state = self._empty_state(1, hidden_states.device)
-                slot = None
-            else:
-                slot = state_slots[prompt_idx : prompt_idx + 1]
-                state = state_cache.read_state(self.layer_idx, slot)
-
-            prompt_projected = tuple(
-                tensor[prompt_offset:end].unsqueeze(0) for tensor in projected
-            )
-            prompt_output = self._run_core(
-                *prompt_projected,
-                state,
-                is_decode=False,
-            )
-            mixed_output[prompt_offset:end] = prompt_output.squeeze(0)
-            if state_cache is not None:
-                state_cache.write_state(self.layer_idx, slot, state)
-            prompt_offset = end
-
-        num_decode_tokens = input_metadata.num_generation_tokens
-        if num_decode_tokens:
-            decode_end = prompt_offset + num_decode_tokens
-            if state_cache is None:
-                state = self._empty_state(num_decode_tokens, hidden_states.device)
-                slots = None
-            else:
-                slots = state_slots[input_metadata.num_prompts :]
-                state = state_cache.read_state(self.layer_idx, slots)
-            decode_projected = tuple(
-                tensor[prompt_offset:decode_end] for tensor in projected
-            )
-            mixed_output[prompt_offset:decode_end] = self._run_core(
-                *decode_projected,
-                state,
-                is_decode=True,
-            )
-            if state_cache is not None:
-                state_cache.write_state(self.layer_idx, slots, state)
+        if state_cache is None:
+            state = self._empty_state(expected_state_count, hidden_states.device)
+        else:
+            # Worker.acquire() constructed this mapping once for all layers.
+            state = state_cache._read_state(self.layer_idx, state_slots)
+        is_decode = input_metadata.num_prompts == 0
+        mixed_output = self._run_core(
+            *projected, state, is_decode=is_decode,
+            cu_seqlens=(None if is_decode else input_metadata.get_gdn_cu_seqlens()),
+            max_seqlen=max(input_metadata.prompt_lens, default=1),
+            replay=input_metadata.gdn_replay,
+        )
+        if state_cache is not None:
+            state_cache._write_state(self.layer_idx, state_slots, state)
 
         output_valid, _ = self.out_proj(mixed_output)
         output = torch.zeros_like(hidden_states)

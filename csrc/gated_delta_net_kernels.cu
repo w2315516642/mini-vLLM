@@ -11,7 +11,9 @@ __global__ void causal_conv1d_update_kernel(
   const scalar_t* __restrict__ weight,         // [channels, kernel_size]
   const int batch_size,
   const int channels,
-  const int kernel_size) {
+  const int kernel_size,
+  const int* __restrict__ cu_seqlens,
+  const int* __restrict__ lengths) {
   // Shift one channel state, append the current
   // projected value, accumulate the depthwise convolution in FP32, and write
   // its SiLU activation. One thread should own one (batch, channel) pair.
@@ -27,23 +29,29 @@ __global__ void causal_conv1d_update_kernel(
 
   if (tid >= num_channels) return;
 
-  float sum = 0.0f;
-  for (int i = 0; i < kernel_size - 1; i++) {
-    float state = conv_state[chn_ptr + i + 1];
-    conv_state[chn_ptr + i] = state;
+  // Packed requests share one launch, but each channel's history is serial.
+  const int start = cu_seqlens ? cu_seqlens[bid] : bid;
+  int end = cu_seqlens ? cu_seqlens[bid + 1] : bid + 1;
+  if (lengths) end = min(end, start + lengths[bid]);
+  for (int token = start; token < end; ++token) {
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size - 1; i++) {
+      float state = conv_state[chn_ptr + i + 1];
+      conv_state[chn_ptr + i] = state;
 
-    float weight_val = static_cast<float>(weight[cid * kernel_size + i]);
+      float weight_val = static_cast<float>(weight[cid * kernel_size + i]);
+      sum += state * weight_val;
+    }
+
+    float state = static_cast<float>(projected_qkv[token * channels + cid]);
+    conv_state[chn_ptr + kernel_size - 1] = state;
+    float weight_val = static_cast<float>(weight[cid * kernel_size + kernel_size - 1]);
     sum += state * weight_val;
+
+    float out = sum / (1.0f + expf(-sum));
+
+    output[token * channels + cid] = static_cast<scalar_t>(out);
   }
-
-  float state = static_cast<float>(projected_qkv[bid * channels + cid]);
-  conv_state[chn_ptr + kernel_size - 1] = state;
-  float weight_val = static_cast<float>(weight[cid * kernel_size + kernel_size - 1]);
-  sum += state * weight_val;
-
-  float out = sum / (1.0f + expf(-sum));
-
-  output[bid * channels + cid] = static_cast<scalar_t>(out);
 }
 
 template<typename scalar_t>
@@ -134,7 +142,9 @@ __global__ void gated_delta_rule_prefill_chunk_kernel(
   const int key_dim,
   const int value_dim,
   const int chunk_start,
-  const int chunk_end) {
+  const int chunk_end,
+  const int* __restrict__ cu_seqlens,
+  const int* __restrict__ lengths) {
   // Reuse the decode recurrence for every token in
   // [chunk_start, chunk_end). State is shared between successive tokens and
   // must remain live for the next chunk launch on the same CUDA stream.
@@ -148,8 +158,13 @@ __global__ void gated_delta_rule_prefill_chunk_kernel(
   const int stride_b = num_heads * key_dim * value_dim;
   const int stride_h = key_dim * value_dim;
   const int head_ptr = bid * stride_b + hid * stride_h;
-  for (int token = chunk_start; token < chunk_end; token++) {
-    const int head_idx = bid * num_heads * sequence_length + token * num_heads + hid;
+  const int start = cu_seqlens ? cu_seqlens[bid] : bid * sequence_length;
+  int count = cu_seqlens ? cu_seqlens[bid + 1] - start : sequence_length;
+  if (lengths) count = min(count, lengths[bid]);
+  // The same recurrence serves rectangular prefill, packed verification and
+  // accepted-prefix state replay. No padded or rejected token advances state.
+  for (int token = chunk_start; token < min(chunk_end, count); token++) {
+    const int head_idx = (start + token) * num_heads + hid;
 
     const int key_ptr = head_idx * key_dim;
     const int value_ptr = head_idx * value_dim;
@@ -229,7 +244,9 @@ void causal_conv1d_update_cuda(
         weight.data_ptr<scalar_t>(),
         batch_size,
         channels,
-        kernel_size);
+        kernel_size,
+        nullptr,
+        nullptr);
     });
 }
 
@@ -322,7 +339,66 @@ void gated_delta_rule_prefill_cuda(
           key_dim,
           value_dim,
           chunk_start,
-          chunk_end);
+          chunk_end,
+          nullptr,
+          nullptr);
+      }
+    });
+}
+
+void causal_conv1d_varlen_cuda(
+  torch::Tensor& output,
+  const torch::Tensor& projected_qkv,
+  torch::Tensor& conv_state,
+  const torch::Tensor& weight,
+  const torch::Tensor& cu_seqlens,
+  const c10::optional<torch::Tensor>& lengths) {
+  const int batch = conv_state.size(0);
+  const int channels = conv_state.size(1);
+  const int threads = std::min(channels, 256);
+  const int blocks = (batch * channels + threads - 1) / threads;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+    at::ScalarType::Half, at::ScalarType::BFloat16,
+    projected_qkv.scalar_type(), "causal_conv1d_varlen", [&] {
+      vllm::causal_conv1d_update_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        output.data_ptr<scalar_t>(), projected_qkv.data_ptr<scalar_t>(),
+        conv_state.data_ptr<float>(), weight.data_ptr<scalar_t>(),
+        batch, channels, conv_state.size(2), cu_seqlens.data_ptr<int>(),
+        lengths ? lengths->data_ptr<int>() : nullptr);
+    });
+}
+
+void gated_delta_rule_varlen_cuda(
+  torch::Tensor& output,
+  const torch::Tensor& query,
+  const torch::Tensor& key,
+  const torch::Tensor& value,
+  const torch::Tensor& log_decay,
+  const torch::Tensor& beta,
+  torch::Tensor& recurrent_state,
+  const torch::Tensor& cu_seqlens,
+  int64_t max_seqlen,
+  const c10::optional<torch::Tensor>& lengths) {
+  const int batch = recurrent_state.size(0);
+  const int heads = recurrent_state.size(1);
+  const int key_dim = recurrent_state.size(2);
+  const int value_dim = recurrent_state.size(3);
+  const int threads = std::min(value_dim, 1024);
+  const size_t shared = 2 * key_dim * sizeof(float);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+    at::ScalarType::Half, at::ScalarType::BFloat16,
+    query.scalar_type(), "gated_delta_rule_varlen", [&] {
+      for (int chunk = 0; chunk < max_seqlen; chunk += 64) {
+        vllm::gated_delta_rule_prefill_chunk_kernel<scalar_t>
+          <<<batch * heads, threads, shared, stream>>>(
+            output.data_ptr<scalar_t>(), query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(), value.data_ptr<scalar_t>(),
+            log_decay.data_ptr<float>(), beta.data_ptr<scalar_t>(),
+            recurrent_state.data_ptr<float>(), batch, 0, heads, key_dim,
+            value_dim, chunk, std::min<int64_t>(chunk + 64, max_seqlen),
+            cu_seqlens.data_ptr<int>(), lengths ? lengths->data_ptr<int>() : nullptr);
       }
     });
 }

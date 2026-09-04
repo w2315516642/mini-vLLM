@@ -1,6 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -16,7 +17,7 @@ from minivllm.model_executor.models.qwen3_5 import (
 )
 from minivllm.model_executor.parallel_utils import parallel_state
 from minivllm.sampling_params import SamplingParams
-from minivllm.sequence import SequenceData
+from minivllm.sequence import SequenceData, SequenceOutputs
 from minivllm.sequence import SequenceGroupMetadata
 from minivllm.model_executor.weight_utils import initialize_dummy_weights
 from minivllm.worker.hybrid_cache import (
@@ -187,6 +188,81 @@ class QwenHybridModelCudaTest(unittest.TestCase):
     def tearDownClass(cls):
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
         parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = None
+
+    def test_worker_replays_only_states_across_multiple_gdn_layers(self):
+        torch.manual_seed(351)
+        config = _config()
+        config.num_hidden_layers = 3
+        config.layer_types = (LINEAR_ATTENTION, FULL_ATTENTION, LINEAR_ATTENTION)
+        model = Qwen3_5ForConditionalGeneration(config).cuda().half().eval()
+        for parameter in model.parameters():
+            if parameter.numel():
+                torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+
+        def worker():
+            kv = _kv_cache(torch.float16)
+            cache = HybridCache(config.layer_types,
+                                {1: (kv[0].repeat(3, 1, 1, 1, 1), kv[1].repeat(3, 1, 1, 1))},
+                                GatedDeltaNetStateSpec.from_text_config(config), 3, "cuda")
+            obj = object.__new__(Worker)
+            obj.model, obj.hybrid_cache, obj.gpu_cache = model, cache, cache
+            obj.block_size = 8
+            obj.draft_model = obj.draft_config = obj.draft_cache_engine = None
+            obj._draft_probabilities = {}
+            obj.scheduler_config = SimpleNamespace(num_speculative_tokens=3)
+            return obj
+
+        def metadata(seq_id, tokens, start=0, count=None, drafts=None, decode=False):
+            return SequenceGroupMetadata(
+                str(seq_id), not decode, {seq_id: SequenceData(tokens)},
+                SamplingParams(temperature=0.0), {seq_id: [seq_id // 10 - 1]},
+                num_computed_tokens={seq_id: start},
+                num_scheduled_tokens={seq_id: count if count is not None else len(tokens)},
+                do_sample=False, is_speculative=drafts is not None,
+                speculative_token_blocks={seq_id: drafts} if drafts is not None else None,
+            )
+
+        with torch.inference_mode():
+            for counts in ((1, 4), (2, 3), (4, 4)):
+                with self.subTest(counts=counts):
+                    actual, expected = worker(), worker()
+                    initial = [metadata(seq_id, [3, 5]) for seq_id in (10, 20, 30)]
+                    actual.execute_model(initial, {}, {}, {})
+                    expected.execute_model(initial, {}, {}, {})
+                    fixed_outputs = {
+                        seq_id: SequenceOutputs(seq_id, seq_id, 17, {17: 0.0},
+                                                num_computed_tokens=count)
+                        for seq_id, count in zip((10, 20), counts)
+                    }
+                    verified = [metadata(seq_id, [3, 5, 7], 2, 4, [9, 11, 13])
+                                for seq_id in (10, 20)]
+                    verified.append(metadata(30, [3, 5, 19], 2, 1, decode=True))
+                    # Force rejection boundaries without replacing the backbone.
+                    # Exactly one forward must execute, even on partial rejection.
+                    with patch.object(model, "_verify_speculative_tokens", return_value=(fixed_outputs, [])), \
+                         patch.object(model, "forward", wraps=model.forward) as forward:
+                        actual.execute_model(verified, {}, {}, {})
+                        self.assertEqual(forward.call_count, 1)
+                    prefixes = [metadata(seq_id, [3, 5] + [7, 9, 11, 13][:count], 2, count)
+                                for seq_id, count in zip((10, 20), counts)]
+                    prefixes.append(metadata(30, [3, 5, 19], 2, 1, decode=True))
+                    expected.execute_model(prefixes, {}, {}, {})
+                    for layer in (0, 2):
+                        a = actual.hybrid_cache.read_state(layer, actual.hybrid_cache.acquire([20, 30, 10]))
+                        e = expected.hybrid_cache.read_state(layer, expected.hybrid_cache.acquire([20, 30, 10]))
+                        torch.testing.assert_close(a.conv_state, e.conv_state, atol=2e-3, rtol=2e-3)
+                        torch.testing.assert_close(a.recurrent_state, e.recurrent_state, atol=2e-3, rtol=2e-3)
+                    # Rejected KV suffixes may remain physically present. A next
+                    # decode must overwrite/ignore them and continue identically.
+                    next_step = [metadata(seq_id, [3, 5] + [7, 9, 11, 13][:count] + [17],
+                                          2 + count, 1, decode=True)
+                                 for seq_id, count in zip((10, 20), counts)]
+                    for item in next_step:
+                        item.do_sample = True
+                    a_out = actual.execute_model(next_step, {}, {}, {})
+                    e_out = expected.execute_model(next_step, {}, {}, {})
+                    self.assertEqual({k: v.output_token_ids for k, v in a_out.items()},
+                                     {k: v.output_token_ids for k, v in e_out.items()})
 
     def test_prefill_then_decode_matches_single_prefill(self):
         torch.manual_seed(103)

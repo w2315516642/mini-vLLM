@@ -65,7 +65,11 @@ class InputMetadata:
         self.max_cached_prompt_context_len = max_cached_prompt_context_len
         self.prompt_seq_ids = prompt_seq_ids or []
         self.generation_seq_ids = generation_seq_ids or []
+        # Hybrid mappings originate from HybridCache.acquire(), not arbitrary
+        # CUDA indices. They remain immutable for this entire model execution.
         self.state_slot_mapping = state_slot_mapping
+        self.gdn_cu_seqlens = None
+        self.gdn_replay = None
 
         # xFormers only sees prompts whose query contains the whole context.
         # Cached suffixes need the separate paged-attention metadata below.
@@ -146,6 +150,22 @@ class InputMetadata:
             assert self.cached_prompt_context_lens.shape[0] == num_cached_prompts
             assert self.cached_prompt_block_tables.shape[0] == num_cached_prompts
     
+    def get_gdn_cu_seqlens(self) -> torch.Tensor:
+        """Build one packed layout for all GDN layers, including decode tails."""
+        if self.gdn_cu_seqlens is None:
+            lengths = self.prompt_lens + [1] * self.num_generation_tokens
+            if any(length <= 0 for length in lengths):
+                raise ValueError("GDN sequence lengths must be positive")
+            offsets = [0]
+            for length in lengths:
+                offsets.append(offsets[-1] + length)
+            if offsets[-1] != self.num_valid_tokens:
+                raise ValueError("GDN sequence lengths must cover all valid tokens")
+            self.gdn_cu_seqlens = torch.tensor(
+                offsets, dtype=torch.int32, device=self.slot_mapping.device,
+            )
+        return self.gdn_cu_seqlens
+
     def __repr__(self) -> str:
         # Print only useful metadata.
         return (f'InputMetadata('

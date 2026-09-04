@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import torch
@@ -80,6 +81,26 @@ class RequestStateSlotAllocatorTest(unittest.TestCase):
 
 
 class HybridCacheTest(unittest.TestCase):
+    def test_internal_batch_io_does_not_revalidate_cuda_values(self):
+        cache = _make_cache()
+        slots = cache.acquire([10, 20])
+        with patch.object(cache, "_normalize_slot_ids", side_effect=AssertionError):
+            state = cache._read_state(0, slots)
+            state.conv_state.fill_(3)
+            cache._write_state(0, slots, state)
+        torch.testing.assert_close(cache.read_state(0, slots).conv_state,
+                                   torch.full_like(state.conv_state, 3))
+
+    def test_snapshot_and_pool_remain_independent_in_both_directions(self):
+        cache = _make_cache()
+        slots = cache.acquire([10])
+        cache.write_state(0, slots, _filled_state(cache.state_spec, 1, 2))
+        snapshot = cache.snapshot([10])
+        cache.write_state(0, slots, _filled_state(cache.state_spec, 1, 5))
+        self.assertTrue(torch.all(snapshot.layer_states[0].conv_state == 2))
+        snapshot.layer_states[0].recurrent_state.fill_(9)
+        self.assertTrue(torch.all(cache.read_state(0, slots).recurrent_state == 5))
+
     def test_state_shapes_and_global_kv_layer_index(self):
         cache = _make_cache(max_num_seqs=2)
         slots = cache.acquire([10, 20])

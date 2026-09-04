@@ -129,3 +129,34 @@ def gated_delta_rule_prefill(
         chunk_size,
     )
     return output
+
+
+def causal_conv1d_varlen(projected_qkv, conv_state, weight, cu_seqlens, lengths=None):
+    """Packed [tokens, channels] convolution with one state per sequence.
+
+    cu_seqlens is immutable int32 metadata built from CPU sequence lengths.
+    Optional lengths limits each sequence to its accepted prefix during replay;
+    output outside those prefixes is unspecified and must not be consumed.
+    """
+    output = torch.empty_like(projected_qkv)
+    _load_ops().causal_conv1d_varlen(
+        output, projected_qkv, conv_state, weight, cu_seqlens, lengths,
+    )
+    return output
+
+
+def gated_delta_rule_varlen(
+    query, key, value, log_decay, beta, recurrent_state,
+    cu_seqlens, max_seqlen, lengths=None,
+):
+    """Packed [tokens, heads, dim] recurrence without advancing padded tokens.
+
+    max_seqlen and optional accepted lengths are validated on the CPU by the
+    metadata/replay owner. All layers reuse the same CUDA metadata tensors.
+    """
+    output = torch.empty_like(value)
+    _load_ops().gated_delta_rule_varlen(
+        output, query, key, value, log_decay, beta, recurrent_state,
+        cu_seqlens, max_seqlen, lengths,
+    )
+    return output
