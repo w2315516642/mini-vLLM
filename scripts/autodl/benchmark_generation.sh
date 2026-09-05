@@ -8,6 +8,11 @@ enter_repo
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 mode="${BENCH_MODE:-target}"
+load_mode="${LOAD_MODE:-batch}"
+output_suffix=""
+if [[ "${load_mode}" != "batch" ]]; then
+  output_suffix="-${load_mode}"
+fi
 mode_args=()
 case "${mode}" in
   target) ;;
@@ -37,6 +42,7 @@ exec env CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1}" python -m benchmarks.benchm
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}" \
   --input-len "${INPUT_LEN:-2048}" --output-len "${OUTPUT_LEN:-128}" \
   --batch-size "${BATCH_SIZE:-1}" --num-batches "${NUM_BATCHES:-10}" \
+  --load-mode "${load_mode}" \
   --warmup "${WARMUP:-2}" --seed "${SEED:-42}" \
-  --output "${BENCH_OUTPUT:-build/benchmarks/${mode}-b${BATCH_SIZE:-1}.json}" \
+  --output "${BENCH_OUTPUT:-build/benchmarks/${mode}-b${BATCH_SIZE:-1}${output_suffix}.json}" \
   "${data_args[@]}" "${mode_args[@]}" "$@"

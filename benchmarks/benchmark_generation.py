@@ -29,6 +29,55 @@ def measure_batch(llm, prompts, params):
     return list(traces.values()), (started, ended)
 
 
+def measure_continuous(llm, prompts, params, concurrency):
+    """Closed-loop load: refill finished slots before the next engine step.
+
+    Time includes admission, prefill and the final drain. Requests not yet
+    admitted have no submission timestamp: this is not an open-loop load test.
+    """
+    from minivllm.engine.output_processor import OutputProcessor
+
+    if concurrency <= 0 or not prompts:
+        raise ValueError("Continuous load requires prompts and positive concurrency")
+    engine = llm.llm_engine
+    if llm._generation_active or engine.has_unfinished_requests():
+        raise RuntimeError("Continuous benchmark requires an idle engine")
+    processor = OutputProcessor(params)
+    traces, pending = {}, set()
+    next_prompt = 0
+    started = time.perf_counter()
+    llm._generation_active = True
+    try:
+        while next_prompt < len(prompts) or pending:
+            while next_prompt < len(prompts) and len(pending) < concurrency:
+                ids = prompts[next_prompt]
+                submitted = time.perf_counter()
+                request_id = llm._add_request(None, params, ids)
+                pending.add(request_id)
+                traces[request_id] = RequestTrace(request_id, len(ids), submitted)
+                next_prompt += 1
+            if not engine.has_unfinished_requests():
+                raise RuntimeError("Engine ended without all final outputs")
+            # Use the same delta conversion as generate_stream. Consume the
+            # whole step before refilling; no extra GPU synchronization is added.
+            for snapshot in engine.step():
+                output = processor.process(snapshot)
+                if output is None:
+                    continue
+                trace = traces[output.request_id]
+                trace.observe(output, time.perf_counter(), cumulative=False)
+                if output.is_finished():
+                    pending.remove(output.request_id)
+                    if trace.output_tokens != params.max_tokens:
+                        raise RuntimeError("Generated token count differs from the fixed benchmark workload")
+        ended = time.perf_counter()
+    finally:
+        llm._generation_active = False
+        for request_id in pending:
+            engine.abort_request(request_id)
+    return list(traces.values()), (started, ended)
+
+
 def main():
     from minivllm import LLM, SamplingParams
     from minivllm.engine.arg_utils import EngineArgs
@@ -40,6 +89,8 @@ def main():
     parser.add_argument("--input-len", type=int, default=2048)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--load-mode", choices=("batch", "continuous"), default="batch",
+                        help="Fixed batches or closed-loop refill at --batch-size concurrency")
     parser.add_argument("--num-batches", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -60,6 +111,10 @@ def main():
         parser.error("Use benchmark_serving for PD roles")
     if args.prime_prefix and not args.enable_prefix_caching:
         parser.error("--prime-prefix requires --enable-prefix-caching")
+    if args.load_mode == "continuous" and args.prime_prefix:
+        parser.error("Continuous load does not support per-batch prefix priming")
+    if args.load_mode == "continuous" and args.batch_size > args.max_num_seqs:
+        parser.error("Continuous concurrency must not exceed --max-num-seqs")
     if args.stage_profile_max_steps <= 0:
         parser.error("--stage-profile-max-steps must be positive")
     if args.stage_profile_output and args.prime_prefix:
@@ -93,7 +148,12 @@ def main():
             skip=args.nsys_skip_steps, steps=args.nsys_capture_steps)
     traces, windows = [], []
     try:
-        for offset in range(0, count, args.batch_size):
+        offsets = range(0, count, args.batch_size) if args.load_mode == "batch" else ()
+        if args.load_mode == "continuous":
+            observed, window = measure_continuous(llm, prompts, params, args.batch_size)
+            traces.extend(observed)
+            windows.append(window)
+        for offset in offsets:
             batch = prompts[offset:offset + args.batch_size]
             if args.prime_prefix:
                 llm.generate(prompt_token_ids=batch, sampling_params=SamplingParams(
@@ -119,7 +179,8 @@ def main():
             indent=2), encoding="utf-8")
     workload = [WorkItem(str(i), ids, args.output_len) for i, ids in enumerate(prompts)]
     write_result(args.output, traces=traces, windows=windows,
-                 config={**vars(args), "benchmark": "generation", "ignore_eos": True},
+                 config={**vars(args), "benchmark": "generation", "ignore_eos": True,
+                         "includes_prefill_and_drain": True},
                  workload=workload, speculative=speculative_delta(before, after),
                  servers=[{"config": after[0]["config"]}])
 

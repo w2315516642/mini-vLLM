@@ -15,12 +15,15 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
     def test_real_engine_streams_into_result_files(self):
         self._run_cli(False)
 
+    def test_continuous_engine_streams_into_result_files(self):
+        self._run_cli(False, load_mode="continuous")
+
     @unittest.skipUnless(os.environ.get("MINIVLLM_RUN_NSYS_TESTS") == "1",
                          "Set MINIVLLM_RUN_NSYS_TESTS=1 with nsys installed")
     def test_short_nsys_capture(self):
         self._run_cli(True)
 
-    def _run_cli(self, capture):
+    def _run_cli(self, capture, load_mode="batch"):
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
         from tokenizers.pre_tokenizers import Whitespace
@@ -60,6 +63,7 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
                 "CONDA_ENV": Path(sys.prefix).name,
                 "CONDA_SH": str(Path(sys.prefix).parents[1] / "etc/profile.d/conda.sh"),
                 "TARGET_MODEL": str(model), "BENCH_MODE": "target", "DTYPE": "half",
+                "LOAD_MODE": load_mode,
                 "CUDA_DEVICES": "0", "TP_SIZE": "1", "GPU_MEMORY_UTILIZATION": "0.15",
                 "MAX_NUM_SEQS": "2", "MAX_NUM_BATCHED_TOKENS": "32",
                 "INPUT_LEN": "16", "OUTPUT_LEN": "6", "BATCH_SIZE": "2",
@@ -95,6 +99,8 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
                 self.assertTrue(all("draft_proposal" in s["stages"] for s in steps))
                 self.assertTrue(all(s["counts"]["replayed_requests"] == 0 for s in steps))
             result = json.loads(result_path.read_text())
+            self.assertEqual(result["config"]["load_mode"], load_mode)
+            self.assertTrue(result["config"]["includes_prefill_and_drain"])
             self.assertEqual(result["metrics"]["requests"], 4)
             self.assertEqual(result["metrics"]["output_tokens"], 24)
             self.assertEqual(result["metrics"]["itl_ms"]["count"], 20)

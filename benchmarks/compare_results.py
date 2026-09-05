@@ -12,6 +12,9 @@ def compare_results(baseline, candidate, allow_config_difference=()):
         raise ValueError("Unsupported result schema")
     if baseline["workload"] != candidate["workload"]:
         raise ValueError("Workloads differ: token inputs, output lengths or arrival schedule changed")
+    # Results written before load modes were introduced used fixed batches.
+    if baseline["config"].get("load_mode", "batch") != candidate["config"].get("load_mode", "batch"):
+        raise ValueError("Benchmark configuration differs: load_mode")
     for key in ("benchmark", "synthetic", "temperature", "ignore_eos", "batch_size", "num_batches"):
         if baseline["config"].get(key) != candidate["config"].get(key):
             raise ValueError(f"Benchmark configuration differs: {key}")
