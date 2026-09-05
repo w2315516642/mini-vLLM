@@ -47,6 +47,9 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--stage-profile-output", help="Opt-in worker stage timing JSON")
     parser.add_argument("--stage-profile-max-steps", type=int, default=2048)
+    parser.add_argument("--nsys-capture-output", help="Enable short Decode capture; write window metadata")
+    parser.add_argument("--nsys-skip-steps", type=int, default=5)
+    parser.add_argument("--nsys-capture-steps", type=int, default=20)
     parser.set_defaults(max_num_seqs=16, disable_log_stats=True)
     args = parser.parse_args()
     if min(args.input_len, args.output_len, args.batch_size, args.num_batches) <= 0 or args.warmup < 0:
@@ -61,6 +64,13 @@ def main():
         parser.error("--stage-profile-max-steps must be positive")
     if args.stage_profile_output and args.prime_prefix:
         parser.error("Stage profiling does not include prefix priming; disable --prime-prefix")
+    if args.nsys_skip_steps < 0 or args.nsys_capture_steps <= 0:
+        parser.error("Nsight skip must be nonnegative and capture steps positive")
+    if args.nsys_capture_output and (
+        args.tensor_parallel_size != 1 or args.pipeline_parallel_size != 1
+        or args.worker_use_ray or args.prime_prefix or args.stage_profile_output
+    ):
+        parser.error("Nsight capture requires one local GPU, no priming or stage-event profiling")
     engine_args = EngineArgs.from_cli_args(args)
     llm = LLM(**vars(engine_args))
     tokenizer = llm.get_tokenizer()
@@ -78,15 +88,26 @@ def main():
     if args.stage_profile_output:
         llm.llm_engine._run_workers("start_stage_profile",
             max_steps=args.stage_profile_max_steps)
+    if args.nsys_capture_output:
+        llm.llm_engine._run_workers("start_decode_capture",
+            skip=args.nsys_skip_steps, steps=args.nsys_capture_steps)
     traces, windows = [], []
-    for offset in range(0, count, args.batch_size):
-        batch = prompts[offset:offset + args.batch_size]
-        if args.prime_prefix:
-            llm.generate(prompt_token_ids=batch, sampling_params=SamplingParams(
-                temperature=0.0, ignore_eos=True, max_tokens=1), use_tqdm=False)
-        observed, window = measure_batch(llm, batch, params)
-        traces.extend(observed)
-        windows.append(window)
+    try:
+        for offset in range(0, count, args.batch_size):
+            batch = prompts[offset:offset + args.batch_size]
+            if args.prime_prefix:
+                llm.generate(prompt_token_ids=batch, sampling_params=SamplingParams(
+                    temperature=0.0, ignore_eos=True, max_tokens=1), use_tqdm=False)
+            observed, window = measure_batch(llm, batch, params)
+            traces.extend(observed)
+            windows.append(window)
+    finally:
+        if args.nsys_capture_output:
+            ranks = llm.llm_engine._run_workers("finish_decode_capture", get_all_outputs=True)
+            target = Path(args.nsys_capture_output)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"config": vars(args), "ranks": ranks}, indent=2),
+                              encoding="utf-8")
     after = [llm.llm_engine.get_runtime_stats()]
     if args.stage_profile_output:
         ranks = llm.llm_engine._run_workers("finish_stage_profile", get_all_outputs=True)

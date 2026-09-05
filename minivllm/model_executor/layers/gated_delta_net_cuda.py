@@ -10,12 +10,14 @@ from importlib import import_module
 from typing import Tuple
 
 import torch
+from minivllm.profiling import nvtx_function
 
 
 def _load_ops():
     return import_module("minivllm.gated_delta_net_ops")
 
 
+@nvtx_function("gdn_prepare_qk")
 def prepare_gated_delta_qk(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -59,6 +61,7 @@ def prepare_gated_delta_qk(
     )
 
 
+@nvtx_function("gdn_conv")
 def causal_conv1d_update(
     projected_qkv: torch.Tensor,
     conv_state: torch.Tensor,
@@ -75,6 +78,7 @@ def causal_conv1d_update(
     return output
 
 
+@nvtx_function("gdn_recurrence")
 def gated_delta_rule_decode(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -101,6 +105,7 @@ def gated_delta_rule_decode(
     return output
 
 
+@nvtx_function("gdn_recurrence")
 def gated_delta_rule_prefill(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -134,6 +139,7 @@ def gated_delta_rule_prefill(
     return output
 
 
+@nvtx_function("gdn_conv")
 def causal_conv1d_varlen(projected_qkv, conv_state, weight, cu_seqlens, lengths=None):
     """Packed [tokens, channels] convolution with one state per sequence.
 
@@ -148,6 +154,7 @@ def causal_conv1d_varlen(projected_qkv, conv_state, weight, cu_seqlens, lengths=
     return output
 
 
+@nvtx_function("gdn_recurrence")
 def gated_delta_rule_varlen(
     query, key, value, log_decay, beta, recurrent_state,
     cu_seqlens, max_seqlen, lengths=None,

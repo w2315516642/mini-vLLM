@@ -9,6 +9,7 @@ from minivllm.model_executor.parallel_utils.tensor_parallel import (
     gather_from_tensor_model_parallel_region)
 from minivllm.sampling_params import SamplingParams
 from minivllm.sequence import SequenceOutputs
+from minivllm.profiling import nvtx_function, nvtx_range
 
 
 class Sampler(nn.Module):
@@ -30,6 +31,7 @@ class Sampler(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
 
+    @nvtx_function("sample_verify")
     def forward(
         self,
         lm_head_weight: torch.Tensor,
@@ -40,8 +42,9 @@ class Sampler(nn.Module):
         hidden_states = _prune_hidden_states(hidden_states, input_metadata)
 
         # Get the logits for the next token.
-        logits = torch.matmul(hidden_states, lm_head_weight.t())
-        logits = gather_from_tensor_model_parallel_region(logits)
+        with nvtx_range("lm_head:standard"):
+            logits = torch.matmul(hidden_states, lm_head_weight.t())
+            logits = gather_from_tensor_model_parallel_region(logits)
         # Remove padding in vocab (if any).
         logits = logits[:, :self.vocab_size]
 

@@ -36,6 +36,7 @@ from minivllm.spec_decode.dspark_context import TargetHiddenStateCollector
 from minivllm.worker.cache_engine import CacheEngine
 from minivllm.worker.draft_cache import DraftCacheEngine
 from minivllm.worker.gdn_replay import GatedDeltaNetReplay, replay_buffer_bytes
+from minivllm.profiling import DecodeCapture, capture_worker_step, nvtx_function
 from minivllm.worker.hybrid_cache import (
     GatedDeltaNetStateSpec,
     HybridCache,
@@ -705,12 +706,21 @@ class Worker:
         from minivllm.worker.stage_profile import StageProfile
         self._stage_profile = StageProfile(max_steps)
 
+    def start_decode_capture(self, skip=5, steps=20):
+        self._decode_capture = DecodeCapture(skip, steps)
+
+    def finish_decode_capture(self):
+        capture = self._decode_capture
+        self._decode_capture = None
+        return capture.close()
+
     def finish_stage_profile(self):
         profile = self._stage_profile
         self._stage_profile = None
         return profile.finish()
 
     @torch.inference_mode()
+    @capture_worker_step
     def execute_model(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -769,6 +779,9 @@ class Worker:
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list=seq_group_metadata_list)
         self._attach_saved_draft_probabilities(input_metadata)
+        capture = getattr(self, "_decode_capture", None)
+        if capture is not None:
+            capture.begin_step(input_metadata)
         if profile is not None:
             profile.mark("prepare_inputs")
             speculative_ids = set(input_metadata.speculative_seq_ids)
@@ -901,6 +914,7 @@ class Worker:
         if has_stochastic_request:
             input_metadata.speculative_draft_probs = probability_blocks
 
+    @nvtx_function("draft_proposal")
     def _attach_dspark_drafts(
         self,
         outputs: Dict[int, SequenceOutputs],

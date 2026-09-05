@@ -30,6 +30,7 @@ from minivllm.spec_decode.dspark_heads import (
     VanillaMarkov,
 )
 from minivllm.spec_decode.rejection_sampler import logits_to_probs
+from minivllm.profiling import nvtx_function
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -423,6 +424,7 @@ class DSparkDraftModel(nn.Module):
             )
         return self.norm(hidden_states)
 
+    @nvtx_function("draft_context_kv")
     def materialize_context_kv(
         self,
         target_hidden: torch.Tensor,
@@ -470,6 +472,7 @@ class DSparkDraftModel(nn.Module):
             )
         return self.norm(hidden_states)
 
+    @nvtx_function("lm_head:draft")
     def compute_base_logits(
         self,
         hidden_states: torch.Tensor,
@@ -487,6 +490,7 @@ class DSparkDraftModel(nn.Module):
             raise ValueError("Gathered target LM head is smaller than draft vocabulary")
         return logits[..., :self.config.vocab_size].float()
 
+    @nvtx_function("draft_model")
     def propose_paged(
         self,
         input_embeddings: torch.Tensor,

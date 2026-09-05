@@ -39,6 +39,7 @@ from minivllm.model_executor.layers.gated_delta_net_cuda import (
 )
 from minivllm.model_executor.layers.layer_norm import Qwen3_5RMSNorm
 from minivllm.model_executor.layers.sampler import Sampler
+from minivllm.profiling import nvtx_function
 from minivllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -782,6 +783,7 @@ class Qwen3_5DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    @nvtx_function("decoder_layer")
     def forward(
         self,
         positions: torch.Tensor,
@@ -1088,6 +1090,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         for seq_id in seq_ids:
             self._multimodal_feature_cache.pop(seq_id, None)
 
+    @nvtx_function("lm_head")
     def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden_states, self.lm_head.weight)
         logits = gather_from_tensor_model_parallel_region(logits)
@@ -1137,6 +1140,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             else positions[:, token_index]
         )
 
+    @nvtx_function("sample_verify")
     def _verify_speculative_tokens(
         self,
         hidden_states: torch.Tensor,

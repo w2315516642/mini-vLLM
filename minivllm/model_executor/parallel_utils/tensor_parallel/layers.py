@@ -1,4 +1,5 @@
 from typing import Callable
+from minivllm.profiling import nvtx_function
 
 import torch
 import torch.nn as nn
@@ -109,6 +110,7 @@ def _linear_weight(module: nn.Module, input_: torch.Tensor) -> torch.Tensor:
     )
 
 
+@nvtx_function("linear")
 def _linear(module, input_, bias=None, out=None):
     # Select by the local GEMM's M, not by request count: speculative verification
     # packs several tokens per request. Weights always remain resident in FP8;

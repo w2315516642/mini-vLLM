@@ -13,6 +13,14 @@ import unittest
                      "Set MINIVLLM_RUN_BENCHMARK_CUDA_TESTS=1 for a tiny GPU CLI smoke")
 class BenchmarkGenerationCUDATest(unittest.TestCase):
     def test_real_engine_streams_into_result_files(self):
+        self._run_cli(False)
+
+    @unittest.skipUnless(os.environ.get("MINIVLLM_RUN_NSYS_TESTS") == "1",
+                         "Set MINIVLLM_RUN_NSYS_TESTS=1 with nsys installed")
+    def test_short_nsys_capture(self):
+        self._run_cli(True)
+
+    def _run_cli(self, capture):
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
         from tokenizers.pre_tokenizers import Whitespace
@@ -44,9 +52,10 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
             result_path = root / "result.json"
             profile_path = root / "stages.json"
             completed = subprocess.run([
-                "bash", "scripts/autodl/benchmark_generation.sh",
+                "bash", ("scripts/autodl/profile_decode_nsys.sh" if capture
+                         else "scripts/autodl/benchmark_generation.sh"),
                 "--use-dummy-weights", "--swap-space", "0",
-                "--stage-profile-output", str(profile_path),
+                *([] if capture else ["--stage-profile-output", str(profile_path)]),
             ], cwd=Path(__file__).resolve().parents[1], env={**os.environ,
                 "CONDA_ENV": Path(sys.prefix).name,
                 "CONDA_SH": str(Path(sys.prefix).parents[1] / "etc/profile.d/conda.sh"),
@@ -56,16 +65,35 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
                 "INPUT_LEN": "16", "OUTPUT_LEN": "6", "BATCH_SIZE": "2",
                 "NUM_BATCHES": "2", "WARMUP": "1", "SYNTHETIC": "1", "PREFIX_PRIME": "0",
                 "BENCH_OUTPUT": str(result_path),
+                "NSYS_OUTPUT": str(root / "trace"),
+                "NSYS_SKIP_STEPS": "1", "NSYS_CAPTURE_STEPS": "2",
                 "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
                 text=True, capture_output=True, timeout=120)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-            profile = json.loads(profile_path.read_text())
-            self.assertEqual(len(profile["ranks"]), 1)
-            steps = profile["ranks"][0]["steps"]
-            self.assertEqual(len(steps), 12)  # Two measured batches, no warmup.
-            self.assertEqual(sum(s["counts"]["prefill_requests"] > 0 for s in steps), 2)
-            self.assertTrue(all("draft_proposal" in s["stages"] for s in steps))
-            self.assertTrue(all(s["counts"]["replayed_requests"] == 0 for s in steps))
+            if capture:
+                window = json.loads((root / "trace-window.json").read_text())["ranks"][0]
+                self.assertTrue(window["complete"])
+                self.assertEqual(len(window["records"]), 2)
+                self.assertEqual(window["records"][0]["decode_step"], 2)
+                self.assertTrue(all(r["M"] == 2 and r["T"] == 1 for r in window["records"]))
+                self.assertGreater((root / "trace.nsys-rep").stat().st_size, 0)
+                stats = subprocess.run([
+                    "nsys", "stats", "--report", "nvtx_sum", "--format", "csv",
+                    str(root / "trace.nsys-rep"),
+                ], text=True, capture_output=True, timeout=60)
+                self.assertEqual(stats.returncode, 0, stats.stdout + stats.stderr)
+                for marker in ("decode_step", "decoder_layer", "layer=0", "linear:",
+                               "gdn_recurrence", "gdn_conv", "full_attention",
+                               "sample_verify", "lm_head:standard"):
+                    self.assertIn(marker, stats.stdout)
+            else:
+                profile = json.loads(profile_path.read_text())
+                self.assertEqual(len(profile["ranks"]), 1)
+                steps = profile["ranks"][0]["steps"]
+                self.assertEqual(len(steps), 12)  # Two measured batches, no warmup.
+                self.assertEqual(sum(s["counts"]["prefill_requests"] > 0 for s in steps), 2)
+                self.assertTrue(all("draft_proposal" in s["stages"] for s in steps))
+                self.assertTrue(all(s["counts"]["replayed_requests"] == 0 for s in steps))
             result = json.loads(result_path.read_text())
             self.assertEqual(result["metrics"]["requests"], 4)
             self.assertEqual(result["metrics"]["output_tokens"], 24)

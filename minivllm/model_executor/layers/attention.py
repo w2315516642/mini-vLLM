@@ -8,6 +8,7 @@ from minivllm import attention_ops
 from minivllm import cache_ops
 from minivllm import pos_encoding_ops
 from minivllm.model_executor.input_metadata import InputMetadata
+from minivllm.profiling import nvtx_function
 
 _SUPPORTED_HEAD_SIZES = {64, 80, 96, 128, 256}
 
@@ -174,6 +175,7 @@ class PagedAttention(nn.Module):
             True,
         )
 
+    @nvtx_function("full_attention")
     def forward(
         self,
         query: torch.Tensor,  # [num_tokens, num_query_heads * head_size]

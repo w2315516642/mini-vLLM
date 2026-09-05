@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+from minivllm.profiling import nvtx_function
 
 from minivllm.model_executor.layers.gated_delta_net_cuda import (
     causal_conv1d_varlen,
@@ -47,6 +48,7 @@ class GatedDeltaNetReplay:
         self.cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
         self.layers = {}
 
+    @nvtx_function("replay_record")
     def record(self, layer_idx, qkv, weight, key, value, log_decay, beta):
         """Keep only speculative tokens; unrelated prefill/decode is excluded."""
         self.layers[layer_idx] = _LayerReplayInputs(
@@ -57,6 +59,7 @@ class GatedDeltaNetReplay:
             beta.index_select(0, self.token_indices),
         )
 
+    @nvtx_function("state_replay")
     def commit(self, cache, committed_tokens):
         """Consume the snapshot and install states at each accepted boundary.
 
