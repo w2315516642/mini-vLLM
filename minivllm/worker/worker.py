@@ -701,6 +701,15 @@ class Worker:
         )
         return tokens_tensor, positions_tensor, input_metadata
 
+    def start_stage_profile(self, max_steps=2048):
+        from minivllm.worker.stage_profile import StageProfile
+        self._stage_profile = StageProfile(max_steps)
+
+    def finish_stage_profile(self):
+        profile = self._stage_profile
+        self._stage_profile = None
+        return profile.finish()
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -753,10 +762,25 @@ class Worker:
                 "DSpark proposals currently support text requests only"
             )
         
+        profile = getattr(self, "_stage_profile", None)
+        if profile is not None:
+            profile.begin()
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list=seq_group_metadata_list)
         self._attach_saved_draft_probabilities(input_metadata)
+        if profile is not None:
+            profile.mark("prepare_inputs")
+            speculative_ids = set(input_metadata.speculative_seq_ids)
+            profile.counts(
+                active_requests=len(input_metadata.prompt_seq_ids)
+                + len(input_metadata.generation_seq_ids),
+                prefill_requests=sum(s not in speculative_ids
+                                     for s in input_metadata.prompt_seq_ids),
+                speculative_requests=len(speculative_ids),
+                input_tokens=input_metadata.num_valid_tokens,
+                draft_tokens=sum(map(len, input_metadata.speculative_token_blocks)),
+            )
         if self.hybrid_cache is not None:
             input_metadata.state_slot_mapping = self.hybrid_cache.acquire(
                 input_metadata.prompt_seq_ids
@@ -768,6 +792,8 @@ class Worker:
                 self.hybrid_cache.snapshot(input_metadata.speculative_seq_ids),
             )
         
+        if profile is not None:
+            profile.mark("state_snapshot")
         # Execute the model.
         # output: List[int (seq_id), SequenceOutputs]
         hidden_collector = (
@@ -786,6 +812,8 @@ class Worker:
             cache_events=cache_events,
             **model_kwargs,
         )
+        if profile is not None:
+            profile.mark("target_model")
         if hidden_collector is not None:
             self.draft_cache_engine.wait_for_cache_ops()
             target_hidden = hidden_collector.concatenate()[
@@ -797,6 +825,8 @@ class Worker:
                 input_metadata.slot_mapping,
                 self.draft_gpu_cache,
             )
+        if profile is not None:
+            profile.mark("draft_context_kv")
         partially_accepted = {
             seq_id: output[seq_id].num_computed_tokens
             for seq_id, draft_tokens in zip(
@@ -814,8 +844,18 @@ class Worker:
             )
         # Release the transaction before allocating the next draft workspace.
         input_metadata.gdn_replay = None
+        if profile is not None:
+            profile.mark("state_replay")
+            profile.counts(
+                rejected_requests=len(partially_accepted),
+                replayed_requests=(len(input_metadata.speculative_seq_ids)
+                                   if partially_accepted else 0),
+            )
         if self._should_attach_dspark_drafts():
             self._attach_dspark_drafts(output, seq_group_metadata_list)
+        if profile is not None:
+            profile.mark("draft_proposal")
+            profile.end()
         return output
 
     def _should_attach_dspark_drafts(self) -> bool:

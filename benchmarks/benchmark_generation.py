@@ -1,6 +1,8 @@
 """Measure local streaming batches with or without DSpark."""
 
 import argparse
+import json
+from pathlib import Path
 from contextlib import closing
 import time
 
@@ -43,6 +45,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--prime-prefix", action="store_true", help="Prefill each measured batch before timing")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--stage-profile-output", help="Opt-in worker stage timing JSON")
+    parser.add_argument("--stage-profile-max-steps", type=int, default=2048)
     parser.set_defaults(max_num_seqs=16, disable_log_stats=True)
     args = parser.parse_args()
     if min(args.input_len, args.output_len, args.batch_size, args.num_batches) <= 0 or args.warmup < 0:
@@ -53,6 +57,10 @@ def main():
         parser.error("Use benchmark_serving for PD roles")
     if args.prime_prefix and not args.enable_prefix_caching:
         parser.error("--prime-prefix requires --enable-prefix-caching")
+    if args.stage_profile_max_steps <= 0:
+        parser.error("--stage-profile-max-steps must be positive")
+    if args.stage_profile_output and args.prime_prefix:
+        parser.error("Stage profiling does not include prefix priming; disable --prime-prefix")
     engine_args = EngineArgs.from_cli_args(args)
     llm = LLM(**vars(engine_args))
     tokenizer = llm.get_tokenizer()
@@ -67,6 +75,9 @@ def main():
     for _ in range(args.warmup):
         llm.generate(prompt_token_ids=warmup_prompts, sampling_params=params, use_tqdm=False)
     before = [llm.llm_engine.get_runtime_stats()]
+    if args.stage_profile_output:
+        llm.llm_engine._run_workers("start_stage_profile",
+            max_steps=args.stage_profile_max_steps)
     traces, windows = [], []
     for offset in range(0, count, args.batch_size):
         batch = prompts[offset:offset + args.batch_size]
@@ -77,6 +88,14 @@ def main():
         traces.extend(observed)
         windows.append(window)
     after = [llm.llm_engine.get_runtime_stats()]
+    if args.stage_profile_output:
+        ranks = llm.llm_engine._run_workers("finish_stage_profile", get_all_outputs=True)
+        target = Path(args.stage_profile_output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"config": vars(args), "ranks": ranks,
+            "note": "Instrumented run. stream_ms includes idle gaps; host_ms includes host waits. "
+                    "They overlap and must not be added. Warmup excluded; prefill included."},
+            indent=2), encoding="utf-8")
     workload = [WorkItem(str(i), ids, args.output_len) for i, ids in enumerate(prompts)]
     write_result(args.output, traces=traces, windows=windows,
                  config={**vars(args), "benchmark": "generation", "ignore_eos": True},

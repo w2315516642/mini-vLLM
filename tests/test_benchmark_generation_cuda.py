@@ -42,9 +42,11 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
             PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]",
                                     bos_token="[BOS]", eos_token="[EOS]").save_pretrained(model)
             result_path = root / "result.json"
+            profile_path = root / "stages.json"
             completed = subprocess.run([
                 "bash", "scripts/autodl/benchmark_generation.sh",
                 "--use-dummy-weights", "--swap-space", "0",
+                "--stage-profile-output", str(profile_path),
             ], cwd=Path(__file__).resolve().parents[1], env={**os.environ,
                 "CONDA_ENV": Path(sys.prefix).name,
                 "CONDA_SH": str(Path(sys.prefix).parents[1] / "etc/profile.d/conda.sh"),
@@ -57,6 +59,13 @@ class BenchmarkGenerationCUDATest(unittest.TestCase):
                 "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
                 text=True, capture_output=True, timeout=120)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            profile = json.loads(profile_path.read_text())
+            self.assertEqual(len(profile["ranks"]), 1)
+            steps = profile["ranks"][0]["steps"]
+            self.assertEqual(len(steps), 12)  # Two measured batches, no warmup.
+            self.assertEqual(sum(s["counts"]["prefill_requests"] > 0 for s in steps), 2)
+            self.assertTrue(all("draft_proposal" in s["stages"] for s in steps))
+            self.assertTrue(all(s["counts"]["replayed_requests"] == 0 for s in steps))
             result = json.loads(result_path.read_text())
             self.assertEqual(result["metrics"]["requests"], 4)
             self.assertEqual(result["metrics"]["output_tokens"], 24)
