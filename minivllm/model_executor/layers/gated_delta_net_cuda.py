@@ -117,6 +117,9 @@ def gated_delta_rule_prefill(
     """
     if not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
+    if query.is_cuda and query.ndim == 4 and query.shape[1] >= 16:
+        from .gdn_prefill import gdn_prefill
+        return gdn_prefill(query, key, value, log_decay, beta, recurrent_state)
     output = torch.empty_like(value)
     _load_ops().gated_delta_rule_prefill(
         output,
@@ -154,6 +157,10 @@ def gated_delta_rule_varlen(
     max_seqlen and optional accepted lengths are validated on the CPU by the
     metadata/replay owner. All layers reuse the same CUDA metadata tensors.
     """
+    if query.is_cuda and max_seqlen >= 16:
+        from .gdn_prefill import gdn_prefill
+        return gdn_prefill(query, key, value, log_decay, beta, recurrent_state,
+                           cu_seqlens, lengths)
     output = torch.empty_like(value)
     _load_ops().gated_delta_rule_varlen(
         output, query, key, value, log_decay, beta, recurrent_state,

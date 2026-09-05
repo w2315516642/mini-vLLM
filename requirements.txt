@@ -5,6 +5,7 @@ sentencepiece  # Required for LLaMA tokenizer.
 safetensors  # Streaming loader for sharded Hugging Face checkpoints.
 numpy
 torch >= 2.0.0
+triton >= 3.0.0; sys_platform == "linux"  # Fused W8A16 Linear and state-resident GDN.
 transformers >= 5.7.0  # Native Qwen3.5 text, image, and video processor support.
 xformers >= 0.0.19
 fastapi

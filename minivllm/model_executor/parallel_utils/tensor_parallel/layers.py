@@ -25,6 +25,10 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_stride': 1
 }
 
+# The software W8A16 kernel wins on bandwidth-bound decode/verification shapes.
+# Large prefill still uses cuBLAS until its fused tile path is competitive.
+FP8_FUSED_MAX_TOKENS = 512
+
 
 def _config_value(config, name, default=None):
     if config is None:
@@ -103,6 +107,25 @@ def _linear_weight(module: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         module.weight_block_size,
         input_.dtype,
     )
+
+
+def _linear(module, input_, bias=None, out=None):
+    # Select by the local GEMM's M, not by request count: speculative verification
+    # packs several tokens per request. Weights always remain resident in FP8;
+    # only large-M/CPU/FP32 calls materialize a temporary per-layer weight.
+    if hasattr(module, "weight_scale_inv") and input_.is_cuda and input_.dtype in (
+        torch.float16, torch.bfloat16,
+    ) and input_.numel() // input_.shape[-1] <= FP8_FUSED_MAX_TOKENS:
+        from minivllm.model_executor.layers.fp8_linear import fp8_linear
+        return fp8_linear(input_, module.weight, module.weight_scale_inv,
+                          module.weight_block_size, bias, out)
+    weight = _linear_weight(module, input_)
+    if out is None:
+        return F.linear(input_, weight, bias)
+    torch.matmul(input_, weight.t(), out=out)
+    if bias is not None:
+        out.add_(bias)
+    return out
 
 
 def set_tensor_model_parallel_attributes(
@@ -347,11 +370,7 @@ class ColumnParallelLinear(nn.Module):
 
         input_parallel = input_
         # Matrix multiply.
-        output_parallel = F.linear(
-            input_parallel,
-            _linear_weight(self, input_parallel),
-            bias,
-        )
+        output_parallel = _linear(self, input_parallel, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
@@ -495,15 +514,14 @@ class RowParallelLinear(nn.Module):
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        weight = _linear_weight(self, input_parallel)
         if get_tensor_model_parallel_world_size() == 1:
-            output_ = F.linear(input_parallel, weight)
+            output_ = _linear(self, input_parallel)
         else:
             all_reduce_launcher = get_all_reduce_launcher()
             num_tokens = input_parallel.shape[0]
             # 取cuda graph要用的固定显存位置
             output_buffer = all_reduce_launcher.get_buffer(num_tokens)
-            torch.matmul(input_parallel, weight.t(), out=output_buffer)
+            _linear(self, input_parallel, out=output_buffer)
             # All-reduce across all the partitions.
             output_ = all_reduce_launcher.launch(output_buffer)
 
