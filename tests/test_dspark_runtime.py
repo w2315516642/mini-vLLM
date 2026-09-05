@@ -43,6 +43,15 @@ class DraftBlockTableTest(unittest.TestCase):
 
 class DraftWorkerBookkeepingTest(unittest.TestCase):
 
+    def test_verification_logits_memory_reserve(self):
+        worker = self.make_worker()
+        worker.scheduler_config.max_num_seqs = 16
+        worker.parallel_config = SimpleNamespace(tensor_parallel_size=2)
+        worker.model.lm_head = SimpleNamespace(weight=torch.empty(128, 4, dtype=torch.bfloat16))
+        self.assertEqual(worker._get_verification_logits_reserve(), 16 * 4 * 256 * 6)
+        worker.scheduler_config.num_speculative_tokens = 0
+        self.assertEqual(worker._get_verification_logits_reserve(), 0)
+
     def make_worker(self):
         worker = Worker.__new__(Worker)
         worker.scheduler_config = SimpleNamespace(num_speculative_tokens=3)

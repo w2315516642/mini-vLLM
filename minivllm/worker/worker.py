@@ -209,6 +209,7 @@ class Worker:
                 block_size, draft_cache_block_size
             )
             - self._get_draft_probability_reserve()
+            - self._get_verification_logits_reserve()
         )
         if usable_cache_memory <= 0:
             state_gib = state_cache_size / (1024 ** 3)
@@ -222,7 +223,9 @@ class Worker:
                 "Persistent runtime buffers do not fit in the configured GPU "
                 f"memory budget: recurrent={state_gib:.2f} GiB, "
                 f"GDN replay={self._get_gdn_replay_reserve() / (1024 ** 3):.2f} GiB, "
-                f"DSpark={draft_gib:.2f} GiB for max_num_seqs="
+                f"DSpark={draft_gib:.2f} GiB, "
+                f"verification logits={self._get_verification_logits_reserve() / (1024 ** 3):.2f} GiB "
+                f"for max_num_seqs="
                 f"{self.scheduler_config.max_num_seqs}. Reduce "
                 "--max-num-seqs or the speculative width."
             )
@@ -290,6 +293,20 @@ class Worker:
             * self.draft_config.vocab_size
             * torch.tensor([], dtype=torch.float32).element_size()
         )
+
+    def _get_verification_logits_reserve(self) -> int:
+        """Keep room for packed projection output and its FP32 conversion.
+
+        Cache profiling uses ordinary prefill and does not exercise packed
+        speculative logits. Reserve this workspace before filling KV blocks.
+        """
+        width = self.scheduler_config.num_speculative_tokens
+        if width <= 0:
+            return 0
+        weight = self.model.lm_head.weight
+        vocab = weight.shape[0] * self.parallel_config.tensor_parallel_size
+        rows = self.scheduler_config.max_num_seqs * (width + 1)
+        return rows * vocab * (weight.element_size() + 4)
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         if (
@@ -958,15 +975,17 @@ class Worker:
             [request.sampling_params for request in requests],
             [request.output_history for request in requests],
         )
+        # Transfer each result tensor once, instead of synchronizing on each row.
+        token_rows = proposal.token_ids.tolist()
+        confidence_rows = (proposal.confidence.tolist()
+                           if proposal.confidence is not None else None)
         for batch_index, request in enumerate(requests):
             width = request.draft_width
             confidence = None
-            if proposal.confidence is not None:
-                confidence = proposal.confidence[
-                    batch_index, :width
-                ].tolist()
+            if confidence_rows is not None:
+                confidence = confidence_rows[batch_index][:width]
             request.output.set_draft_tokens(
-                proposal.token_ids[batch_index, :width].tolist(),
+                token_rows[batch_index][:width],
                 confidence,
             )
             probabilities = proposal.draft_probs[batch_index]

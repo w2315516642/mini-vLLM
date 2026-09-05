@@ -1155,16 +1155,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         draft_probability_blocks = input_metadata.speculative_draft_probs or (
             [None] * len(input_metadata.speculative_seq_ids)
         )
-        for seq_id, draft_token_ids, indices, sampling_params, draft_probs in zip(
+        # Project all verification positions together. Per-request projections
+        # repeatedly read the large vocabulary weight for only a few rows.
+        index_blocks = input_metadata.speculative_hidden_indices
+        if not index_blocks:
+            return outputs, proposal_contexts
+        flat_indices = [index for block in index_blocks for index in block]
+        packed_logits = self._compute_logits(hidden_states[flat_indices])
+        logit_blocks = packed_logits.split([len(block) for block in index_blocks])
+        for seq_id, draft_token_ids, indices, sampling_params, draft_probs, block_logits in zip(
             input_metadata.speculative_seq_ids,
             input_metadata.speculative_token_blocks,
             input_metadata.speculative_hidden_indices,
             input_metadata.speculative_sampling_params,
             draft_probability_blocks,
+            logit_blocks,
         ):
-            block_logits = self._compute_logits(
-                hidden_states[list(indices)]
-            )
             if sampling_params.temperature == 0.0:
                 verification = verify_greedy_block(
                     block_logits,
