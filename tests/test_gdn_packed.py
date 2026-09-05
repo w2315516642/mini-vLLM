@@ -89,6 +89,11 @@ class PackedGdnCudaTest(unittest.TestCase):
                         torch.testing.assert_close(state[row], expected_state[0])
 
     def test_replay_mixed_acceptance_matches_each_prefix_and_ignores_other_rows(self):
+        for counts in ((4, 1), (2, 3), (2, 1), (4, 3)):
+            with self.subTest(counts=counts):
+                self._check_replay(counts)
+
+    def _check_replay(self, counts):
         torch.manual_seed(342)
         spec = GatedDeltaNetStateSpec(1, 2, 3, 4, 3)
         cache = HybridCache(("linear_attention",), {}, spec, 3, "cuda")
@@ -109,7 +114,7 @@ class PackedGdnCudaTest(unittest.TestCase):
         decay = -torch.rand(14, 2, device="cuda")
         replay.record(0, qkv, weight, k, v, decay, beta)
         expected = []
-        for index, (start, count) in enumerate(((10, 4), (0, 1))):
+        for index, (start, count) in enumerate(zip((10, 0), counts)):
             initial = snapshot.layer_states[0]
             expected_rec = initial.recurrent_state[index:index + 1].clone()
             gated_delta_rule_prefill(q[start:start + count].unsqueeze(0),
@@ -125,13 +130,32 @@ class PackedGdnCudaTest(unittest.TestCase):
         changed = cache._read_state(0, slots)
         changed.conv_state.fill_(19)
         changed.recurrent_state.fill_(23)
+        # Fully accepted rows have already reached their final state during
+        # verification. They must remain bitwise untouched by commit().
+        for index, (count, limit, slot) in enumerate(zip(counts, (4, 3), (1, 0))):
+            if count == limit:
+                changed.conv_state[slot].copy_(expected[index][0])
+                changed.recurrent_state[slot].copy_(expected[index][1])
         cache._write_state(0, slots, changed)
-        with patch.object(cache, "_normalize_slot_ids", side_effect=AssertionError):
-            replay.commit(cache, {20: 4, 10: 1})
+        rejected = sum(n < limit for n, limit in zip(counts, (4, 3)))
+        with patch.object(cache, "_normalize_slot_ids", side_effect=AssertionError), \
+                patch("minivllm.worker.gdn_replay.causal_conv1d_varlen",
+                      wraps=causal_conv1d_varlen) as conv_call, \
+                patch("minivllm.worker.gdn_replay.gated_delta_rule_varlen",
+                      wraps=gated_delta_rule_varlen) as gdn_call:
+            self.assertEqual(replay.commit(cache, dict(zip((20, 10), counts))), rejected)
+            self.assertEqual(conv_call.call_count, int(rejected > 0))
+            self.assertEqual(gdn_call.call_count, int(rejected > 0))
+            if rejected:
+                self.assertEqual(conv_call.call_args.args[1].shape[0], rejected)
+                self.assertEqual(gdn_call.call_args.args[5].shape[0], rejected)
         actual = cache._read_state(0, cache.acquire([20, 10, 30]))
         for index, (conv, rec) in enumerate(expected):
             torch.testing.assert_close(actual.conv_state[index], conv)
             torch.testing.assert_close(actual.recurrent_state[index], rec)
+            if counts[index] == (4, 3)[index]:
+                self.assertTrue(torch.equal(actual.conv_state[index], conv))
+                self.assertTrue(torch.equal(actual.recurrent_state[index], rec))
         self.assertTrue(torch.all(actual.conv_state[2] == 19))
         self.assertTrue(torch.all(actual.recurrent_state[2] == 23))
 

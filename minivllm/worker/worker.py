@@ -865,9 +865,10 @@ class Worker:
             )
             if output[seq_id].num_computed_tokens < len(draft_tokens) + 1
         }
+        replayed_requests = 0
         if partially_accepted:
             assert self.hybrid_cache is not None and input_metadata.gdn_replay is not None
-            input_metadata.gdn_replay.commit(
+            replayed_requests = input_metadata.gdn_replay.commit(
                 self.hybrid_cache,
                 {seq_id: output[seq_id].num_computed_tokens
                  for seq_id in input_metadata.speculative_seq_ids},
@@ -878,8 +879,7 @@ class Worker:
             profile.mark("state_replay")
             profile.counts(
                 rejected_requests=len(partially_accepted),
-                replayed_requests=(len(input_metadata.speculative_seq_ids)
-                                   if partially_accepted else 0),
+                replayed_requests=replayed_requests,
             )
         if self._should_attach_dspark_drafts():
             self._attach_dspark_drafts(output, seq_group_metadata_list)
