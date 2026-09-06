@@ -210,6 +210,7 @@ class Worker:
             )
             - self._get_draft_probability_reserve()
             - self._get_verification_logits_reserve()
+            - self._get_linear_tuning_reserve()
         )
         if usable_cache_memory <= 0:
             state_gib = state_cache_size / (1024 ** 3)
@@ -225,6 +226,7 @@ class Worker:
                 f"GDN replay={self._get_gdn_replay_reserve() / (1024 ** 3):.2f} GiB, "
                 f"DSpark={draft_gib:.2f} GiB, "
                 f"verification logits={self._get_verification_logits_reserve() / (1024 ** 3):.2f} GiB "
+                f"Linear scratch={self._get_linear_tuning_reserve() / (1024 ** 3):.2f} GiB "
                 f"for max_num_seqs="
                 f"{self.scheduler_config.max_num_seqs}. Reduce "
                 "--max-num-seqs or the speculative width."
@@ -235,6 +237,20 @@ class Worker:
 
         set_random_seed(self.model_config.seed)
         return num_gpu_blocks, num_cpu_blocks
+
+    def _get_linear_tuning_reserve(self) -> int:
+        # Prefill profiling may not exercise the tuned small-M split-K path.
+        # Projections run sequentially, so reserve one largest scratch, not
+        # one per layer (8 FP32 partial matrices of at most 64 x 5120).
+        if (self.model_config.dtype != torch.bfloat16
+                or torch.cuda.get_device_capability() != (8, 0)):
+            return 0
+        for module in self.model.modules():
+            if (hasattr(module, "weight_scale_inv")
+                    and tuple(module.weight.shape) == (5120, 5120)
+                    and tuple(module.weight_block_size) == (128, 128)):
+                return 8 * 64 * 5120 * 4
+        return 0
 
     def _get_gdn_replay_reserve(self) -> int:
         num_layers = self.model_config.architecture.num_linear_attention_layers

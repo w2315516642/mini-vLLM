@@ -10,6 +10,16 @@ import triton
 import triton.language as tl
 
 
+def linear_launch_config(m, n, k, dtype, capability, block_size):
+    """Keep the SM80 tuning limited to measured BF16 verification shapes."""
+    if (capability == (8, 0) and dtype == torch.bfloat16
+            and (n, k) == (5120, 5120) and tuple(block_size) == (128, 128)
+            and m in (32, 48, 64)):
+        return (32, 64, 32, 8, 4, 2)
+    return (min(128, max(16, triton.next_power_of_2(m))), 64, 32,
+            8 if m <= 16 and k >= 1024 else 1, 4, 1)
+
+
 @triton.jit
 def _e4m3fn_to_float(bits):
     # Software decoding avoids emitting FP8 conversion instructions unavailable
@@ -117,12 +127,9 @@ def fp8_linear(input_, weight, scale, block_size, bias=None, out=None, *,
     y = torch.empty(shape, dtype=input_.dtype, device=input_.device) if out is None else out
     if m == 0:
         return y
-    split = 8 if m <= 16 and k >= 1024 else 1
-    tm = min(128, max(16, triton.next_power_of_2(m)))
-    tn, tk = 64, 32
-    warps, stages = 4, 1
-    # Benchmark-only override. Runtime keeps the existing deterministic choice
-    # until candidate configurations have been measured on the deployment GPU.
+    tm, tn, tk, split, warps, stages = linear_launch_config(
+        m, n, k, x.dtype, torch.cuda.get_device_capability(x.device), block_size)
+    # Explicit benchmark overrides do not change the runtime dispatch policy.
     if _launch_config is not None:
         tm, tn, tk, split, warps, stages = _launch_config
         if (tm not in (16, 32, 64, 128) or tn not in (32, 64, 128)

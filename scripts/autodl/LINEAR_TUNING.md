@@ -1,6 +1,10 @@
 # FP8 Linear launch configuration scan
 
-This scan does not change runtime defaults or dequantize the resident model.
+The scan does not modify runtime policy or dequantize the resident model.
+Runtime now selects `(32,64,32,8,4,2)` for SM80 BF16 128x128-block weights
+of shape N=K=5120 at M=32,48,64, based on the A800 scan. All other shapes keep
+their previous configuration, including M=16 and unmeasured tails such as M=62.
+The worker reserves up to 10 MiB for this split-K scratch when applicable.
 It compares candidate fused kernels with the current fused runtime, not with
 the slower dequantize-plus-GEMM reference used by the normal operator benchmark.
 All candidates are compiled and checked against that numerical reference before

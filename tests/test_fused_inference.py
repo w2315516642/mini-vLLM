@@ -19,8 +19,62 @@ from minivllm.model_executor.layers.gated_delta_net_cuda import (
 RUN = os.environ.get("MINIVLLM_RUN_FUSED_TESTS") == "1" and torch.cuda.is_available()
 
 
+class LinearTuningPolicyTest(unittest.TestCase):
+    def test_only_measured_sm80_shapes_use_new_policy(self):
+        from minivllm.model_executor.layers.fp8_linear import linear_launch_config
+        for m in (32, 48, 64):
+            self.assertEqual(linear_launch_config(m, 5120, 5120, torch.bfloat16,
+                                                 (8, 0), (128, 128)),
+                             (32, 64, 32, 8, 4, 2))
+        for m, n, dtype, cap, block in (
+            (62, 5120, torch.bfloat16, (8, 0), (128, 128)),
+            (64, 17408, torch.bfloat16, (8, 0), (128, 128)),
+            (64, 5120, torch.float16, (8, 0), (128, 128)),
+            (64, 5120, torch.bfloat16, (8, 9), (128, 128)),
+            (64, 5120, torch.bfloat16, (8, 0), (64, 64)),
+        ):
+            self.assertEqual(linear_launch_config(m, n, 5120, dtype, cap, block),
+                             (64, 64, 32, 1, 4, 1))
+        self.assertEqual(linear_launch_config(16, 5120, 5120, torch.bfloat16,
+                                             (8, 0), (128, 128)),
+                         (16, 64, 32, 8, 4, 1))
+
+    def test_scratch_reserved_only_for_matching_modules(self):
+        from minivllm.worker.worker import Worker
+        module = SimpleNamespace(weight=torch.empty(5120, 5120, device="meta"),
+                                 weight_scale_inv=True, weight_block_size=(128, 128))
+        worker = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16),
+                                 model=SimpleNamespace(modules=lambda: [module]))
+        with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+            self.assertEqual(Worker._get_linear_tuning_reserve(worker), 10 * 2**20)
+        with patch("torch.cuda.get_device_capability", return_value=(8, 9)):
+            self.assertEqual(Worker._get_linear_tuning_reserve(worker), 0)
+
+
 @unittest.skipUnless(RUN, "enable MINIVLLM_RUN_FUSED_TESTS on CUDA")
 class FusedLinearTest(unittest.TestCase):
+    def test_tuned_runtime_shape_and_graph(self):
+        from minivllm.model_executor.layers.fp8_linear import fp8_linear
+        torch.manual_seed(486)
+        w = torch.randn(5120, 5120, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.rand(40, 40, device="cuda") * .02
+        reference_weight = dequantize_fp8_block_weight(w, scales, (128, 128), torch.bfloat16)
+        # Exercise SM80 dispatch on the local GPU as well; hardware performance
+        # is evaluated separately on A800, not inferred from this test.
+        with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+            for m in (32, 48, 64):
+                x = torch.randn(m, 5120, device="cuda", dtype=torch.bfloat16)
+                actual = fp8_linear(x, w, scales, (128, 128))
+                torch.testing.assert_close(actual, F.linear(x, reference_weight),
+                                           rtol=2e-2, atol=3e-2)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = fp8_linear(x, w, scales, (128, 128))
+            x.normal_()
+            graph.replay()
+            torch.testing.assert_close(actual, F.linear(x, reference_weight),
+                                       rtol=2e-2, atol=3e-2)
+
     def test_tuning_configs_match_reference_on_strided_tail_shapes(self):
         from benchmarks.benchmark_fused_inference import linear_candidates
         from minivllm.model_executor.layers.fp8_linear import fp8_linear
