@@ -44,14 +44,12 @@ def prepare_gated_delta_qk(
 
     query_fp32 = query.float()
     key_fp32 = key.float()
-    query_fp32 = query_fp32 / query_fp32.norm(
-        dim=-1,
-        keepdim=True,
-    ).clamp_min(eps)
-    key_fp32 = key_fp32 / key_fp32.norm(
-        dim=-1,
-        keepdim=True,
-    ).clamp_min(eps)
+    # Qwen/FLA puts epsilon inside the square root; clamp_min(norm, eps)
+    # changes small projected vectors substantially, despite both being finite.
+    query_fp32 = query_fp32 * torch.rsqrt(
+        query_fp32.square().sum(dim=-1, keepdim=True) + eps)
+    key_fp32 = key_fp32 * torch.rsqrt(
+        key_fp32.square().sum(dim=-1, keepdim=True) + eps)
     query_fp32 = query_fp32 * (query.shape[-1] ** -0.5)
     return (
         query_fp32.to(query.dtype).contiguous(),

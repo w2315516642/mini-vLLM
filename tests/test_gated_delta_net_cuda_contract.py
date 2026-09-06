@@ -46,6 +46,14 @@ class _FakeGatedDeltaNetOps:
 
 
 class GatedDeltaNetCudaWrapperTest(unittest.TestCase):
+    def test_prepare_qk_adds_epsilon_to_squared_norm_near_zero(self):
+        query = torch.tensor([[[1e-4, 0.0], [0.0, 0.0]]])
+        actual_q, actual_k = gdn_cuda.prepare_gated_delta_qk(query, query)
+        expected_k = query / torch.sqrt(torch.tensor([[[1.01e-6], [1e-6]]]))
+        torch.testing.assert_close(actual_k, expected_k)
+        torch.testing.assert_close(actual_q, expected_k / (2 ** 0.5))
+        self.assertLess(actual_k[0, 0, 0].item(), 0.1)
+
     def test_prepare_qk_matches_fp32_normalization_and_query_scale(self):
         torch.manual_seed(61)
         query = torch.randn(2, 3, 4, 5, dtype=torch.float16)
@@ -58,15 +66,11 @@ class GatedDeltaNetCudaWrapperTest(unittest.TestCase):
 
         query_fp32 = query.float()
         key_fp32 = key.float()
-        expected_query = query_fp32 / query_fp32.norm(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-6)
+        expected_query = query_fp32 * torch.rsqrt(
+            query_fp32.square().sum(dim=-1, keepdim=True) + 1e-6)
         expected_query *= query.shape[-1] ** -0.5
-        expected_key = key_fp32 / key_fp32.norm(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-6)
+        expected_key = key_fp32 * torch.rsqrt(
+            key_fp32.square().sum(dim=-1, keepdim=True) + 1e-6)
         torch.testing.assert_close(actual_query, expected_query.half())
         torch.testing.assert_close(actual_key, expected_key.half())
         self.assertTrue(actual_query.is_contiguous())

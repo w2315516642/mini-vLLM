@@ -188,11 +188,9 @@ def recurrent_gated_delta_rule_reference(
     key = key.float()
     value = value.float()
 
-    q_norm = torch.norm(query, dim=-1, keepdim=True).clamp_min(eps)
-    k_norm = torch.norm(key, dim=-1, keepdim=True).clamp_min(eps)
-
-    query = query / q_norm
-    key = key / k_norm
+    # Match Qwen's additive epsilon in the squared L2 norm, including near zero.
+    query = query * torch.rsqrt(query.square().sum(dim=-1, keepdim=True) + eps)
+    key = key * torch.rsqrt(key.square().sum(dim=-1, keepdim=True) + eps)
 
     query = query * (query.shape[-1] ** (-0.5))
 

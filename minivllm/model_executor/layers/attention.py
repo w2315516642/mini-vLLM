@@ -272,7 +272,11 @@ class PagedAttentionWithRoPE(PagedAttention):
             num_kv_heads=num_kv_heads,
         )
 
-        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2) / rotary_dim))
+        # Build frequencies in FP32: large RoPE bases overflow in FP16 when
+        # model loading temporarily changes the default floating-point dtype.
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        )
         t = torch.arange(max_position).float()
         freqs = torch.einsum('i,j -> ij', t, inv_freq.float())
         cos = freqs.cos()

@@ -761,3 +761,26 @@ python -m scripts.qwen_stage8_smoke --model models/Qwen3.5-0.8B
 - 按用户要求提交当前模型计算、权重加载、运行时接线、测试和 smoke 脚本，作为阶段 8 的进度保存点，不是阶段完成提交。
 - 阶段状态更新为“待验收”；最近一次完整测试为 142/142 通过，之后仅清理模型文件行尾空白和更新此记录。
 - 讲义保持忽略，不纳入提交。进入阶段 9 FP8 前，仍需完整小模型 logits 对照和真实检查点 prefill/decode、连续请求状态释放验证。
+
+### 2026-09-07：WSL 完整数值与真实模型验收
+
+- 本轮基于 `codex/qwen38-learning` 的 `ffeaa00` 运行；环境为 WSL2 Ubuntu、Conda `mini-vllm`、PyTorch 2.11.0+cu128、Transformers 5.7.0、RTX 4070 Laptop 8 GB。沿用既有 CUDA 扩展，未重编译、未安装依赖，使用已存在的 `models/Qwen3.5-0.8B`。
+- 新增 `tests/test_qwen_stage8_logits.py`：独立 Transformers 四层 hybrid 模型提供 FP32 全序列 logits，权重先量化到对应目标精度；mini-vLLM 使用真实投影、CUDA GDN/Attention 和 HybridCache，在 FP16/BF16 下执行 prefill + 三步 decode。prompt 长度为 1、5、67，各自释放槽位后重复执行一次；TP=1 的 rank/world-size 查询是唯一替身，不替换计算算子。
+- 对照发现并修正两个数值问题：Q/K L2 normalization 对齐目标模型的 `sqrt(sum(x*x) + eps)`，而非 `clamp_min(norm, eps)`；RoPE 频率明确以 FP32 构建，避免默认 FP16 下 `rope_theta=10000000` 溢出使多数逆频率归零。增加近零 Q/K 与低精度默认 dtype 下的 RoPE cache 回归测试。未修改学习者的 model forward、CUDA kernel、read/write 缓存热路径。
+- smoke 首次运行发现 Transformers 5.7 的 chat template 返回 BatchEncoding，与 `prompt_token_ids` 要求的列表不符；脚本显式传入 `return_dict=False` 后通过。
+- 独立 logits 对照通过：FP16 最大绝对误差 `0.000376225`，阈值 `rtol=0.003, atol=0.001`；BF16 最大绝对误差 `0.00271037`，阈值 `rtol=0.03, atol=0.006`。每组槽位复用后的 logits 完全一致。
+- 真实 BF16 小模型两次 greedy 生成均以 `The capital of France is **Paris**.` 开头；各生成 32 tokens，两次 token ID 完全一致，每次结束后 active state slots 为 0。仅验证该 prompt 的单请求端到端与复用行为，不是大模型性能或质量评测。
+- 所有测试开关开启，完整回归 **145/145 通过，无跳过**。`git diff --check` 通过，仅有 Windows LF/CRLF 提示；讲义已确认被忽略。Transformers 提示缺少 FLA/causal-conv1d fast path，本次独立 oracle 正是使用其 PyTorch 实现；mini-vLLM CUDA 测试实际执行，没有被替换或跳过。
+- 阶段 8 的自动化数值与真实模型运行门槛已通过，保留“待验收”状态等待收尾；本轮未 commit/push，未开始阶段 9。TP、多请求、FP8、27B、MTP 和多模态仍不在本轮验证范围。
+
+本轮在 WSL 项目根目录的复现命令（使用指定 Conda Python）：
+
+```bash
+OMP_NUM_THREADS=4 PYTHONPATH=tests \
+  MINIVLLM_RUN_CUDA_GDN_TESTS=1 MINIVLLM_RUN_CUDA_GQA_TESTS=1 \
+  MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 MINIVLLM_RUN_QWEN_LOGITS_TESTS=1 \
+  /home/yue/miniconda3/envs/mini-vllm/bin/python -m unittest discover -s tests -v
+
+OMP_NUM_THREADS=4 /home/yue/miniconda3/envs/mini-vllm/bin/python \
+  -m scripts.qwen_stage8_smoke --model models/Qwen3.5-0.8B
+```

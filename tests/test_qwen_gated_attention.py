@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from minivllm.model_executor.layers.layer_norm import Qwen3_5RMSNorm
+from minivllm.model_executor.layers.attention import PagedAttentionWithRoPE
 from minivllm.model_executor.models import qwen3_5 as qwen_module
 from minivllm.model_executor.models.qwen3_5 import (
     Qwen3_5Attention,
@@ -45,6 +46,29 @@ class RecordingPagedAttention(nn.Module):
         self.rotary_dim = rotary_dim
         self.max_position = max_position
         self.base = base
+
+
+class QwenRoPECacheTest(unittest.TestCase):
+    def test_large_base_uses_fp32_frequencies_under_low_precision_default(self):
+        positions = torch.arange(128, dtype=torch.float32)
+        inv_freq = 1.0 / (10000000.0 ** (torch.arange(0, 32, 2, dtype=torch.float32) / 32))
+        angles = positions[:, None] * inv_freq[None, :]
+        expected = torch.cat((angles.cos(), angles.sin()), dim=-1)
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                old_dtype = torch.get_default_dtype()
+                try:
+                    torch.set_default_dtype(dtype)
+                    attention = PagedAttentionWithRoPE(
+                        2, 64, 0.125, 32, max_position=128,
+                        base=10000000.0, num_kv_heads=1,
+                    )
+                finally:
+                    torch.set_default_dtype(old_dtype)
+                self.assertEqual(attention.cos_sin_cache.dtype, dtype)
+                torch.testing.assert_close(
+                    attention.cos_sin_cache, expected.to(dtype), rtol=0, atol=0,
+                )
 
 
 class QwenRMSNormTest(unittest.TestCase):

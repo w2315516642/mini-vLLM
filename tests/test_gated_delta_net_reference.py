@@ -31,9 +31,11 @@ def _tiny_config(**overrides):
 
 
 def _manual_delta_step(query, key, value, log_decay, beta, state):
-    query = F.normalize(query.float(), p=2, dim=-1, eps=1e-6)
+    query = query.float()
+    query = query / torch.sqrt(query.square().sum(dim=-1, keepdim=True) + 1e-6)
     query = query * (query.shape[-1] ** -0.5)
-    key = F.normalize(key.float(), p=2, dim=-1, eps=1e-6)
+    key = key.float()
+    key = key / torch.sqrt(key.square().sum(dim=-1, keepdim=True) + 1e-6)
     state = state.float() * log_decay.float().exp()[..., None, None]
     old_value = torch.einsum("bhd,bhdv->bhv", key, state)
     delta = (value.float() - old_value) * beta.float()[..., None]
@@ -208,8 +210,8 @@ class RecurrentGatedDeltaRuleTest(unittest.TestCase):
             initial_state
             * log_decay[:, 0].exp()[..., None, None]
         )
-        normalized_query = F.normalize(
-            query[:, 0], p=2, dim=-1, eps=1e-6
+        normalized_query = query[:, 0] / torch.sqrt(
+            query[:, 0].square().sum(dim=-1, keepdim=True) + 1e-6
         ) * (query.shape[-1] ** -0.5)
         expected_output = torch.einsum(
             "bhd,bhdv->bhv",

@@ -26,7 +26,7 @@ def main():
         tokenizer = llm.get_tokenizer()
         prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": args.prompt}], tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=True, return_dict=False,
         )
         if len(prompt_ids) > 256:
             parser.error("The formatted prompt exceeds the 256-token smoke budget")
