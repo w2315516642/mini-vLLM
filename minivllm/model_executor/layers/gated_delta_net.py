@@ -380,6 +380,22 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         )
         return GatedDeltaNetState(conv_state, recurrent_state)
 
+    def _check_input(
+        self,
+        hidden_states: torch.Tensor,
+        state: Optional[GatedDeltaNetState] = None,
+    ) -> None:
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(
+                "hidden_states must have shape [batch, sequence, hidden_size] "
+                f"with hidden_size={self.hidden_size}, "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[0] <= 0:
+            raise ValueError("hidden_states batch dimension must be positive")
+        if state is not None and not isinstance(state, GatedDeltaNetState):
+            raise TypeError("state must be a GatedDeltaNetState or None")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -391,16 +407,7 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         the returned state into a later call must be equivalent to evaluating
         the concatenated sequence in one call.
         """
-        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
-            raise ValueError(
-                "hidden_states must have shape [batch, sequence, hidden_size] "
-                f"with hidden_size={self.hidden_size}, "
-                f"got {tuple(hidden_states.shape)}"
-            )
-        if hidden_states.shape[0] <= 0:
-            raise ValueError("hidden_states batch dimension must be positive")
-        if state is not None and not isinstance(state, GatedDeltaNetState):
-            raise TypeError("state must be a GatedDeltaNetState or None")
+        self._check_input(hidden_states, state)
 
         qkv = self.in_proj_qkv(hidden_states)
         gate = self.in_proj_z(hidden_states)

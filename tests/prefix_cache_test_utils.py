@@ -3,6 +3,7 @@ import sys
 import types
 from enum import Enum, auto
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ def _load_module(name: str, relative_path: str):
     return module
 
 
+@patch.dict(sys.modules)
 def _load_prefix_cache_modules():
     """Load scheduler/cache code without importing CUDA and Ray modules."""
     minivllm = types.ModuleType("minivllm")
@@ -99,6 +101,7 @@ def make_scheduler(max_tokens=32, max_seqs=8, num_gpu_blocks=16):
     return scheduler.Scheduler(scheduler_config, cache_config, log_stats=False)
 
 
+@patch.dict(sys.modules)
 def load_worker_module():
     """Load Worker with small stubs for dependencies unrelated to input prep."""
     configs_config = types.ModuleType("minivllm.configs.config")

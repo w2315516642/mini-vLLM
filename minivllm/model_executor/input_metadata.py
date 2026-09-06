@@ -31,8 +31,12 @@ class InputMetadata:
         cached_prompt_context_lens: Optional[torch.Tensor] = None,
         cached_prompt_block_tables: Optional[torch.Tensor] = None,
         max_cached_prompt_context_len: int = 0,
+        is_profile_run: bool = False,
     ) -> None:
         self.seq_groups = seq_groups
+        self.is_profile_run = is_profile_run
+        # Filled once by the hybrid Worker, then reused by all linear layers.
+        self.state_slot_ids: Optional[torch.Tensor] = None
         self.seq_data = seq_data
         self.prompt_lens = prompt_lens
         self.slot_mapping = slot_mapping

@@ -58,6 +58,9 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+        self.hybrid_cache = None
+        self.hybrid_seq_id = None
+        self.hybrid_num_computed = 0
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -90,13 +93,21 @@ class Worker:
             seqs.append(seq)
 
         input_tokens, input_positions, input_metadata = self._prepare_inputs(seqs)
+        input_metadata.is_profile_run = True
         num_layers = self.model_config.get_num_layers(self.parallel_config)
+        profile_caches = [(None, None)] * num_layers
+        hybrid_kwargs = {}
+        if self.model_config.architecture.num_linear_attention_layers:
+            self.hybrid_cache = self._make_hybrid_cache(profile_caches)
+            self._prepare_hybrid_state(seqs, input_metadata)
+            hybrid_kwargs["hybrid_cache"] = self.hybrid_cache
         self.model(
             input_ids=input_tokens,
             positions=input_positions,
-            kv_caches=[(None, None)] * num_layers,
+            kv_caches=profile_caches,
             input_metadata=input_metadata,
-            cache_events=None
+            cache_events=None,
+            **hybrid_kwargs,
         )
 
         # Calculate the number of blocks that can be allocated with the
@@ -112,6 +123,10 @@ class Worker:
         num_gpu_blocks = int((total_gpu_memory * gpu_memory_utilization
                               - peak_memory) // cache_block_size)
         num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+        self.hybrid_cache = None
+        hybrid_kwargs.clear()
+        self.hybrid_seq_id = None
+        self.hybrid_num_computed = 0
         torch.cuda.empty_cache()
 
         set_random_seed(self.model_config.seed)
@@ -125,6 +140,48 @@ class Worker:
         )
         self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
+        if self.model_config.architecture.num_linear_attention_layers:
+            self.hybrid_cache = self._make_hybrid_cache(self.gpu_cache)
+
+    def _make_hybrid_cache(self, kv_caches):
+        from minivllm.worker.hybrid_cache import HybridCache, GatedDeltaNetStateSpec
+        architecture = self.model_config.architecture
+        # Profiling uses empty KV placeholders; actual allocation follows later.
+        full_caches = {
+            i: (kv if kv[0] is not None else
+                (torch.empty(0, device="cuda"), torch.empty(0, device="cuda")))
+            for i, kv in enumerate(kv_caches)
+            if architecture.layer_types[i] == "full_attention"
+        }
+        return HybridCache(
+            architecture.layer_types, full_caches,
+            GatedDeltaNetStateSpec.from_text_config(architecture.text_config),
+            self.scheduler_config.max_num_seqs, device="cuda",
+        )
+
+    def _prepare_hybrid_state(self, metadata_list, input_metadata) -> None:
+        """Resolve a single request once on the CPU, before per-layer execution."""
+        if len(metadata_list) != 1 or len(metadata_list[0].seq_data) != 1:
+            raise ValueError("Stage 8 hybrid execution requires one sequence")
+        metadata = metadata_list[0]
+        seq_id = next(iter(metadata.seq_data))
+        start = metadata.num_computed_tokens[seq_id]
+        if metadata.is_prompt:
+            if start != 0:
+                raise ValueError("Hybrid prefix/chunk continuation is not enabled yet")
+            # Also handles recompute: its prompt must start from zero GDN state.
+            self.release_hybrid_state()
+        elif seq_id != self.hybrid_seq_id or start != self.hybrid_num_computed:
+            raise ValueError("Hybrid decode has no matching preceding state")
+        input_metadata.state_slot_ids = self.hybrid_cache.acquire([seq_id])
+        self.hybrid_seq_id = seq_id
+        self.hybrid_num_computed = start + metadata.num_scheduled_tokens[seq_id]
+
+    def release_hybrid_state(self) -> None:
+        if self.hybrid_cache is not None and self.hybrid_seq_id is not None:
+            self.hybrid_cache.release([self.hybrid_seq_id])
+        self.hybrid_seq_id = None
+        self.hybrid_num_computed = 0
 
     def _prepare_inputs(
         self,
@@ -271,6 +328,10 @@ class Worker:
         blocks_to_copy: Dict[int, List[int]],
     ) -> Dict[int, SequenceOutputs]:
         # Issue cache operations.
+        if self.hybrid_cache is not None and (
+            blocks_to_swap_in or blocks_to_swap_out or blocks_to_copy
+        ):
+            raise ValueError("Hybrid swap/beam copy is not enabled in stage 8")
         issued_cache_op = False
         if blocks_to_swap_in:
             self.cache_engine.swap_in(blocks_to_swap_in)
@@ -297,6 +358,10 @@ class Worker:
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list=seq_group_metadata_list)
+        hybrid_kwargs = {}
+        if self.hybrid_cache is not None:
+            self._prepare_hybrid_state(seq_group_metadata_list, input_metadata)
+            hybrid_kwargs["hybrid_cache"] = self.hybrid_cache
         
         # Execute the model.
         # output: List[int (seq_id), SequenceOutputs]
@@ -306,6 +371,7 @@ class Worker:
             kv_caches=self.gpu_cache,
             input_metadata=input_metadata,
             cache_events=cache_events,
+            **hybrid_kwargs,
         )
         return output
 

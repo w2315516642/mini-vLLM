@@ -199,6 +199,7 @@ class GQAIntegrationTest(unittest.TestCase):
             get_num_layers=lambda parallel_config: 3,
             get_num_heads=lambda parallel_config: 8,
             get_num_kv_heads=lambda parallel_config: 2,
+            architecture=SimpleNamespace(num_linear_attention_layers=0),
         )
         parallel_config = SimpleNamespace(tensor_parallel_size=1)
 

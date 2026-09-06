@@ -81,6 +81,18 @@ class LLMEngine:
     def _verify_args(self) -> None:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
+        self.is_hybrid = self.model_config.architecture.num_linear_attention_layers > 0
+        if self.is_hybrid:
+            if self.parallel_config.world_size != 1:
+                raise ValueError("Stage 8 hybrid inference requires TP=1 and PP=1")
+            if self.scheduler_config.max_num_seqs != 1:
+                raise ValueError("Stage 8 hybrid inference requires max_num_seqs=1")
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError("Hybrid prefix caching requires GDN snapshots (stage 12)")
+            root = self.model_config.architecture.root_config
+            text = self.model_config.architecture.text_config
+            if getattr(root, "quantization_config", None) or getattr(text, "quantization_config", None):
+                raise ValueError("Stage 8 requires unquantized floating-point weights")
 
     def _init_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
@@ -98,6 +110,8 @@ class LLMEngine:
         # operators can be applied to all workers.
         num_gpu_blocks = min(b[0] for b in num_blocks)
         num_cpu_blocks = min(b[1] for b in num_blocks)
+        if num_gpu_blocks <= 0:
+            raise ValueError("No GPU KV blocks fit after profiling model and runtime state")
         # Log
         logger.info(f'# GPU blocks: {num_gpu_blocks}, '
                     f'# CPU blocks: {num_cpu_blocks}')
@@ -186,6 +200,11 @@ class LLMEngine:
         """
         if arrival_time is None:
             arrival_time = time.time()
+        if self.is_hybrid:
+            if self.has_unfinished_requests():
+                raise ValueError("Stage 8 accepts one outstanding hybrid request")
+            if sampling_params.best_of != 1 or sampling_params.use_beam_search:
+                raise ValueError("Stage 8 hybrid requests require best_of=1 without beam search")
         if prompt_token_ids is None:
             assert prompt is not None
             prompt_token_ids = self.tokenizer.encode(prompt)
@@ -215,6 +234,8 @@ class LLMEngine:
     def abort_request(self, request_id: str) -> None:
         """Aborts a request with the given ID."""
         self.scheduler.abort_seq_group(request_id)
+        if self.is_hybrid and not self.has_unfinished_requests():
+            self._run_workers("release_hybrid_state")
 
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
@@ -283,7 +304,9 @@ class LLMEngine:
         self._stop_sequences(seq_groups)
         # Free the finished sequence groups.
         self.scheduler.free_finished_seq_groups()
-        
+        if self.is_hybrid and not self.has_unfinished_requests():
+            self._run_workers("release_hybrid_state")
+
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
         for seq_group in seq_groups:
@@ -302,7 +325,8 @@ class LLMEngine:
                     skip_special_tokens=True,
                 )
                 seq.output_tokens.append(new_token)
-                seq.output_text += new_output_text
+                # The tokenizer helper returns the entire generated text so far.
+                seq.output_text = new_output_text
 
     def _stop_sequences(self, seq_groups: List[SequenceGroup]) -> None:
         """Stop the finished sequences."""

@@ -1,10 +1,11 @@
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import torch
 
 from minivllm import cache_ops
 from minivllm.configs import CacheConfig, ModelConfig, ParallelConfig
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+# Linear layers keep their global index but do not own paged KV tensors.
+KVCache = Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
 
 class CacheEngine:
     """Manages the KV cache.
@@ -26,6 +27,7 @@ class CacheEngine:
 
         self.head_size = model_config.get_head_size() 
         self.num_layers = model_config.get_num_layers(parallel_config)
+        self.layer_types = model_config.architecture.layer_types
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.dtype = model_config.dtype
 
@@ -64,7 +66,10 @@ class CacheEngine:
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
-        for _ in range(self.num_layers):
+        for layer_idx in range(self.num_layers):
+            if self.layer_types[layer_idx] == "linear_attention":
+                gpu_cache.append((None, None))
+                continue
             key_block = torch.empty(
                 # 申请 num_gpu_blocks 个 block
                 # NOTE: 这里假设每个block形状固定
@@ -84,16 +89,19 @@ class CacheEngine:
         cpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
-        for _ in range(self.num_layers):
+        for layer_idx in range(self.num_layers):
+            if self.layer_types[layer_idx] == "linear_attention":
+                cpu_cache.append((None, None))
+                continue
             key_block = torch.empty(
-                # 申请 num_gpu_blocks 个 block
+                # CPU capacity is independent of the profiled GPU block count.
                 # NOTE: 这里假设每个block形状固定
-                size=(self.num_gpu_blocks, *key_block_shape),
+                size=(self.num_cpu_blocks, *key_block_shape),
                 dtype=self.dtype,
                 pin_memory=True
             )
             value_block = torch.empty(
-                size=(self.num_gpu_blocks, *value_block_shape),
+                size=(self.num_cpu_blocks, *value_block_shape),
                 dtype=self.dtype,
                 pin_memory=True
             )
@@ -108,6 +116,8 @@ class CacheEngine:
     ) -> None:
         with torch.cuda.stream(self.cache_stream):
             for i in range(self.num_layers):
+                if self.layer_types[i] == "linear_attention":
+                    continue
                 src_key_cache, src_value_cache = src[i]
                 dst_key_cache, dst_value_cache = dst[i]
                 # Copy the key blocks
@@ -127,8 +137,8 @@ class CacheEngine:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
-        value_caches = [value_cache for _, value_cache in self.gpu_cache]
+        key_caches = [key for key, _ in self.gpu_cache if key is not None]
+        value_caches = [value for _, value in self.gpu_cache if value is not None]
         # NOTE(by original author woosuk): 
         # This operation implicitly synchronizes the CPU and GPU.
         cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
@@ -141,6 +151,8 @@ class CacheEngine:
     ) -> int:
         head_size = model_config.get_head_size() 
         num_layers = model_config.get_num_layers(parallel_config)
+        if model_config.architecture.num_linear_attention_layers:
+            num_layers = model_config.architecture.num_full_attention_layers
         num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         # Size of key cache in bytes.

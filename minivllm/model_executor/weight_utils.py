@@ -31,7 +31,7 @@ def hf_model_weights_iterator(
         with lock:
             hf_loader = snapshot_download(
                 model_name_or_path,
-                allow_patterns="*.bin",
+                allow_patterns=["*.safetensors", "*.bin"],
                 cache_dir=cache_dir,
                 tqdm_class=Disabledtqdm)
     else:
@@ -39,10 +39,24 @@ def hf_model_weights_iterator(
     
     hf_bin_files = glob.glob(os.path.join(hf_loader, "*.bin"))
 
+    # Modern Qwen checkpoints use safetensors, sometimes split across shards.
+    hf_safe_files = sorted(glob.glob(os.path.join(hf_loader, "*.safetensors")))
+    if hf_safe_files:
+        if use_np_cache:
+            raise ValueError("use_np_cache is not supported for safetensors")
+        from safetensors import safe_open
+        for filename in hf_safe_files:
+            with safe_open(filename, framework="pt", device="cpu") as reader:
+                for name in reader.keys():
+                    yield name, reader.get_tensor(name)
+        return
+    if not hf_bin_files:
+        raise FileNotFoundError(f"No model weights found in {hf_loader}")
+
     if use_np_cache:
         # Convert the model weights from torch tensors to numpy arrays for
         # faster loading.
-        np_folder = os.path.join(hf_folder, "np")
+        np_folder = os.path.join(hf_loader, "np")
         os.makedirs(np_folder, exist_ok=True)
         weight_names_file = os.path.join(np_folder, "weight_names.json")
         with lock:

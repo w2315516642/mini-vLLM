@@ -22,7 +22,7 @@
 | 5 | Gated DeltaNet 参考实现 | 已完成 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 已完成 |
 | 7 | Hybrid Cache | 已完成 |
-| 8 | 真实小模型端到端推理 | 未开始 |
+| 8 | 真实小模型端到端推理 | 待验收 |
 | 9 | FP8 权重 | 未开始 |
 | 10 | TP=2 与 Qwen3.8-27B | 未开始 |
 | 11 | 连续批处理 | 未开始 |
@@ -659,7 +659,7 @@ Reference 与完整回归：
 - 聚焦结果：HybridCache 28 项、GDN reference 14 项、GDN wrapper contract 7 项，共 49 项全部通过。
 - CUDA 同步检查：read/write 使用 CUDA 索引进行 CUDA Graph 捕获成功，连续两次 replay 正确更新池，未选择槽位保持不变。本用例只验证局部热路径，不代表完整模型 CUDA Graph 接线或吞吐基准。
 - 完整回归：117 项全部执行通过，无跳过；使用已有扩展，没有重新编译。WSL 启动时有已有 localhost 代理提示，不影响测试。
-- 阶段 7 已通过验收并完成收尾；阶段 8 仍保持未开始。
+- 阶段 7 已通过验收并完成收尾，提交为 `a8b65ba`；阶段 8 后续启动记录见下文。
 
 复现命令（WSL 项目根目录）：
 
@@ -682,3 +682,82 @@ PYTHONPATH=tests MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
 - 为什么 beam fork 必须复制 recurrent state，而不能只共享 slot？
 - 为什么 full-attention Prefix Cache 命中不足以证明 hybrid prefix 可以直接跳过？
 - Hybrid Cache、Scheduler 和 GDN kernel 各自拥有哪一部分状态与生命周期？
+
+## 阶段 8：真实小模型端到端推理
+
+### 当前状态与范围
+
+- 2026-09-05 在 `codex/qwen38-learning` 基于阶段 7 提交 `a8b65ba` 准备讲义与作业，状态为“作业进行中”，不是阶段完成。
+- 目标是把已经验收的 Attention、GDN CUDA 和 HybridCache 装配到真实 `LLM -> Engine -> Worker -> Model -> Sampler` 链路。
+- 首次真实检查点验收使用 `Qwen/Qwen3.5-0.8B` 普通浮点权重。已核对其官方 config/权重索引及目标 `Qwen/Qwen3.8-27B` config，二者使用 Qwen3.5 schema；这只是小尺寸验收入口，不替代最终 27B 目标。
+- 本阶段限定 TP=1、PP=1、单个未完成请求、`max_num_seqs=1`、文本输入。FP8、TP、动态批处理、hybrid prefix、调度级 chunked prefill、MTP、视觉/视频分别留在既有后续阶段，不增设阶段。
+
+### 学习者作业
+
+只完成 `minivllm/model_executor/models/qwen3_5.py` 的五处 `TODO(student, stage 8)`，预计自然实现约 180 到 280 行：
+
+1. `Qwen3_5DecoderLayer.__init__`：按全局层类型构造 mixer、MLP 与两个 Qwen RMSNorm。
+2. `Qwen3_5DecoderLayer.forward`：两次 pre-norm/residual；linear 分支读写对应层和请求槽位的状态。
+3. `Qwen3_5GatedDeltaNet.forward`：复用已有参数；单 token 走 CUDA conv/decode，多 token 走 reference conv + CUDA prefill，维护 FP32 state。
+4. `Qwen3_5Model.forward`：在 embedding 前截去 alignment padding，按全局层顺序运行并应用 final norm。
+5. `Qwen3_5ForConditionalGeneration.load_weights_from_iterator`：语言模型权重映射、packed QKV/MLP 分片、共享 embedding 和加载完整性检查。
+
+核心约束：padding 不推进 state；GDN Q/K 只归一化及缩放一次；packed 权重逐分片记录；未知语言模型权重不能静默跳过；read/write 热路径不增加 CUDA 张量值回传校验。建议按上述顺序实现，完成后请求“检查阶段 8”。
+
+### Codex 已准备
+
+- 不跟踪讲义 `docs/qwen38-learning/stage-08-end-to-end.md`：说明完整推理链路、数据维度、实现顺序、权重映射和就近参考链接，已确认被 `.gitignore` 忽略。
+- 模型入口、embedding/lm_head 共享关系、Sampler 委托和 safetensors 分片读取；保留五个明确 TODO，未代写作业。
+- CacheEngine 只为 full layers 分配 paged KV，保留全局层索引；修正 CPU cache 使用 GPU block 数的既有问题。
+- Worker 创建长期 FP32 状态池，在 batch 边界解析请求槽位，接续 decode、重算时归零、完成/取消后释放。显存 profile 包含状态池，通过 `is_profile_run` 阻止向未分配 KV 的占位张量写入。
+- Engine 在启动/请求边界拒绝尚未支持的 hybrid 功能；修正 detokenizer 返回累计文本时重复追加的问题，并补充回归测试。
+- 隔离旧 Prefix Cache 测试的 `sys.modules` 替身，避免假 CacheEngine 污染后续新测试；不修改对应生产模块。
+- `tests/test_qwen_stage8.py` 提供 learner 验收，`tests/test_qwen_stage8_runtime.py` 验证外围接线；`scripts/qwen_stage8_smoke.py` 供作业完成后用本地权重连续执行两次 greedy generate，并验证状态释放。
+
+### 当前验证证据
+
+- 环境：WSL2 Ubuntu 的 `/home/yue/miniconda3/envs/mini-vllm/bin/python`，沿用已编译扩展，没有重新编译或安装依赖。
+- 既有 117 项回归加 11 项 Stage 8 外围测试，共 128 项全部执行通过，无跳过；既有 GDN/GQA/Qwen Attention CUDA 开关全部开启。
+- Stage 8 聚焦基线共 19 个测试方法：11 项外围测试通过，8 个 learner 测试方法仅在保留的 TODO 失败；其中包含子测试，unittest 汇总为 13 个 `NotImplementedError`，没有其他异常。
+- smoke 的 `--help` 导入检查通过；`git diff --check` 通过。尚未下载或执行真实检查点，没有模型端到端通过或性能结论。
+- 完整模型 tiny logits oracle 将在作业可运行后依据安装的 Transformers 版本补充并执行；当前只有模块级 reference 对照，不能替代最终精度验收。
+- 本次仅准备作业，未 commit/push。后续需学习者实现、审查、数值与真实模型验证，再按要求收尾提交。
+
+### 运行命令
+
+在 WSL 项目根目录并激活 `mini-vllm` 环境：
+
+```bash
+# 作业未完成前，只应出现明确的 learner TODO 错误。
+PYTHONPATH=tests python -m unittest discover -s tests -p 'test_qwen_stage8*.py' -v
+
+# 已有回归 + Codex 外围接线，不含尚未完成的 learner 测试。
+PYTHONPATH=tests MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
+  MINIVLLM_RUN_CUDA_GQA_TESTS=1 MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
+  python -m unittest -v \
+  test_gated_delta_net_cuda test_gated_delta_net_cuda_contract \
+  test_gated_delta_net_reference test_gqa test_gqa_cuda test_hybrid_cache \
+  test_model_architecture test_model_registry test_prefix_cache_blocks \
+  test_prefix_cache_scheduler test_prefix_cache_worker \
+  test_qwen_gated_attention test_qwen_gated_attention_cuda test_qwen_stage8_runtime
+
+# 作业和数值测试通过后，使用已有本地普通浮点检查点。
+python -m scripts.qwen_stage8_smoke --model models/Qwen3.5-0.8B
+```
+
+原理验收：说明两次 residual 的依赖关系、padding 对 recurrent state 的影响、两种 slot 的区别、profile 为什么不写 KV、packed 分片完整性，以及不能仅凭 full-attention KV 命中跳过 hybrid 前缀的原因。
+
+### 2026-09-07：计算作业与权重加载进展
+
+- 学习者已实现 Decoder 构造/forward、GDN CUDA forward 和 Model.forward；聚焦测试通过。按用户明确请求，最后的 `load_weights_from_iterator` 改由 Codex 实现，不继续保留为 learner TODO。
+- loader 从本地 Parameter 建立检查点名字到目标参数/分片的映射；复用 QKV helper，MLP 按行段复制，其余参数直接复制。支持语言模型前缀规范化与共享 embedding，逐分片检查缺失、重复及准确形状；检查点提供两个共享别名时必须在目标精度下一致。
+- 不改学习者的 forward、CUDA kernel 或缓存热路径；没有新增框架抽象。检查只在权重加载时执行。
+- 扩充权重测试覆盖 GDN、两种 Norm、MLP 分片、共享/非共享 embedding、本地前缀、dtype 转换、别名前缀重复、过大 Q 矩阵和缺失项。WSL `mini-vllm` 环境下权重测试 9/9，完整回归 142/142 全部执行通过，无跳过；沿用已有扩展，没有重新编译。
+- `git diff --check` 仍提示学习者 forward 中的既有尾随空白，本次未改动这些非 loader 行。讲义第 6.4 节补充实际代码阅读顺序，仍不跟踪。
+- 尚未执行真实模型 smoke，也未补完完整模型 logits oracle；阶段 8 仍未完成最终验收，本轮没有 commit/push。
+
+### 2026-09-07：保存并推送阶段 8 进展
+
+- 按用户要求提交当前模型计算、权重加载、运行时接线、测试和 smoke 脚本，作为阶段 8 的进度保存点，不是阶段完成提交。
+- 阶段状态更新为“待验收”；最近一次完整测试为 142/142 通过，之后仅清理模型文件行尾空白和更新此记录。
+- 讲义保持忽略，不纳入提交。进入阶段 9 FP8 前，仍需完整小模型 logits 对照和真实检查点 prefill/decode、连续请求状态释放验证。

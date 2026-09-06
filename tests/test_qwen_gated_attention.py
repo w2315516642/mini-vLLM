@@ -317,7 +317,7 @@ class QwenAttentionForwardTest(unittest.TestCase):
         hidden_states = torch.tensor([[9.0]])
         key_cache = torch.tensor([1.0])
         value_cache = torch.tensor([2.0])
-        input_metadata = object()
+        input_metadata = SimpleNamespace(is_profile_run=False)
         cache_event = object()
 
         output = attention(
