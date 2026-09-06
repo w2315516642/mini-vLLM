@@ -91,7 +91,8 @@ def _finish_split(Partial, Bias, Y, MN: tl.constexpr, N: tl.constexpr,
     tl.store(Y + i, total, i < MN)
 
 
-def fp8_linear(input_, weight, scale, block_size, bias=None, out=None):
+def fp8_linear(input_, weight, scale, block_size, bias=None, out=None, *,
+               _launch_config=None):
     """Return input @ dequant(weight).T, optionally into a TP output buffer."""
     if input_.device.type != "cuda" or input_.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("Fused FP8 Linear requires CUDA FP16/BF16 inputs")
@@ -119,12 +120,21 @@ def fp8_linear(input_, weight, scale, block_size, bias=None, out=None):
     split = 8 if m <= 16 and k >= 1024 else 1
     tm = min(128, max(16, triton.next_power_of_2(m)))
     tn, tk = 64, 32
+    warps, stages = 4, 1
+    # Benchmark-only override. Runtime keeps the existing deterministic choice
+    # until candidate configurations have been measured on the deployment GPU.
+    if _launch_config is not None:
+        tm, tn, tk, split, warps, stages = _launch_config
+        if (tm not in (16, 32, 64, 128) or tn not in (32, 64, 128)
+                or tk not in (32, 64, 128) or split not in (1, 2, 4, 8)
+                or warps not in (4, 8) or stages not in (1, 2, 3)):
+            raise ValueError("Unsupported FP8 Linear launch configuration")
     partial = torch.empty((split, m, n), device=x.device, dtype=torch.float32) if split > 1 else y
     with torch.cuda.device(input_.device):
         _linear_kernel[(triton.cdiv(m, tm) * triton.cdiv(n, tn), split)](
             x, weight.view(torch.uint8), scale, bias, y, partial, m, n, k,
             *x.stride(), *weight.stride(), *scale.stride(), bn, bk,
-            bias is not None, split, tm, tn, tk, num_warps=4, num_stages=1)
+            bias is not None, split, tm, tn, tk, num_warps=warps, num_stages=stages)
         if split > 1:
             _finish_split[(triton.cdiv(m * n, 256),)](
                 partial, bias, y, m * n, n, split, bias is not None, 256)

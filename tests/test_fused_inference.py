@@ -21,6 +21,24 @@ RUN = os.environ.get("MINIVLLM_RUN_FUSED_TESTS") == "1" and torch.cuda.is_availa
 
 @unittest.skipUnless(RUN, "enable MINIVLLM_RUN_FUSED_TESTS on CUDA")
 class FusedLinearTest(unittest.TestCase):
+    def test_tuning_configs_match_reference_on_strided_tail_shapes(self):
+        from benchmarks.benchmark_fused_inference import linear_candidates
+        from minivllm.model_executor.layers.fp8_linear import fp8_linear
+        torch.manual_seed(485)
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(33, 258, device="cuda", dtype=dtype)[:, ::2]
+            w = torch.randn(65, 129, device="cuda").to(torch.float8_e4m3fn)
+            scales = torch.rand(1, 2, device="cuda") * .02
+            bias = torch.randn(65, device="cuda", dtype=dtype)
+            out = torch.empty(33, 65, device="cuda", dtype=dtype)
+            expected = F.linear(x, dequantize_fp8_block_weight(w, scales, (128, 128), dtype), bias)
+            for config in linear_candidates(33, 129):
+                with self.subTest(dtype=dtype, config=config):
+                    actual = fp8_linear(x, w, scales, (128, 128), bias, out,
+                                        _launch_config=config)
+                    self.assertEqual(actual.data_ptr(), out.data_ptr())
+                    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=3e-2)
+
     def test_shapes_scales_bias_and_output_buffer(self):
         from minivllm.model_executor.layers.fp8_linear import fp8_linear
         torch.manual_seed(481)
