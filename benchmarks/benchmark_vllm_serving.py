@@ -4,9 +4,42 @@ import argparse
 import json
 from pathlib import Path
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from benchmarks.benchmark_utils import WorkItem, prepare_prompts, workload_info
 from benchmarks.streaming_metrics import distribution
+
+
+def run_closed_loop(prompts, concurrency, generate):
+    """Keep at most concurrency HTTP requests in flight, including final drain."""
+    if concurrency < 1 or len(prompts) < concurrency:
+        raise ValueError("Need at least concurrency prompts")
+    rows, events, pending = [], [], {}
+    next_index = 0
+    origin = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        def submit(index):
+            def task():
+                submitted = time.perf_counter() - origin
+                result = generate(prompts[index])
+                return {"request_id": str(index), "submitted_s": submitted,
+                        "finished_s": time.perf_counter() - origin, **result}
+            pending[pool.submit(task)] = index
+
+        while next_index < concurrency:
+            submit(next_index)
+            next_index += 1
+        events.append({"time_s": time.perf_counter() - origin, "inflight": len(pending)})
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                rows.append(future.result())
+                del pending[future]
+                if next_index < len(prompts):
+                    submit(next_index)
+                    next_index += 1
+            events.append({"time_s": time.perf_counter() - origin, "inflight": len(pending)})
+    return sorted(rows, key=lambda r: int(r["request_id"])), time.perf_counter() - origin, events
 
 
 COUNTERS = {
@@ -104,9 +137,12 @@ def main():
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--concurrency", type=int, choices=(1, 16), default=1)
+    parser.add_argument("--framework", choices=("vllm", "mini"), default="vllm")
+    parser.add_argument("--profile", action="store_true", help="Instrumented run, not a performance baseline")
     parser.add_argument("--metrics-settle-seconds", type=float, default=10)
     args = parser.parse_args()
-    if args.count <= 0 or args.metrics_settle_seconds < 0:
+    if args.count < args.concurrency or args.metrics_settle_seconds < 0:
         parser.error("count must be positive and settle time nonnegative")
     out = Path(args.output)
     if out.exists():
@@ -115,7 +151,7 @@ def main():
     prompts = prepare_prompts(tokenizer, args.count, 512, dataset=args.dataset, seed=42)
     if len({tuple(p) for p in prompts}) != args.count:
         raise ValueError("Need count distinct prompts; refusing resampling")
-    warmup = prepare_prompts(tokenizer, 1, 512, synthetic=True, seed=10042)
+    warmup = prepare_prompts(tokenizer, args.concurrency, 512, synthetic=True, seed=10042)
     url = args.url.rstrip("/")
     with requests.Session() as session:
         def get(path):
@@ -131,7 +167,8 @@ def main():
 
         def generate(ids):
             started = time.perf_counter()
-            with session.post(url + "/v1/completions", json={
+            # A session per request avoids sharing mutable Session state across threads.
+            with requests.post(url + "/v1/completions", json={
                 "model": args.model, "prompt": ids, "temperature": 0,
                 "top_p": 1, "top_k": -1, "max_tokens": 128, "ignore_eos": True,
                 "seed": 42, "stream": True, "return_token_ids": True,
@@ -144,13 +181,17 @@ def main():
         get("/health")
         version = get("/version").json()
         for _ in range(2):
-            generate(warmup[0])
+            run_closed_loop(warmup, args.concurrency, generate)
         before = snapshot()
-        rows = []
-        started = time.perf_counter()
-        for i, ids in enumerate(prompts):
-            rows.append({"request_id": str(i), **generate(ids)})
-        elapsed = time.perf_counter() - started
+        if args.profile:
+            response = session.post(url + "/start_profile", timeout=600)
+            response.raise_for_status()
+        try:
+            rows, elapsed, occupancy = run_closed_loop(prompts, args.concurrency, generate)
+        finally:
+            if args.profile:
+                response = session.post(url + "/stop_profile", timeout=600)
+                response.raise_for_status()
         after = snapshot()
     result = {"config": vars(args), "server_version": version,
               "workload": workload_info([WorkItem(str(i), p, 128) for i, p in enumerate(prompts)]),
@@ -158,7 +199,9 @@ def main():
                           for k in ("ttft_ms", "e2e_ms", "tpot_ms")},
               "counters_before": before, "counters_after": after,
               "speculative": counter_delta(before, after, args.mode), "requests": rows,
-              "notes": ["Client HTTP timings include transport overhead; no per-token ITL inferred.",
+              "client_occupancy": occupancy,
+              "notes": ["Client inflight counts are not GPU active batch sizes.",
+                        "Client HTTP timings include transport overhead; no per-token ITL inferred.",
                         "Requires an otherwise idle server; settle delay is not a stats flush barrier.",
                         "Mode is a client assertion, not a complete server configuration attestation."]}
     result["metrics"].update(output_tokens=args.count * 128, measurement_seconds=elapsed,

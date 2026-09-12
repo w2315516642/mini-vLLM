@@ -7,6 +7,8 @@ configure_cuda
 enter_repo
 mode="${BENCH_MODE:-dspark}"
 spec_args=()
+profile_args=()
+if [[ "${PROFILE:-0}" == 1 ]]; then profile_args+=(--profiler-config.profiler cuda); fi
 case "$mode" in
   target) ;;
   dspark)
@@ -17,6 +19,6 @@ esac
 exec env CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID vllm serve "$TARGET_MODEL" \
   --served-model-name target --host 127.0.0.1 --port "${PORT:-8000}" \
   --dtype bfloat16 --tensor-parallel-size 1 --max-model-len 2048 \
-  --max-num-seqs 1 --max-num-batched-tokens 2048 \
+  --max-num-seqs "${BATCH_SIZE:-1}" --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}" \
   --gpu-memory-utilization 0.85 --no-enable-prefix-caching \
-  --generation-config vllm --seed 42 "${spec_args[@]}"
+  --generation-config vllm --seed 42 "${spec_args[@]}" "${profile_args[@]}"
