@@ -13,6 +13,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from benchmarks.benchmark_vllm_serving import COUNTERS
 
 
+class StreamingHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def start_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def send_event(self, data):
+        payload = "[DONE]" if data is None else json.dumps(data)
+        raw = ("data: " + payload + "\n\n").encode()
+        # Frame each event so the HTTP reader can deliver it without waiting
+        # for the full response or a fixed-size buffer to fill.
+        self.wfile.write(f"{len(raw):x}\r\n".encode() + raw + b"\r\n")
+        if data is None:
+            self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+
 def validate_request(data):
     ids = data.get("prompt")
     if (not isinstance(ids, list) or len(ids) != 512
@@ -42,7 +64,7 @@ def main():
     version = {"version": "mini-vllm-benchmark", "environment": environment_info(),
                "config": engine.get_runtime_stats()["config"]}
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(StreamingHandler):
         def log_message(self, *args):
             pass
 
@@ -89,17 +111,11 @@ def main():
                 return
             request_id, answer = uuid.uuid4().hex, queue.Queue()
             commands.put(("add", request_id, ids, answer))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
+            self.start_stream()
             try:
                 while True:
                     data = answer.get(timeout=600)
-                    payload = "[DONE]" if data is None else json.dumps(data)
-                    self.wfile.write(("data: " + payload + "\n\n").encode())
-                    self.wfile.flush()
+                    self.send_event(data)
                     if data is None:
                         break
             except (BrokenPipeError, ConnectionResetError, queue.Empty):

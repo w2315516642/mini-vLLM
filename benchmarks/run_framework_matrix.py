@@ -11,6 +11,19 @@ import sys
 import time
 
 
+def check_port_available(port):
+    # Match the HTTP servers' reuse policy: TIME_WAIT is not a live listener.
+    # listen() also rejects a competing bound socket that uses SO_REUSEADDR.
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+            probe.listen(1)
+        except OSError as exc:
+            raise OSError(f"Cannot reserve 127.0.0.1:{port}; check live listeners with "
+                          f"ss -ltnp 'sport = :{port}'. No unrelated process was stopped.") from exc
+
+
 def stop_owned(process):
     # Each server has a private process group; never kill by executable name.
     try:
@@ -50,8 +63,7 @@ def main():
     cells = list(itertools.product(args.frameworks, args.batches, ("target", "dspark")))
     for round_id in range(1, args.rounds + 1):
         for framework, batch, mode in (cells if round_id % 2 else list(reversed(cells))):
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", args.port))
+            check_port_available(args.port)
             name = f"{framework}-{mode}-b{batch}-r{round_id}"
             env = dict(os.environ, BENCH_MODE=mode, BATCH_SIZE=str(batch), PORT=str(args.port),
                        MAX_NUM_BATCHED_TOKENS="8192", PROFILE=str(int(args.profile)),
