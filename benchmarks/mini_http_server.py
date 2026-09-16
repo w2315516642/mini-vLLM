@@ -149,9 +149,12 @@ def main():
                     rest[0].put(engine.get_runtime_stats()["speculative"])
                 elif kind == "profile":
                     import torch
+                    from minivllm.profiling import set_external_nvtx
                     if rest[0]:
                         torch.cuda.cudart().cudaProfilerStart()
+                        set_external_nvtx(True)
                     else:
+                        set_external_nvtx(False)
                         torch.cuda.synchronize()
                         torch.cuda.cudart().cudaProfilerStop()
                     rest[1].put(True)
@@ -182,6 +185,8 @@ def main():
             answer.put(None)
         raise
     finally:
+        from minivllm.profiling import set_external_nvtx
+        set_external_nvtx(False)
         server.shutdown()
         server.server_close()
         engine._run_workers("close_transfer_engine")

@@ -5,11 +5,21 @@ from functools import wraps
 
 
 _active = False
+_external_active = False
+
+
+def set_external_nvtx(enabled):
+    """Enable annotations for an externally owned capture on the worker thread.
+
+    This does not start/stop CUDA profiling or synchronize the device.
+    """
+    global _external_active
+    _external_active = bool(enabled)
 
 
 @contextmanager
 def nvtx_range(name):
-    if not _active:
+    if not (_active or _external_active):
         yield
         return
     import torch
@@ -25,7 +35,7 @@ def nvtx_function(name):
     def decorate(fn):
         @wraps(fn)
         def wrapped(*args, **kwargs):
-            if not _active:
+            if not (_active or _external_active):
                 return fn(*args, **kwargs)
             shapes = [tuple(x.shape) for x in (*args, *kwargs.values())
                       if hasattr(x, "shape")][:3]
@@ -35,6 +45,11 @@ def nvtx_function(name):
                 label += f" weight={tuple(args[0].weight.shape)}"
             if layer is not None:
                 label += f" layer={layer}"
+            metadata = kwargs.get("input_metadata")
+            if name == "target_model" and metadata is not None:
+                label += (f" B={len(metadata.prompt_seq_ids) + len(metadata.generation_seq_ids)}"
+                          f" M={metadata.num_valid_tokens}"
+                          f" verify_requests={len(metadata.speculative_seq_ids)}")
             with nvtx_range(label):
                 return fn(*args, **kwargs)
         return wrapped
@@ -115,7 +130,8 @@ def capture_worker_step(fn):
     def wrapped(self, *args, **kwargs):
         capture = getattr(self, "_decode_capture", None)
         if capture is None:
-            return fn(self, *args, **kwargs)
+            with nvtx_range("worker_step"):
+                return fn(self, *args, **kwargs)
         output = None
         try:
             output = fn(self, *args, **kwargs)

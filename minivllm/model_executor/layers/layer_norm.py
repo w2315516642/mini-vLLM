@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from minivllm import layernorm_ops
+from minivllm.profiling import nvtx_function
 
 
 class RMSNorm(nn.Module):
@@ -21,6 +22,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    @nvtx_function("rms_norm")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
         layernorm_ops.rms_norm(
@@ -45,6 +47,7 @@ class Qwen3_5RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
+    @nvtx_function("qwen_rms_norm")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
         x_fp32 = x.float()

@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+from minivllm.profiling import nvtx_function
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,7 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    @nvtx_function("rms_norm_gated")
     def forward(
         self,
         hidden_states: torch.Tensor,

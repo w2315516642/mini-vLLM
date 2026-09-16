@@ -622,6 +622,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         decay_input, _ = self.in_proj_a(hidden_states)
         return qkv, gate, beta, decay_input
 
+    @nvtx_function("gdn_core")
     def _run_core(
         self,
         qkv: torch.Tensor,
@@ -916,6 +917,7 @@ class Qwen3_5Model(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    @nvtx_function("target_backbone")
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1311,6 +1313,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         for context, draft_token_id in zip(contexts, draft_token_ids):
             context[0].set_draft_tokens([int(draft_token_id)])
 
+    @nvtx_function("target_model")
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -78,6 +78,14 @@ bash scripts/autodl/benchmark_matrix.sh \
 捕获包含 prefill 和 drain 的短窗口，不是假称“纯稳态 decode”；图中需要选取相同活跃 batch 的 decode 范围。
 上游使用官方 `--profiler-config.profiler cuda` 和 /start_profile、/stop_profile。
 mini 适配器在唯一引擎线程调用 cudaProfilerStart/Stop，仅适用于本脚本的 TP1 本地 worker。
+同时在 /start_profile 到 /stop_profile 之间打开阶段 NVTX，正常性能测量默认关闭。
+在 Nsight 的 mini 主线程 NVTX 行可展开 worker_step、target_model、target_backbone、
+decoder_layer，再查看 linear、qwen_rms_norm、gdn_core、gdn_conv、gdn_prepare_qk、
+gdn_recurrence、rms_norm_gated、full_attention。采样路径还标记 sample_verify、lm_head；
+DSpark 有 draft_context_kv、draft_proposal、draft_model、state_replay 等范围。
+target_model 标记实际 B、有效输入 token 数 M 和验证请求数，decoder_layer 标记 layer。
+这些范围测量 CPU 发射/等待区间，不是纯 GPU 执行时间；父子范围不可相加。
+沿 CUDA API 对应关系查看 GPU kernel 才能核对其执行耗时。上游保留其自带 NVTX。
 采样报告与性能报告严格分目录。nsys 版本、CUDA Graph node tracing 支持须在 AutoDL 验证。
 
 分析顺序：先 target 的 Linear/GDN/Attention/lm_head/空闲间隔，再 DSpark 的 draft/verify/恢复。
