@@ -1,10 +1,11 @@
-"""Run after stage 8 TODOs pass; requires an existing local floating checkpoint."""
+"""Two real text requests against a local floating or stage 9 FP8 checkpoint."""
 import argparse
 from pathlib import Path
 
 import torch
 
 from minivllm.entrypoints.llm import LLM
+from minivllm.model_executor.layers.fp8 import Fp8Linear
 from minivllm.sampling_params import SamplingParams
 
 
@@ -24,6 +25,11 @@ def main():
             enable_prefix_caching=False,
         )
         tokenizer = llm.get_tokenizer()
+        fp8_layers = [module for worker in llm.llm_engine.workers
+                      for module in worker.model.modules() if isinstance(module, Fp8Linear)]
+        if fp8_layers:
+            weight_bytes = sum(m.weight.numel() + m.weight_scale_inv.numel()*4 for m in fp8_layers)
+            print(f"Resident FP8 projections={len(fp8_layers)}, weight/scale bytes={weight_bytes}")
         prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": args.prompt}], tokenize=True,
             add_generation_prompt=True, return_dict=False,
@@ -47,6 +53,9 @@ def main():
             for worker in llm.llm_engine.workers:
                 if worker.hybrid_cache.num_active_slots:
                     raise AssertionError("Completed request retained a hybrid state slot")
+            for module in fp8_layers:
+                if module.weight.dtype != torch.float8_e4m3fn or module.weight_scale_inv.dtype != torch.float32:
+                    raise AssertionError("Inference changed compressed weight/scale dtype")
             print(f"Run {iteration + 1}: {tokens}")
             print(tokenizer.decode(tokens, skip_special_tokens=True))
     finally:

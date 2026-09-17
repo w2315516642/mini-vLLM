@@ -9,7 +9,7 @@
 - 作业验收前不提交阶段完成 commit。
 - Codex 默认只提供概念级提示，不直接覆盖作业实现。
 - 每阶段通过测试和原理问答后，以中文 commit 收口。
-- CUDA 验证使用 `/root/miniconda3/envs/vllm` 环境。
+- 本机 CUDA 验证使用 WSL2 Ubuntu 的 `/home/yue/miniconda3/envs/mini-vllm`；AutoDL 验证使用 `/root/miniconda3/envs/vllm`，不混用两端结果。
 
 ## 阶段状态
 
@@ -22,8 +22,8 @@
 | 5 | Gated DeltaNet 参考实现 | 已完成 |
 | 6 | Gated DeltaNet Kernel（含 Decode 状态更新与 Prefill 分块扫描算子） | 已完成 |
 | 7 | Hybrid Cache | 已完成 |
-| 8 | 真实小模型端到端推理 | 待验收 |
-| 9 | FP8 权重 | 未开始 |
+| 8 | 真实小模型端到端推理 | 已完成 |
+| 9 | FP8 权重 | 已完成（Codex 代实现） |
 | 10 | TP=2 与 Qwen3.8-27B | 未开始 |
 | 11 | 连续批处理 | 未开始 |
 | 12 | Hybrid Prefix Cache | 未开始 |
@@ -784,3 +784,131 @@ OMP_NUM_THREADS=4 PYTHONPATH=tests \
 OMP_NUM_THREADS=4 /home/yue/miniconda3/envs/mini-vllm/bin/python \
   -m scripts.qwen_stage8_smoke --model models/Qwen3.5-0.8B
 ```
+
+### 阶段 8 收尾
+
+- 上述数值修正与完整验收证据已提交为 `1ba6287 修复 Qwen 低精度数值问题并补齐端到端验收`，并按用户要求推送到 `origin/codex/qwen38-learning`。
+- 2026-09-07 用户要求进入下一阶段，阶段 8 标为已完成；计算主体由学习者完成，权重 loader 与外围问题修正由 Codex 完成。结果不扩展成 27B、TP 或 FP8 已验证。
+
+## 阶段 9：FP8 权重
+
+2026-09-18 用户明确要求本阶段跳过自主作业，改由 Codex 完成并讲解实现；下面的职责/TODO 描述保留为原计划，最新进展见本节末尾的实现记录。不增加阶段，也不替代后续 TP/27B 验收。
+
+### 范围与位置
+
+- 保持既定阶段数与顺序，不新增算子阶段。在阶段 8 的真实 loader 与投影调用链上增加 FP8 E4M3FN 权重、FP32 二维 block scale，以及融合反量化/GEMM 的 W8A16 Triton kernel（2026-09-13 按用户要求调整）。
+- 本次核对 [Qwen3.8-27B-FP8 官方配置](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/main/config.json)：`quant_method=fp8`、`fmt=e4m3`、`activation_scheme=dynamic`、`weight_block_size=[128,128]`，含非量化模块列表。只核对格式元数据，未下载权重，也不宣称已经覆盖该检查点所有新版本模型行为。
+- 区分“FP8 检查点”“FP8 权重常驻”和“原生 W8A8 GEMM”。本阶段使用 FP16/BF16 激活，kernel 内对当前 FP8 tile 做 FP32 恢复后转 16 位 dot、FP32 累加；不向显存写出完整浮点权重。独立反量化仅为测试 reference，生产路径不允许拆分 fallback，不声称吞吐提升或峰值显存减半。
+- 仍限定 TP=1、单活跃请求、文本输入。TP=2/27B 属于阶段 10；连续批处理、Hybrid Prefix、Chunked Prefill、MTP、多模态继续保留原阶段，不提前实现。KV/Conv/Recurrent State 的 dtype 和生命周期不变。
+
+### Codex 负责
+
+- 不跟踪讲义 `docs/qwen38-learning/stage-09-fp8-weights.md`：说明启动/逐 token 两条链路、FP8 与整数的区别、block scale 手算、packed 内部分界对齐和存储/计算精度区别，参考资料在对应段落内。
+- 独立 `layers/fp8.py` 接口和 Fp8Linear 参数分配，模型根/文本配置传递，Qwen 投影替换，weight/scale 双重 source coverage。提供可读反量化 reference、仅调用融合入口的 forward、CUDA 元信息校验和 lazy import；`layers/fp8_triton.py` 提供固定 tile launcher，核心 kernel 保留 TODO。原 Decoder/GDN forward 和已有 .cu kernel 不改。
+- 同一 packed 投影只允许一致的量化策略，内部段边界不对齐时明确拒绝；未知语言模型 scale、缺失 scale、重复分片不能被吞掉。先检查整个替换布局，再逐个创建 FP8 参数，避免同时分配第二套完整压缩模型。
+- `tests/test_fp8_weights.py` 提供 reference、存储及 forward 委托测试；`tests/test_fp8_runtime.py` 在 CPU 检查跨 safetensors、scale-first、packed 存储布局，不再依赖 CPU forward。`tests/test_fp8_fused.py` 直接验证 CUDA launcher 与 kernel，不被配置/loader TODO 阻挡。普通浮点模型不进入 learner TODO。
+- 既有阶段 8 的未来功能拒绝测试改为拒绝尚不支持的 AWQ，不再把“所有 FP8 都拒绝”当最终行为；当前有效 FP8 配置仍会停在待实现 TODO。
+
+### 学习者负责
+
+完成 `minivllm/model_executor/layers/fp8.py` 的三处 Python TODO，以及 `minivllm/model_executor/layers/fp8_triton.py` 的一个 kernel TODO，预计自然实现合计约 180 到 300 行：
+
+1. `FP8BlockConfig.from_dict`：解析格式和排除列表，校验二维正整数 block size，不修改原配置。
+2. `FP8BlockConfig.should_quantize`：原始模块名规范化、点分隔前缀匹配、packed 全选或全排除。
+3. `load_fp8_shard`：权重行偏移到 scale 行偏移的转换、dtype/形状/范围检查、有限及正 scale 校验，验证完再写入；错误包含源名字。
+4. `fp8_linear_kernel`：program 负责输出 tile，K 循环内读取 X、FP8 W 和每个 lane 对应的 scale，恢复后 dot/累加；处理 M/N/K mask、非连续 strides 和输出。不改 FP8 常驻 dtype，不分配整张浮点 W 或展开 scale。
+
+建议从配置和排除策略开始，读懂已提供的 3x5 reference，完成 load 后写 kernel；也可以直接开始 kernel，独立测试会构造输入。reference、forward 和 launcher 已由 Codex 提供，不再作为作业。准备好后请求“检查阶段 9”，Codex 默认给提示，不代写核心。
+
+### 2026-09-07 初始基线（拆分方案，历史记录）
+
+- WSL mini-vllm：已有 145 项回归加 6 项新外围测试共 **151 项通过，无跳过**；GDN/GQA/Qwen Attention CUDA 与阶段 8 完整 logits 对照开关全部开启。
+- learner 基线共 16 个测试方法，显式启用 FP8 CUDA 测试；全部停在保留的五处 TODO。由于子测试展开，共记录 47 个 NotImplementedError，0 个断言失败，0 个跳过，无导入、语法或夹具错误。
+- 没有编译、安装新依赖或下载 27B。当前只能说明脚手架可开始，FP8 正确性与真实量化模型运行仍待学习者完成后验证。正式验收还需完整小模型 logits 对照、真实量化检查点 smoke 和常驻权重/临时内存检查；不能用普通浮点阶段 8 的结果替代。
+- 本次未 commit/push；阶段 9 为“作业进行中”，阶段 10 仍未开始。
+
+### 2026-09-13 融合方案基线
+
+- 用户确认不将反量化与 GEMM 拆成两个生产步骤。讲义更新整条调用链并增加 Triton program/tile、GROUP 与 BLOCK 的区别、逻辑转置 W、mask、FP32 恢复后转 16 位 dot 的教学说明；不增加阶段，仍为“作业进行中”。
+- 环境：WSL2 Ubuntu 的 mini-vllm，PyTorch 2.11.0+cu128、Triton 3.6.0、RTX 4070 Laptop GPU。未安装依赖、未编译 C++/CUDA 扩展；直接测试 kernel 时执行 Triton JIT 并触发保留的 `tl.static_assert`。
+- 全部已有 CUDA/logits 和 FP8 CUDA 开关开启：**160 项旧回归/reference/外围通过，无跳过**。15 个 learner 测试方法只在 TODO 失败，子测试共 45 个错误，其中 10 个明确指向 kernel 编译期 TODO；无非预期异常或断言失败。不是融合 kernel 已完成或通过数值验收。
+- 新验收覆盖 decode/prefill、各维尾块、非方形量化组、跨组 tile、非连续 X/W/S、空 batch、大 scale 先乘后 cast、禁止调用拆分 reference/F.linear，以及 warmup 后无完整浮点权重中间分配。分配测试只观测 PyTorch allocator，不替代寄存器 spill/profiler 检查。
+- wrapper 仅检查元信息，不扫描 CUDA 张量值；scale 数值检查仍由启动 loader 负责。不支持的 CPU/FP32 forward 明确报错，不回退到 reference。非连续激活展平时可复制激活，不复制整张反量化权重。
+- 作业通过后仍需完整小模型/真实量化模型验证，测量排除 JIT 后的 decode/prefill 延迟与峰值内存；当前不宣称任何性能收益。本轮未 commit/push，讲义确认仍被忽略。
+
+在 WSL 项目根目录激活 `mini-vllm` 后：
+
+```bash
+PYTHONPATH=tests python -m unittest -v test_fp8_weights.FP8ConfigTest
+PYTHONPATH=tests python -m unittest -v test_fp8_weights.FP8DequantTest
+PYTHONPATH=tests python -m unittest -v test_fp8_weights.FP8StorageTest
+PYTHONPATH=tests MINIVLLM_RUN_CUDA_FP8_TESTS=1 \
+  python -m unittest -v test_fp8_weights test_fp8_runtime test_fp8_fused
+
+# 只测试融合 kernel，不需要先完成配置/loader。
+PYTHONPATH=tests MINIVLLM_RUN_CUDA_FP8_TESTS=1 \
+  python -m unittest -v test_fp8_fused.FP8FusedKernelTest
+
+# Codex 外围接线，不调用 learner 实现，当前应全通过。
+PYTHONPATH=tests python -m unittest -v test_fp8_runtime.FP8PlumbingTest
+
+# 作业完成后的完整验收，所有 CUDA 和独立 logits 对照均启用。
+OMP_NUM_THREADS=4 PYTHONPATH=tests MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
+  MINIVLLM_RUN_CUDA_GQA_TESTS=1 MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
+  MINIVLLM_RUN_QWEN_LOGITS_TESTS=1 MINIVLLM_RUN_CUDA_FP8_TESTS=1 \
+  python -m unittest discover -s tests -v
+```
+
+原理验收：scale 的乘除方向、ceil scale shape、packed 分界约束、逐 source 的双重覆盖、量化组与 GEMM tile 的区别、[N,K] W 的逻辑转置、W8A16 与 W8A8 的区别，以及启动校验和热路径的边界。讲义提供逐项引导，不要求一口气读完整个 loader。
+
+### 2026-09-18：代实现过程
+
+1. 补齐配置与加载：解析 E4M3 block 格式和排除列表，统一原始模块名前缀；packed 投影只允许统一量化策略。`load_fp8_shard` 把权重行偏移换算为 scale 行偏移，先验证再复制；数值扫描只在加载时执行。
+2. 补齐融合 kernel：固定 `BLOCK_M/N/K=16/32/32`，K 循环内读取 FP8 W 与对应 block scale，FP32 恢复后转 FP16/BF16 执行 dot，FP32 累加。处理尾块和非连续 strides；无整张浮点权重或展开 scale 的生产临时张量，无拆分 fallback。Triton 3.6 的 FP8 masked load 使用浮点 `other=0.0`，避免整数零转换失败。30 项 FP8 聚焦测试先行通过。
+3. 扩大到完整模型：复用阶段 8 的真实 prefill/decode/状态复用 oracle，新增 FP8 权重量化与独立 Transformers 恢复路径。FP16 decode 出现 NaN，定位到既有 Attention 在 PV 阶段读取未初始化的 V 尾槽，`0 * NaN` 污染输出；不是 FP8 scale 错误。给未使用 KV 填 NaN 后，旧 decode/cached-prefill 两项测试确定性失败。
+4. 针对性修正：仅在两个 Attention kernel 的 V 向量点积前屏蔽不可见元素，复用已有 `from_float` 兼容 FP16 原始位存储与 BF16。不清零整池 KV，不改 Python 缓存热路径。回归扩大到 FP32/FP16/BF16 与 block size 8/16/32。该修正需要构建 CUDA 扩展；标准 setup.py 构建目录无既有完整产物，因此本轮不是只运行 Triton JIT。
+5. 准备真实检查点与复现工具：`scripts/qwen_fp8_quantize.py` 在 CPU 离线转换现有 0.8B，只写入新目录；150 个原始文本投影转为 block128 FP8，小型 GDN a/b 投影保持浮点。零块/尾块转换测试通过。生成的 `models/Qwen3.5-0.8B-FP8-local` 明确标注本地转换，不冒充官方 FP8 检查点；原始模型未修改。`scripts/benchmark_fp8.py` 使用预热与 CUDA events，对比融合路径与仅用于基准的拆分 reference。
+6. 讲义转为实现复盘：先解释启动与每步推理，再用真实 MLP packed 行数举例说明 scale 偏移；保留深入推导和对应资料链接。讲义和模型文件继续被忽略，不纳入 Git。
+
+### 2026-09-18：验证证据
+
+- 分支 `codex/qwen38-learning`，提交基线 `1ba6287`；WSL2 Ubuntu 的 Conda `mini-vllm`，Python 3.10.20、PyTorch 2.11.0+cu128、Triton 3.6.0、Transformers 5.7.0、RTX 4070 Laptop 8 GB（SM89）。没有安装新依赖。
+- `python setup.py build_ext --inplace` 完成现有六个 CUDA 扩展构建，源码只改 Attention 的 19 行。首次 BF16 编译因禁用隐式转换而拒绝 `scalar_t(0)`，改用项目已有 `from_float` 后成功。构建器未找到 ninja，使用 distutils；既有 void 指针运算与未使用变量警告仍保留，不把它们说成无警告构建。
+- 全部五个 CUDA/logits 开关启用，**178/178 测试通过，无跳过**。新增 FP8 完整 logits oracle 覆盖 prompt 1/5/67、三步 decode、两次槽位复用，FP16 最大绝对误差 `0.000369638`，BF16 `0.00299848`，沿用阶段 8 阈值；两次运行 logits 完全一致。旧普通浮点模型 oracle 同样通过。
+- Attention 的 NaN 尾块用例覆盖 decode/cached-prefill、FP32/FP16/BF16、block 8/16/32 共 18 个组合，均通过。修复前两条基础用例确定性失败，没有靠放宽误差或清零测试缓存来通过。
+- Transformers 提示未安装 FLA/causal-conv1d fast path，独立 oracle 使用其 PyTorch 实现；mini-vLLM 的 CUDA/FP8 算子实际执行，未回退到参考路径。模型量化误差不在上述 kernel/实现误差中重复计入：两边都使用相同量化后权重。
+- 本地 `Qwen3.5-0.8B-FP8-local` 两次真实 greedy 请求各生成 32 tokens，均以 `The capital of France is **Paris**.` 开头，token ID 完全一致，每次结束后 active state slots 为 0。150 个原始投影合并为 114 个 Fp8Linear，weight+scale 常驻字节数 `497146368`，两次推理后仍分别为 FP8/FP32。该字节数不包含 embedding、未量化层、KV 或 GDN state，不能解释成整个模型显存。
+- 算子基准在编译和模型 smoke 结束后单独运行，BF16、10 次预热、5 组各 50 次 CUDA event 计时取中位数；包含 Python 提交间隙，未锁频，仅代表本机操作级测量，不代表服务吞吐。临时分配统计为 warmup 后 PyTorch allocator peak，包含输出，不测寄存器 spill：
+
+| M,N,K | 融合 ms | 拆分 reference ms | 融合峰值额外字节 | 拆分峰值额外字节 |
+| --- | --- | --- | --- | --- |
+| 1,1024,1024 | 0.0654 | 0.0834 | 2048 | 12582912 |
+| 128,1024,1024 | 0.2091 | 0.0827 | 262144 | 12582912 |
+| 1,3584,1024 | 0.1128 | 0.3962 | 7168 | 44040192 |
+| 128,3584,1024 | 0.6438 | 0.4446 | 917504 | 44040192 |
+
+- 结论：压缩常驻权重与消除整张反量化中间张量的目标通过；这版固定 tile 在测量的 prefill shape 上仍慢于拆分参考，不宣称全场景加速。没有引入 fallback，也没有为追求 benchmark 改造模型架构。
+- `git diff --check` 通过，仅有 LF/CRLF 提示；讲义与本地转换模型确认被 Git 忽略。阶段 9 标为待验收，核心由 Codex 代实现，不冒充学习者独立完成；尚未 commit/push，未开始阶段 10。官方 27B、TP、多请求、原生 W8A8 和质量基准仍未验证。
+
+在 WSL 根目录激活 `mini-vllm` 后复现：
+
+```bash
+python setup.py build_ext --inplace
+OMP_NUM_THREADS=4 PYTHONPATH=tests MINIVLLM_RUN_CUDA_GDN_TESTS=1 \
+  MINIVLLM_RUN_CUDA_GQA_TESTS=1 MINIVLLM_RUN_CUDA_QWEN_ATTENTION_TESTS=1 \
+  MINIVLLM_RUN_QWEN_LOGITS_TESTS=1 MINIVLLM_RUN_CUDA_FP8_TESTS=1 \
+  python -m unittest discover -s tests -v
+
+# 只执行一次，输出目录必须不存在，不覆盖原模型。
+OMP_NUM_THREADS=4 python -m scripts.qwen_fp8_quantize \
+  --source models/Qwen3.5-0.8B --output models/Qwen3.5-0.8B-FP8-local
+OMP_NUM_THREADS=4 HF_HUB_OFFLINE=1 python -m scripts.qwen_stage8_smoke \
+  --model models/Qwen3.5-0.8B-FP8-local
+OMP_NUM_THREADS=4 python -m scripts.benchmark_fp8 --repeats 50
+```
+
+### 阶段 9 收尾
+
+- 2026-09-18 用户要求提交并推送已验证的实现，阶段 9 标为已完成。核心由 Codex 按用户要求代实现，讲义已提供逐步复盘，不记录为学习者独立完成。
+- 提交包含 FP8 配置与加载、融合 W8A16 kernel、Attention 尾块屏蔽修正、测试和复现脚本；沿用本轮 178/178 测试及真实本地 FP8 模型验证证据。收尾只更新记录，没有再次修改生产逻辑或重跑编译。
+- 讲义、模型权重与编译产物不纳入 Git。下一阶段仍为阶段 10「TP=2 与 Qwen3.8-27B」，保持未开始；官方 27B、多卡和原生 W8A8 不在本次完成声明中。

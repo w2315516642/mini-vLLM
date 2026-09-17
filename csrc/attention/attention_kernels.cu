@@ -271,6 +271,15 @@ __global__ void single_query_cached_kv_attention_kernel(
       if (row_idx < HEAD_SIZE) {
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec = *reinterpret_cast<const V_vec *>(v_ptr + offset);
+        // Unwritten tail slots can contain NaN; zero probability is not enough
+        // because NaN * 0 is still NaN. Mask V before the vector dot product.
+        if (token_idx + V_VEC_SIZE > context_len) {
+          scalar_t* lanes = reinterpret_cast<scalar_t*>(&v_vec);
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            if (token_idx + j >= context_len) from_float(lanes[j], 0.f);
+          }
+        }
         accs[i] += dot(logits_vec, v_vec);
       }
     }
@@ -618,6 +627,16 @@ __global__ void varlen_query_cached_kv_attention_kernel(
           if (row_idx < HEAD_SIZE) {
             const int offset_r = row_idx * BLOCK_SIZE + physical_block_offset;
             V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset_r);
+            // Mask both unused cache slots and this query's causal future.
+            const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+            const int query_position = query_start + m_block_offset + q_token_idx;
+            if (token_idx + V_VEC_SIZE > query_position + 1) {
+              scalar_t* lanes = reinterpret_cast<scalar_t*>(&v_vec);
+#pragma unroll
+              for (int j = 0; j < V_VEC_SIZE; j++) {
+                if (token_idx + j > query_position) from_float(lanes[j], 0.f);
+              }
+            }
             block_acc[i] += dot(probs_vec, v_vec);
           }
         }

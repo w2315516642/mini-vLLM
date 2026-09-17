@@ -21,6 +21,7 @@ from minivllm.utils import (
     BlockHasher
 )
 from minivllm.worker.worker import Worker
+from minivllm.model_executor.layers.fp8 import resolve_fp8_config
 
 class LLMEngine:
     """ 核心，负责模型初始化、资源分配和推理 """
@@ -91,8 +92,9 @@ class LLMEngine:
                 raise ValueError("Hybrid prefix caching requires GDN snapshots (stage 12)")
             root = self.model_config.architecture.root_config
             text = self.model_config.architecture.text_config
-            if getattr(root, "quantization_config", None) or getattr(text, "quantization_config", None):
-                raise ValueError("Stage 8 requires unquantized floating-point weights")
+            # Validate metadata before starting workers. The worker consumes the
+            # same root/text config without mutating the language architecture.
+            resolve_fp8_config(root, text)
 
     def _init_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""

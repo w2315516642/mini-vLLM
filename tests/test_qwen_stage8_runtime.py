@@ -38,7 +38,7 @@ class Stage8RuntimeTest(unittest.TestCase):
     def test_engine_rejects_future_stage_features_at_startup(self):
         for field, value in (("world_size", 2), ("max_num_seqs", 2),
                              ("enable_prefix_caching", True),
-                             ("quantization_config", {"quant_method": "fp8"})):
+                             ("quantization_config", {"quant_method": "awq"})):
             with self.subTest(field=field):
                 engine = self.make_engine()
                 owner = {"world_size": engine.parallel_config,

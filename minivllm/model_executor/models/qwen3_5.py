@@ -23,6 +23,7 @@ from minivllm.model_executor.layers.gated_delta_net_cuda import (
     prepare_gated_delta_qk,
 )
 from minivllm.model_executor.layers.sampler import Sampler
+from minivllm.model_executor.layers.fp8 import FP8BlockConfig, Fp8Linear, load_fp8_shard
 from minivllm.model_executor.models.llama import LlamaMLP
 from minivllm.model_executor.weight_utils import hf_model_weights_iterator
 from minivllm.model_executor.parallel_utils.parallel_state import (
@@ -416,6 +417,47 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             hf_model_weights_iterator(model_name_or_path, cache_dir, use_np_cache)
         )
 
+    def configure_fp8(self, config: FP8BlockConfig) -> None:
+        """Install FP8 storage before loading; leave decoder execution unchanged.
+
+        This weight-only path is TP=1 and uses fused W8A16 GEMM. Resolve
+        source projection names before packing so exclusions apply coherently.
+        """
+        if getattr(self, "_fp8_configured", False):
+            raise ValueError("FP8 storage is already configured")
+        replacements = []
+        for name, module in self.named_modules():
+            if not name.startswith("model.layers.") or not isinstance(
+                module, (nn.Linear, ColumnParallelLinear, RowParallelLinear)
+            ):
+                continue
+            rows, cols = module.weight.shape
+            parent_name, child = name.rsplit(".", 1)
+            parent = self.get_submodule(parent_name)
+            if child == "qkv_gate_proj":
+                sources = [f"{parent_name}.{s}_proj" for s in ("q", "k", "v")]
+                partitions = (2 * parent.q_size, parent.kv_size, parent.kv_size)
+            elif child == "gate_up_proj":
+                sources = [f"{parent_name}.{s}_proj" for s in ("gate", "up")]
+                partitions = (rows // 2, rows // 2)
+            else:
+                sources, partitions = [name], (rows,)
+            if not config.should_quantize(sources):
+                continue
+            if module.bias is not None:
+                raise ValueError(f"Stage 9 FP8 projection must be bias-free: {name}")
+            if any(size % config.block_size[0] for size in partitions[:-1]):
+                raise ValueError(f"Packed FP8 row boundary is not block-aligned: {name}")
+            replacements.append((parent, child, cols, rows, module.weight.device,
+                                 isinstance(module, (ColumnParallelLinear, RowParallelLinear))))
+        # Validate the entire layout first, then replace one projection at a
+        # time instead of allocating a second model's worth of FP8 tensors.
+        for parent, child, cols, rows, device, returns_tuple in replacements:
+            setattr(parent, child, Fp8Linear(
+                cols, rows, config.block_size, device=device, returns_tuple=returns_tuple,
+            ))
+        self._fp8_configured = True
+
     @torch.no_grad()
     def load_weights_from_iterator(
         self, weights: Iterable[Tuple[str, torch.Tensor]],
@@ -433,6 +475,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         params = dict(self.named_parameters(remove_duplicate=False))
         routes = {}
         for name, param in params.items():
+            if name.endswith(".weight_scale_inv"):
+                continue
             if name.endswith(".self_attn.qkv_gate_proj.weight"):
                 prefix = name.removesuffix(".qkv_gate_proj.weight")
                 attention = self.get_submodule(prefix)
@@ -452,6 +496,17 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                         name, shard, offset, size)
             else:
                 routes[name] = (name, None, None, None)
+
+        # A packed scale has the SAME source coverage as its weight, but its
+        # offset is measured in blocks. load_fp8_shard performs that mapping.
+        for source, (target, shard, offset, size) in list(routes.items()):
+            if target.endswith(".weight") and isinstance(
+                self.get_submodule(target.removesuffix(".weight")), Fp8Linear
+            ):
+                routes[source.removesuffix(".weight") + ".weight_scale_inv"] = (
+                    target.removesuffix(".weight") + ".weight_scale_inv",
+                    shard, offset, size,
+                )
 
         # Coverage is tracked by source shard, not packed destination parameter.
         # Seeing Q alone must not make the whole QKV matrix appear loaded.
@@ -478,6 +533,20 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
             target_name, shard, offset, size = routes[name]
             param = params[target_name]
+            parent_name, field = target_name.rsplit(".", 1)
+            parent = self.get_submodule(parent_name)
+            if isinstance(parent, Fp8Linear):
+                load_fp8_shard(
+                    parent, loaded_weight,
+                    kind="scale" if field == "weight_scale_inv" else "weight",
+                    row_offset=offset if offset is not None else 0,
+                    num_rows=size if size is not None else parent.output_size,
+                    source_name=source_name,
+                )
+                loaded.add(name)
+                continue
+            if loaded_weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(f"FP8 weight has no configured scale destination: {source_name}")
             expected_shape = (param.shape if shard is None else
                               (size, *param.shape[1:]))
             # Check exact source size before the TP helper slices it. Otherwise

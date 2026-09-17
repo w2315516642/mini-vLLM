@@ -33,20 +33,14 @@ def _pack_cache(
     num_kv_heads = keys.shape[1]
     head_size = keys.shape[2]
     x = 16 // keys.element_size()
-    key_cache = torch.zeros(
-        num_blocks,
-        num_kv_heads,
-        head_size // x,
-        block_size,
-        x,
+    # Poison unused slots: probability zero alone cannot mask NaN * 0 in PV.
+    key_cache = torch.full(
+        (num_blocks, num_kv_heads, head_size // x, block_size, x), float("nan"),
         dtype=keys.dtype,
         device="cuda",
     )
-    value_cache = torch.zeros(
-        num_blocks,
-        num_kv_heads,
-        head_size,
-        block_size,
+    value_cache = torch.full(
+        (num_blocks, num_kv_heads, head_size, block_size), float("nan"),
         dtype=values.dtype,
         device="cuda",
     )
@@ -66,12 +60,16 @@ def _pack_cache(
 )
 class GQACudaKernelTest(unittest.TestCase):
     def test_decode_reads_compact_kv_cache(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for block_size in (8, 16, 32):
+                with self.subTest(dtype=dtype, block_size=block_size):
+                    self._check_decode(dtype, block_size)
+
+    def _check_decode(self, dtype, block_size):
         torch.manual_seed(1)
-        dtype = torch.float16
         num_query_heads = 4
         num_kv_heads = 2
         head_size = 64
-        block_size = 8
         context_lens_list = [5, 7]
         scale = head_size ** -0.5
 
@@ -146,12 +144,16 @@ class GQACudaKernelTest(unittest.TestCase):
         torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
     def test_cached_prefill_reads_compact_kv_cache(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for block_size in (8, 16, 32):
+                with self.subTest(dtype=dtype, block_size=block_size):
+                    self._check_cached_prefill(dtype, block_size)
+
+    def _check_cached_prefill(self, dtype, block_size):
         torch.manual_seed(2)
-        dtype = torch.float16
         num_query_heads = 4
         num_kv_heads = 2
         head_size = 64
-        block_size = 8
         context_len = 5
         query_len = 2
         scale = head_size ** -0.5

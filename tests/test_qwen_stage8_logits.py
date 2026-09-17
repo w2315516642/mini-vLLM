@@ -23,8 +23,6 @@ class Stage8LogitsTest(unittest.TestCase):
     @torch.inference_mode()
     def test_prefill_decode_and_reused_slots_match_transformers(self):
         from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
-
         config = Qwen3_5TextConfig(
             hidden_size=32, intermediate_size=64, vocab_size=128,
             num_hidden_layers=4,
@@ -48,14 +46,7 @@ class Stage8LogitsTest(unittest.TestCase):
                 torch.manual_seed(108)
                 # Quantize weights identically, but compute the independent
                 # oracle in FP32 (including near-zero Q/K normalization).
-                reference = Qwen3_5ForCausalLM(config).eval().to(dtype).float().cuda()
-                old_dtype = torch.get_default_dtype()
-                try:
-                    torch.set_default_dtype(dtype)
-                    actual = Qwen3_5ForConditionalGeneration(config).eval().cuda()
-                finally:
-                    torch.set_default_dtype(old_dtype)
-                actual.load_weights_from_iterator(reference.state_dict().items())
+                reference, actual = self.make_models(config, dtype)
                 worker = self.make_worker(config, dtype)
                 for prompt_len in (1, 5, 67):
                     # 67 crosses the 64-token GDN chunk and several KV blocks.
@@ -90,6 +81,20 @@ class Stage8LogitsTest(unittest.TestCase):
                         self.assertEqual(worker.hybrid_cache.num_active_slots, 0)
                 del reference, actual, worker
                 torch.cuda.empty_cache()
+
+    @staticmethod
+    def make_models(config, dtype):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+        reference = Qwen3_5ForCausalLM(config).eval().to(dtype).float().cuda()
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(dtype)
+            actual = Qwen3_5ForConditionalGeneration(config).eval().cuda()
+        finally:
+            torch.set_default_dtype(old_dtype)
+        actual.load_weights_from_iterator(reference.state_dict().items())
+        return reference, actual
 
     @staticmethod
     def make_worker(config, dtype):
